@@ -83,7 +83,7 @@ impl Default for AppConfig {
             experimental_calls: false,
             tray_enabled: true,
             close_to_tray: true,
-            discord_rpc: true,
+            discord_rpc: false,
             discord_rpc_client_id: String::new(),
             discord_rpc_show_chat: false,
             discord_rpc_show_avatar: false,

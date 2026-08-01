@@ -147,6 +147,8 @@ pub struct AppState {
     pub self_display_name: Rc<RefCell<String>>,
     pub self_avatar_path: Rc<RefCell<Option<String>>>,
     pub self_picture_url: Rc<RefCell<Option<String>>>,
+    /// Avoid double full rebuilds when warm cache + fetch return the same list.
+    pub msg_list_fp: Rc<RefCell<Option<(String, usize, String, String)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +355,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         self_display_name: Rc::new(RefCell::new(String::new())),
         self_avatar_path: Rc::new(RefCell::new(None)),
         self_picture_url: Rc::new(RefCell::new(None)),
+        msg_list_fp: Rc::new(RefCell::new(None)),
     };
 
     apply_ui_language(&state);
@@ -501,13 +504,21 @@ fn ensure_desktop_integration(repo_root: &std::path::Path) {
          StartupWMClass=dev.linegtk.LineGtk\n\
          StartupNotify=true\n"
     );
-    // App id must match the .desktop basename for taskbar/dock icons.
-    for name in ["dev.linegtk.LineGtk.desktop", "line-gtk.desktop"] {
-        let path = apps_dir.join(name);
-        if let Err(e) = std::fs::write(&path, &desktop) {
-            eprintln!("[desktop] write {}: {e}", path.display());
-        }
+    // Basename must match GTK application_id for a single dock/launcher entry.
+    let path = apps_dir.join("dev.linegtk.LineGtk.desktop");
+    if let Err(e) = std::fs::write(&path, &desktop) {
+        eprintln!("[desktop] write {}: {e}", path.display());
     }
+    // Remove the old duplicate that caused two "LINE GTK" icons in launchers.
+    let legacy = apps_dir.join("line-gtk.desktop");
+    if legacy.exists() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn apply_close_behavior(state: &AppState) {
@@ -1318,12 +1329,86 @@ fn extract_urls(text: &str) -> Vec<String> {
     out
 }
 
+/// Drag-and-drop files/images onto the conversation (chat + composer).
+fn wire_drop_attachments(state: &AppState) {
+    let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+    drop.set_types(&[
+        gdk::FileList::static_type(),
+        gio::File::static_type(),
+        gdk::Texture::static_type(),
+    ]);
+    let s = state.clone();
+    drop.connect_drop(move |_, value, _x, _y| {
+        if let Ok(list) = value.get::<gdk::FileList>() {
+            let mut any = false;
+            for file in list.files() {
+                if let Some(path) = file.path() {
+                    if path.is_file() {
+                        send_local_media_path(&s, path);
+                        any = true;
+                    }
+                }
+            }
+            return any;
+        }
+        if let Ok(file) = value.get::<gio::File>() {
+            if let Some(path) = file.path() {
+                if path.is_file() {
+                    send_local_media_path(&s, path);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Ok(tex) = value.get::<gdk::Texture>() {
+            match save_clipboard_texture_png(&s, &tex) {
+                Ok(path) => {
+                    send_local_media_path(&s, path);
+                    true
+                }
+                Err(e) => {
+                    toast(
+                        &s,
+                        &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    });
+    state.conversation.add_controller(drop);
+}
+
 fn wire_actions(state: &AppState) {
     let s = state.clone();
     state.composer.connect_activate(move |_| send_current(&s));
 
     let s = state.clone();
     state.send_btn.connect_clicked(move |_| send_current(&s));
+
+    // Ctrl+V / Shift+Insert: attach clipboard files or images (text paste stays default).
+    let s = state.clone();
+    let paste = gtk::EventControllerKey::new();
+    paste.set_propagation_phase(gtk::PropagationPhase::Capture);
+    paste.connect_key_pressed(move |_, key, _, mods| {
+        let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+        let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
+        let is_paste = (ctrl && (key == gdk::Key::v || key == gdk::Key::V))
+            || (shift && key == gdk::Key::Insert);
+        if !is_paste {
+            return glib::Propagation::Proceed;
+        }
+        if try_paste_clipboard_attachment(&s) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    state.composer.add_controller(paste);
+
+    wire_drop_attachments(state);
 
     // Esc in composer / chat dismisses the "New" separator.
     let s = state.clone();
@@ -1500,6 +1585,13 @@ fn wire_actions(state: &AppState) {
     state.sticker_btn.connect_clicked(move |_| {
         open_sticker_picker(&s);
     });
+    // Drop decoded sticker thumbs when the picker closes.
+    {
+        let pop = state.sticker_popover.clone();
+        pop.connect_closed(move |p| {
+            p.set_child(None::<&gtk::Widget>);
+        });
+    }
 
     let s = state.clone();
     state.call_btn.connect_clicked(move |_| {
@@ -1632,7 +1724,8 @@ fn open_chat(state: &AppState, chat: &ChatInfo) {
     state.media_queue.borrow_mut().clear();
     set_msg_state(state, "loading", None);
     clear_messages(state);
-    match state.sidecar.fetch_messages(&chat.mid, 80) {
+    *state.msg_list_fp.borrow_mut() = None;
+    match state.sidecar.fetch_messages(&chat.mid, 40) {
         Ok(id) => {
             state.pending.borrow_mut().insert(
                 id,
@@ -1664,15 +1757,17 @@ fn restart_qr_login(state: &AppState) {
 
 fn pump_events(state: AppState) {
     let rx = state.sidecar.events.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(24), move || {
-        // Drain a bounded batch so one flood can't freeze the frame.
-        for _ in 0..64 {
-            match rx.try_recv() {
-                Ok(ev) => handle_event(&state, ev),
-                Err(_) => break,
+    glib::spawn_future_local(async move {
+        while let Ok(ev) = rx.recv().await {
+            handle_event(&state, ev);
+            // Drain a short burst so one flood cannot stall forever on await.
+            for _ in 0..64 {
+                match rx.try_recv() {
+                    Ok(ev) => handle_event(&state, ev),
+                    Err(_) => break,
+                }
             }
         }
-        glib::ControlFlow::Continue
     });
 }
 
@@ -2202,7 +2297,9 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                             .cloned()
                             .and_then(|v| serde_json::from_value(v).ok())
                             .unwrap_or_default();
-                        apply_messages(state, messages);
+                        if !same_message_list(state, &chat_mid, &messages) {
+                            apply_messages(state, messages);
+                        }
                     }
                 }
                 Some(Pending::Send {
@@ -2684,11 +2781,37 @@ fn build_chat_row(
     (row, avatar, preview, badge)
 }
 
+fn message_list_fingerprint(messages: &[MessageInfo]) -> (usize, String, String) {
+    let first = messages
+        .first()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    let last = messages
+        .last()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    (messages.len(), first, last)
+}
+
+fn same_message_list(state: &AppState, chat_mid: &str, messages: &[MessageInfo]) -> bool {
+    let (len, first, last) = message_list_fingerprint(messages);
+    matches!(
+        state.msg_list_fp.borrow().as_ref(),
+        Some((mid, l, f, la)) if mid == chat_mid && *l == len && f == &first && la == &last
+    )
+}
+
 fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     clear_messages(state);
     state.media_queue.borrow_mut().clear();
     *state.stick_bottom.borrow_mut() = true;
     messages.sort_by_key(|m| m.created_time);
+    if let Some(mid) = state.current_chat.borrow().clone() {
+        let (len, first, last) = message_list_fingerprint(&messages);
+        *state.msg_list_fp.borrow_mut() = Some((mid, len, first, last));
+    } else {
+        *state.msg_list_fp.borrow_mut() = None;
+    }
     if messages.is_empty() {
         set_msg_state(state, "empty", Some(&crate::i18n::t("no_messages")));
         state.chat_subtitle.set_text(&crate::i18n::t("empty"));
@@ -2869,7 +2992,7 @@ fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             attach_texture_async_anim(
                 pic.clone(),
                 path.to_string(),
-                if is_sticker { 128 } else { 440 },
+                if is_sticker { 128 } else { 320 },
                 animate,
             );
             if !is_sticker && (is_image || is_video) {
@@ -2902,7 +3025,7 @@ fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         }
     }
 
-    if !msg.id.is_empty() {
+    if !msg.id.is_empty() && message_tracks_media(msg) {
         state
             .media_slots
             .borrow_mut()
@@ -3484,25 +3607,36 @@ fn extract_audio_peaks(path: &std::path::Path, bars: usize) -> Option<Vec<f32>> 
 }
 
 fn wav_tail_level(path: &std::path::Path) -> f32 {
-    let Ok(data) = std::fs::read(path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
         return 0.08;
     };
-    if data.len() < 44 + 512 {
+    let Ok(meta) = file.metadata() else {
+        return 0.08;
+    };
+    let len = meta.len() as usize;
+    if len < 44 + 512 {
         return 0.08;
     }
-    let pcm = &data[44..];
-    let samples = pcm.len() / 2;
+    let bytes = (1024 * 2).min(len.saturating_sub(44));
+    let start = (len - bytes) as u64;
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return 0.08;
+    }
+    let mut buf = vec![0u8; bytes];
+    if file.read_exact(&mut buf).is_err() {
+        return 0.08;
+    }
+    let samples = buf.len() / 2;
     if samples == 0 {
         return 0.08;
     }
-    let take = samples.min(1024);
-    let start = samples - take;
     let mut sum = 0.0f64;
-    for i in start..samples {
-        let s = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]) as f64 / 32768.0;
+    for i in 0..samples {
+        let s = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as f64 / 32768.0;
         sum += s * s;
     }
-    let rms = (sum / take as f64).sqrt() as f32;
+    let rms = (sum / samples as f64).sqrt() as f32;
     (rms * 4.5).clamp(0.08, 1.0)
 }
 
@@ -5341,6 +5475,10 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        // Lazy-decode: only the first pack loads immediately; others wait until selected.
+        let pending_thumbs: Rc<RefCell<Vec<(gtk::Picture, String)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let pack_loaded = Rc::new(RefCell::new(idx == 0));
         for item in stickers {
             let sticker_id = item
                 .get("stickerId")
@@ -5370,20 +5508,21 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
                 .css_classes(["line-sticker-thumb"])
                 .build();
             pic.set_size_request(64, 64);
-            if let Some(path) = item.get("imagePath").and_then(|v| v.as_str()) {
-                if !path.is_empty() {
-                    attach_texture_async(pic.clone(), path.to_string(), 96);
+            let path = item
+                .get("imagePath")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+                .map(|s| s.to_string());
+            if idx == 0 {
+                if let Some(path) = path.clone() {
+                    attach_texture_async(pic.clone(), path, 96);
                 }
             }
             btn.set_child(Some(&pic));
 
             let s = state.clone();
             let pop = state.sticker_popover.clone();
-            let image_path = item
-                .get("imagePath")
-                .and_then(|v| v.as_str())
-                .filter(|p| !p.is_empty())
-                .map(|s| s.to_string());
+            let image_path = path.clone();
             btn.connect_clicked(move |_| {
                 pop.popdown();
                 send_sticker_now(
@@ -5395,6 +5534,11 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
                 );
             });
             grid.append(&btn);
+            if idx != 0 {
+                if let Some(path) = path {
+                    pending_thumbs.borrow_mut().push((pic, path));
+                }
+            }
         }
         scroll.set_child(Some(&grid));
         let page_name = format!("pack-{idx}");
@@ -5431,6 +5575,8 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
         let tabs_c = tab_buttons.clone();
         let page_name_c = page_name.clone();
         let display_name_c = display_name.clone();
+        let pending_c = pending_thumbs.clone();
+        let loaded_c = pack_loaded.clone();
         tab.connect_toggled(move |btn| {
             if !btn.is_active() {
                 return;
@@ -5442,6 +5588,13 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
             }
             title_c.set_text(&display_name_c);
             pages_c.set_visible_child_name(&page_name_c);
+            // Decode this pack's thumbs only the first time it is opened.
+            if !*loaded_c.borrow() {
+                *loaded_c.borrow_mut() = true;
+                for (pic, path) in pending_c.borrow_mut().drain(..) {
+                    attach_texture_async(pic, path, 96);
+                }
+            }
         });
 
         tab_buttons.borrow_mut().push(tab.clone());
@@ -5504,7 +5657,7 @@ fn send_sticker_now(
 }
 
 fn pick_and_send_media(state: &AppState) {
-    let Some(chat_mid) = state.current_chat.borrow().clone() else {
+    let Some(_chat_mid) = state.current_chat.borrow().clone() else {
         toast(state, &crate::i18n::t("select_chat_first"));
         return;
     };
@@ -5560,85 +5713,143 @@ fn pick_and_send_media(state: &AppState) {
                 );
                 return;
             };
-            let o_type = guess_media_o_type(&path);
-            let duration_ms = if o_type == "audio" || o_type == "video" {
-                ffprobe_duration_ms(&path)
-            } else {
-                None
-            };
-            let cached = match copy_into_media_cache(&s, &path) {
-                Ok(p) => p,
-                Err(e) => {
-                    toast(
+            send_local_media_path(&s, path);
+        },
+    );
+}
+
+/// Ctrl+V attachment: files (URI list / FileList) or a clipboard image.
+/// Returns true when paste was handled so text paste is suppressed.
+fn try_paste_clipboard_attachment(state: &AppState) -> bool {
+    if state.current_chat.borrow().is_none() {
+        return false;
+    }
+    if !*state.session_ready.borrow() {
+        return false;
+    }
+
+    let clipboard = state.composer.clipboard();
+    let formats = clipboard.formats();
+    let has_files = formats.contains_type(gdk::FileList::static_type())
+        || formats.contain_mime_type("text/uri-list");
+    let has_image = formats.contains_type(gdk::Texture::static_type())
+        || formats.contain_mime_type("image/png")
+        || formats.contain_mime_type("image/jpeg")
+        || formats.contain_mime_type("image/bmp")
+        || formats.contain_mime_type("image/tiff");
+
+    if has_files {
+        let s = state.clone();
+        clipboard.read_value_async(
+            gdk::FileList::static_type(),
+            glib::Priority::DEFAULT,
+            None::<&gio::Cancellable>,
+            move |res| match res {
+                Ok(value) => {
+                    if let Ok(list) = value.get::<gdk::FileList>() {
+                        let mut any = false;
+                        for file in list.files() {
+                            if let Some(path) = file.path() {
+                                if path.is_file() {
+                                    send_local_media_path(&s, path);
+                                    any = true;
+                                }
+                            }
+                        }
+                        if !any {
+                            paste_clipboard_uri_list(&s);
+                        }
+                    } else {
+                        paste_clipboard_uri_list(&s);
+                    }
+                }
+                Err(_) => paste_clipboard_uri_list(&s),
+            },
+        );
+        return true;
+    }
+
+    if has_image {
+        let s = state.clone();
+        clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| {
+            match res {
+                Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
+                    Ok(path) => send_local_media_path(&s, path),
+                    Err(e) => toast(
                         &s,
                         &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
-                    );
-                    return;
-                }
+                    ),
+                },
+                _ => paste_clipboard_image_bytes(&s),
+            }
+        });
+        return true;
+    }
+
+    false
+}
+
+fn paste_clipboard_uri_list(state: &AppState) {
+    let clipboard = state.composer.clipboard();
+    let s = state.clone();
+    clipboard.read_async(
+        &["text/uri-list"],
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |res| {
+            let Ok((stream, _)) = res else {
+                return;
             };
-            let path_str = cached.to_string_lossy().to_string();
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file")
-                .to_string();
-            match s.sidecar.send_media(&chat_mid, &path_str, o_type, duration_ms) {
-                Ok(id) => {
-                    let (content_type, text, image_path, audio_path, file_path) = match o_type {
-                        "image" | "gif" => (
-                            "IMAGE",
-                            "[Image]".to_string(),
-                            Some(path_str.clone()),
-                            None,
-                            Some(path_str.clone()),
-                        ),
-                        "video" => (
-                            "VIDEO",
-                            "[Video]".to_string(),
-                            None,
-                            None,
-                            Some(path_str.clone()),
-                        ),
-                        "audio" => (
-                            "AUDIO",
-                            "Voice message".to_string(),
-                            None,
-                            Some(path_str.clone()),
-                            Some(path_str.clone()),
-                        ),
-                        _ => (
-                            "FILE",
-                            file_name.clone(),
-                            None,
-                            None,
-                            Some(path_str.clone()),
-                        ),
-                    };
-                    begin_optimistic_send(
-                        &s,
-                        id,
-                        &chat_mid,
-                        MessageInfo {
-                            id: String::new(),
-                            text,
-                            from: String::new(),
-                            to: chat_mid.clone(),
-                            mine: true,
-                            created_time: now_ms(),
-                            content_type: content_type.into(),
-                            image_path,
-                            image_url: None,
-                            audio_path,
-                            file_name: Some(file_name),
-                            file_path,
-                            duration_ms: duration_ms.map(|v| v as i64),
-                            flex: None,
-                        },
-                    );
-                    show_upload_progress(&s, 0.02, &crate::i18n::t("media_uploading"));
-                    dismiss_new_marker(&s);
-                    pin_messages_to_latest(&s);
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut input = gio::InputStream::into_read(stream);
+            if input.read_to_string(&mut buf).is_err() {
+                return;
+            }
+            for line in buf.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
                 }
+                let file = gio::File::for_uri(line);
+                if let Some(path) = file.path() {
+                    if path.is_file() {
+                        send_local_media_path(&s, path);
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn paste_clipboard_image_bytes(state: &AppState) {
+    let clipboard = state.composer.clipboard();
+    let s = state.clone();
+    clipboard.read_async(
+        &["image/png", "image/jpeg", "image/bmp", "image/tiff"],
+        glib::Priority::DEFAULT,
+        None::<&gio::Cancellable>,
+        move |res| {
+            let Ok((stream, mime)) = res else {
+                return;
+            };
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let mut input = gio::InputStream::into_read(stream);
+            if input.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+                return;
+            }
+            let ext = if mime.as_str().contains("jpeg") {
+                "jpg"
+            } else if mime.as_str().contains("bmp") {
+                "bmp"
+            } else if mime.as_str().contains("tiff") {
+                "tiff"
+            } else {
+                "png"
+            };
+            match write_clipboard_bytes(&s, &bytes, ext) {
+                Ok(path) => send_local_media_path(&s, path),
                 Err(e) => toast(
                     &s,
                     &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
@@ -5646,6 +5857,142 @@ fn pick_and_send_media(state: &AppState) {
             }
         },
     );
+}
+
+fn save_clipboard_texture_png(state: &AppState, tex: &gdk::Texture) -> anyhow::Result<PathBuf> {
+    use gdk::prelude::TextureExt;
+    let dir = state.data_dir.join("cache/media");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!(
+        "paste-{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    tex.save_to_png(&dest)?;
+    Ok(dest)
+}
+
+fn write_clipboard_bytes(state: &AppState, bytes: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
+    let dir = state.data_dir.join("cache/media");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(format!(
+        "paste-{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        ext
+    ));
+    std::fs::write(&dest, bytes)?;
+    Ok(dest)
+}
+
+fn send_local_media_path(state: &AppState, path: PathBuf) {
+    let Some(chat_mid) = state.current_chat.borrow().clone() else {
+        toast(state, &crate::i18n::t("select_chat_first"));
+        return;
+    };
+    if !*state.session_ready.borrow() {
+        toast(state, &crate::i18n::t("still_restoring"));
+        return;
+    }
+    if !path.is_file() {
+        toast(
+            state,
+            &crate::i18n::tf("media_send_failed", &[("error", "not a file")]),
+        );
+        return;
+    }
+
+    let o_type = guess_media_o_type(&path);
+    let duration_ms = if o_type == "audio" || o_type == "video" {
+        ffprobe_duration_ms(&path)
+    } else {
+        None
+    };
+    let cached = match copy_into_media_cache(state, &path) {
+        Ok(p) => p,
+        Err(e) => {
+            toast(
+                state,
+                &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+            );
+            return;
+        }
+    };
+    let path_str = cached.to_string_lossy().to_string();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    match state
+        .sidecar
+        .send_media(&chat_mid, &path_str, o_type, duration_ms)
+    {
+        Ok(id) => {
+            let (content_type, text, image_path, audio_path, file_path) = match o_type {
+                "image" | "gif" => (
+                    "IMAGE",
+                    "[Image]".to_string(),
+                    Some(path_str.clone()),
+                    None,
+                    Some(path_str.clone()),
+                ),
+                "video" => (
+                    "VIDEO",
+                    "[Video]".to_string(),
+                    None,
+                    None,
+                    Some(path_str.clone()),
+                ),
+                "audio" => (
+                    "AUDIO",
+                    "Voice message".to_string(),
+                    None,
+                    Some(path_str.clone()),
+                    Some(path_str.clone()),
+                ),
+                _ => (
+                    "FILE",
+                    file_name.clone(),
+                    None,
+                    None,
+                    Some(path_str.clone()),
+                ),
+            };
+            begin_optimistic_send(
+                state,
+                id,
+                &chat_mid,
+                MessageInfo {
+                    id: String::new(),
+                    text,
+                    from: String::new(),
+                    to: chat_mid.clone(),
+                    mine: true,
+                    created_time: now_ms(),
+                    content_type: content_type.into(),
+                    image_path,
+                    image_url: None,
+                    audio_path,
+                    file_name: Some(file_name),
+                    file_path,
+                    duration_ms: duration_ms.map(|v| v as i64),
+                    flex: None,
+                },
+            );
+            show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));
+            dismiss_new_marker(state);
+            pin_messages_to_latest(state);
+        }
+        Err(e) => toast(
+            state,
+            &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+        ),
+    }
 }
 
 fn start_voice_record(state: &AppState) {
@@ -6084,7 +6431,11 @@ fn make_media_picture_placeholder(sticker: bool) -> gtk::Picture {
         .can_shrink(true)
         .width_request(w)
         .height_request(h)
-        .css_classes(["line-bubble-image"])
+        .css_classes(if sticker {
+            ["line-sticker-image"]
+        } else {
+            ["line-bubble-image"]
+        })
         .build()
 }
 
@@ -6260,7 +6611,7 @@ fn attach_texture_async(picture: gtk::Picture, path: String, max_px: i32) {
 fn attach_texture_async_anim(picture: gtk::Picture, path: String, max_px: i32, animate: bool) {
     let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&path, max_px));
+        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&path, max_px, animate));
     });
     glib::spawn_future_local(async move {
         match rx.recv().await {
@@ -6310,7 +6661,7 @@ fn pump_media_queue(state: &AppState) {
         .any(|c| c == "line-bubble-sticker");
 
     // Keep the "Loading…" label until decode succeeds.
-    let max_px = if is_sticker { 128 } else { 440 };
+    let max_px = if is_sticker { 128 } else { 320 };
     let animate = is_sticker && state.config.borrow().animations;
     let state2 = state.clone();
     let bubble2 = bubble.clone();
@@ -6319,7 +6670,7 @@ fn pump_media_queue(state: &AppState) {
     let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
     let image_path2 = image_path.clone();
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&image_path2, max_px));
+        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&image_path2, max_px, animate));
     });
     glib::spawn_future_local(async move {
         let frames = rx.recv().await.ok().flatten();
@@ -6397,6 +6748,17 @@ fn clear_messages(state: &AppState) {
     *state.new_sep_row.borrow_mut() = None;
     *state.pending_new_below.borrow_mut() = 0;
     state.jump_banner.set_reveal_child(false);
+}
+
+fn message_tracks_media(msg: &MessageInfo) -> bool {
+    let ct = msg.content_type.to_ascii_uppercase();
+    matches!(
+        ct.as_str(),
+        "IMAGE" | "VIDEO" | "AUDIO" | "FILE" | "STICKER"
+    ) || msg.image_path.is_some()
+        || msg.audio_path.is_some()
+        || msg.file_path.is_some()
+        || msg.flex.is_some()
 }
 
 fn set_side_state(state: &AppState, name: &str, empty_text: Option<&str>) {

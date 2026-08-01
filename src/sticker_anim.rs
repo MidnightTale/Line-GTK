@@ -1,9 +1,14 @@
 //! Decode LINE animated stickers (APNG) into RGBA frames.
 //! gdk-pixbuf cannot load APNG, so we composite frames with the `png` crate.
 //! Raw frames are `Send` so decoding can run off the GTK thread.
+//!
+//! Static images use `Pixbuf::from_file_at_scale` so JPEG/PNG are never fully
+//! decoded at native resolution just to show a chat thumbnail.
 
+use gdk_pixbuf::Pixbuf;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub struct RawFrame {
@@ -18,6 +23,40 @@ pub struct AnimFrames {
     pub frames: Vec<RawFrame>,
     /// 0 = loop forever (LINE chat UX).
     pub plays: u32,
+}
+
+/// Cap parallel image/APNG decodes so chat open cannot spike hundreds of MiB.
+struct DecodeLimiter {
+    active: Mutex<u32>,
+    cv: Condvar,
+    max: u32,
+}
+
+fn decode_limiter() -> &'static DecodeLimiter {
+    static LIMITER: OnceLock<DecodeLimiter> = OnceLock::new();
+    LIMITER.get_or_init(|| DecodeLimiter {
+        active: Mutex::new(0),
+        cv: Condvar::new(),
+        max: 2,
+    })
+}
+
+fn with_decode_slot<R>(f: impl FnOnce() -> R) -> R {
+    let lim = decode_limiter();
+    let mut guard = lim.active.lock().unwrap_or_else(|e| e.into_inner());
+    while *guard >= lim.max {
+        guard = lim
+            .cv
+            .wait(guard)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    *guard += 1;
+    drop(guard);
+    let out = f();
+    let mut guard = lim.active.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = guard.saturating_sub(1);
+    lim.cv.notify_one();
+    out
 }
 
 pub fn is_apng_file(path: &str) -> bool {
@@ -53,7 +92,13 @@ pub fn is_apng_file(path: &str) -> bool {
     bytes.windows(4).any(|w| w == b"acTL")
 }
 
-pub fn load_scaled(path: &str, max_px: i32) -> Option<AnimFrames> {
+/// Load a chat/sticker image scaled to `max_px`.
+/// When `animate` is false, APNG returns only the first composited frame.
+pub fn load_scaled(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
+    with_decode_slot(|| load_scaled_inner(path, max_px, animate))
+}
+
+fn load_scaled_inner(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() < 32 {
         return None;
@@ -78,45 +123,68 @@ pub fn load_scaled(path: &str, max_px: i32) -> Option<AnimFrames> {
         }
     }
     if is_apng_file(path) {
-        return decode_apng(path, max_px);
+        return decode_apng(path, max_px, animate);
     }
     decode_static(path, max_px)
 }
 
 fn decode_static(path: &str, max_px: i32) -> Option<AnimFrames> {
-    let img = image::open(path).ok()?.into_rgba8();
-    let (w0, h0) = img.dimensions();
-    let scale = if max_px > 0 {
-        (max_px as f64 / w0.max(h0) as f64).min(1.0)
-    } else {
-        1.0
-    };
-    let tw = ((w0 as f64) * scale).round().max(1.0) as u32;
-    let th = ((h0 as f64) * scale).round().max(1.0) as u32;
-    let rgba = if tw != w0 || th != h0 {
-        image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
-    } else {
-        img.into_raw()
-    };
+    let max = if max_px > 0 { max_px } else { 2048 };
+    let pb = Pixbuf::from_file_at_scale(path, max, max, true).ok()?;
+    let w = pb.width();
+    let h = pb.height();
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let rgba = pixbuf_to_rgba(&pb)?;
     Some(AnimFrames {
         frames: vec![RawFrame {
             rgba,
-            width: tw as i32,
-            height: th as i32,
+            width: w,
+            height: h,
             delay_ms: 0,
         }],
         plays: 1,
     })
 }
 
-fn decode_apng(path: &str, max_px: i32) -> Option<AnimFrames> {
+fn pixbuf_to_rgba(pb: &Pixbuf) -> Option<Vec<u8>> {
+    let w = pb.width() as usize;
+    let h = pb.height() as usize;
+    let n_ch = pb.n_channels() as usize;
+    let stride = pb.rowstride() as usize;
+    let bytes = pb.read_pixel_bytes();
+    let src = bytes.as_ref();
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let row = y * stride;
+        for x in 0..w {
+            let s = row + x * n_ch;
+            let d = (y * w + x) * 4;
+            if s + n_ch.min(3) > src.len() {
+                return None;
+            }
+            rgba[d] = src[s];
+            rgba[d + 1] = src.get(s + 1).copied().unwrap_or(0);
+            rgba[d + 2] = src.get(s + 2).copied().unwrap_or(0);
+            rgba[d + 3] = if n_ch >= 4 {
+                src.get(s + 3).copied().unwrap_or(255)
+            } else {
+                255
+            };
+        }
+    }
+    Some(rgba)
+}
+
+fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     let file = File::open(path).ok()?;
     let decoder = png::Decoder::new(BufReader::new(file));
     let mut reader = decoder.read_info().ok()?;
     let info = reader.info();
     let full_w = info.width as usize;
     let full_h = info.height as usize;
-    if full_w == 0 || full_h == 0 || full_w * full_h > 4096 * 4096 {
+    if full_w == 0 || full_h == 0 || full_w * full_h > 2048 * 2048 {
         return None;
     }
     let plays = info
@@ -124,8 +192,16 @@ fn decode_apng(path: &str, max_px: i32) -> Option<AnimFrames> {
         .map(|a| a.num_plays)
         .unwrap_or(0);
 
+    let scale = if max_px > 0 {
+        (max_px as f64 / full_w.max(full_h) as f64).min(1.0)
+    } else {
+        1.0
+    };
+    let tw = ((full_w as f64) * scale).round().max(1.0) as u32;
+    let th = ((full_h as f64) * scale).round().max(1.0) as u32;
+
     let mut canvas = vec![0u8; full_w * full_h * 4];
-    let mut out_frames: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut frames: Vec<RawFrame> = Vec::new();
 
     loop {
         let buf_size = match reader.output_buffer_size() {
@@ -138,10 +214,22 @@ fn decode_apng(path: &str, max_px: i32) -> Option<AnimFrames> {
             Err(_) => break,
         };
         let Some(fc) = reader.info().frame_control else {
-            if out_frames.is_empty() {
+            if frames.is_empty() {
                 let rgba =
                     expand_to_rgba(&buf[..out.buffer_size()], out.color_type, out.width, out.height)?;
-                out_frames.push((rgba, 100));
+                let rgba = if tw != full_w as u32 || th != full_h as u32 {
+                    let img = image::RgbaImage::from_raw(out.width, out.height, rgba)?;
+                    image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle)
+                        .into_raw()
+                } else {
+                    rgba
+                };
+                frames.push(RawFrame {
+                    rgba,
+                    width: tw as i32,
+                    height: th as i32,
+                    delay_ms: 100,
+                });
             }
             break;
         };
@@ -219,7 +307,24 @@ fn decode_apng(path: &str, max_px: i32) -> Option<AnimFrames> {
             };
             ((fc.delay_num as u32) * 1000 / den).clamp(20, 5000)
         };
-        out_frames.push((canvas.clone(), delay_ms));
+        // Scale immediately so we never retain a full-res frame list in RAM.
+        let rgba = if tw != full_w as u32 || th != full_h as u32 {
+            let img = image::RgbaImage::from_raw(full_w as u32, full_h as u32, canvas.clone())?;
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
+        } else {
+            canvas.clone()
+        };
+        frames.push(RawFrame {
+            rgba,
+            width: tw as i32,
+            height: th as i32,
+            delay_ms,
+        });
+
+        // Static display: keep first composited frame only.
+        if !animate {
+            break;
+        }
 
         match fc.dispose_op {
             png::DisposeOp::None => {}
@@ -237,37 +342,13 @@ fn decode_apng(path: &str, max_px: i32) -> Option<AnimFrames> {
         }
     }
 
-    if out_frames.is_empty() {
+    if frames.is_empty() {
         return None;
-    }
-
-    let scale = if max_px > 0 {
-        (max_px as f64 / full_w.max(full_h) as f64).min(1.0)
-    } else {
-        1.0
-    };
-    let tw = ((full_w as f64) * scale).round().max(1.0) as u32;
-    let th = ((full_h as f64) * scale).round().max(1.0) as u32;
-
-    let mut frames = Vec::with_capacity(out_frames.len());
-    for (rgba, delay) in out_frames {
-        let rgba = if tw != full_w as u32 || th != full_h as u32 {
-            let img = image::RgbaImage::from_raw(full_w as u32, full_h as u32, rgba)?;
-            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
-        } else {
-            rgba
-        };
-        frames.push(RawFrame {
-            rgba,
-            width: tw as i32,
-            height: th as i32,
-            delay_ms: delay,
-        });
     }
 
     Some(AnimFrames {
         frames,
-        plays: if plays == 1 { 1 } else { 0 },
+        plays: if !animate || plays == 1 { 1 } else { 0 },
     })
 }
 
@@ -277,7 +358,7 @@ fn expand_to_rgba(
     width: u32,
     height: u32,
 ) -> Option<Vec<u8>> {
-    let n = (width as usize) * (height as usize);
+    let n = (width as usize).checked_mul(height as usize)?;
     match color_type {
         png::ColorType::Rgba => Some(buf[..n * 4].to_vec()),
         png::ColorType::Rgb => {

@@ -10,6 +10,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 - [x] QR login (additional device)
 - [x] Chats, messages, stickers, friends
 - [x] Photos, video, voice messages, files
+- [x] Paste and drag-and-drop attachments
 - [x] In-app viewers (image, video, PDF, text)
 - [x] Downloads, tray, Thai / English, themes
 - [x] Discord RPC

@@ -78,25 +78,43 @@ fn worker(rx: Receiver<Cmd>) {
     let mut need_apply = false;
 
     loop {
-        match rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(cmd) => {
-                if handle_cmd(
-                    cmd,
-                    &mut enabled,
-                    &mut app_id,
-                    &mut client,
-                    &mut last,
-                    &mut need_apply,
-                ) {
-                    break;
+        let timed_out = if enabled {
+            match rx.recv_timeout(RECV_TIMEOUT) {
+                Ok(cmd) => {
+                    if handle_cmd(
+                        cmd,
+                        &mut enabled,
+                        &mut app_id,
+                        &mut client,
+                        &mut last,
+                        &mut need_apply,
+                    ) {
+                        break;
+                    }
+                    false
                 }
+                Err(RecvTimeoutError::Timeout) => true,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Err(RecvTimeoutError::Timeout) => {
-                // Heartbeat: refresh presence / attempt reconnect.
-                need_apply = true;
+        } else {
+            // Stay asleep until Settings enables RPC (no periodic wakeups).
+            match rx.recv() {
+                Ok(cmd) => {
+                    if handle_cmd(
+                        cmd,
+                        &mut enabled,
+                        &mut app_id,
+                        &mut client,
+                        &mut last,
+                        &mut need_apply,
+                    ) {
+                        break;
+                    }
+                    false
+                }
+                Err(_) => break,
             }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
+        };
 
         // Drain any burst of updates so we only publish the latest.
         loop {
@@ -115,6 +133,13 @@ fn worker(rx: Receiver<Cmd>) {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if timed_out {
+            // Only reconnect when Discord went away; do not re-push unchanged presence.
+            if enabled && !app_id.is_empty() && client.is_none() {
+                need_apply = true;
             }
         }
 

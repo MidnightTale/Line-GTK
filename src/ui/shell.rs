@@ -911,9 +911,21 @@ pub fn load_css() {
         }
         .line-bubble-sticker {
             background: transparent;
+            background-color: transparent;
             border: none;
-            padding: 2px;
+            box-shadow: none;
+            padding: 0;
+            margin: 0;
             max-width: min(160px, 56%);
+        }
+        .line-bubble-sticker .line-bubble-image,
+        .line-sticker-image {
+            background: transparent;
+            background-color: transparent;
+            border: none;
+            box-shadow: none;
+            border-radius: 0;
+            max-width: 160px;
         }
         .line-flex-card {
             border-radius: 12px;
