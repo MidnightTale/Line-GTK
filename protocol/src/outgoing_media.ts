@@ -139,18 +139,21 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
   async function makeImagePreviewBlob(filePath: string): Promise<Blob | null> {
     try {
       const dest = join(mediaDir, `preview-${Date.now()}.jpg`);
-      const code = `
-  from PIL import Image
-  src=${JSON.stringify(filePath)}
-  dest=${JSON.stringify(dest)}
-  im=Image.open(src)
-  im.thumbnail((640, 640))
-  if im.mode not in ("RGB","L"):
-      im=im.convert("RGB")
-  im.save(dest, "JPEG", quality=80, optimize=True)
-  `;
-      const p = new Deno.Command("python3", {
-        args: ["-c", code],
+      const p = new Deno.Command("ffmpeg", {
+        args: [
+          "-y",
+          "-v",
+          "error",
+          "-i",
+          filePath,
+          "-vf",
+          "scale=640:640:force_original_aspect_ratio=decrease",
+          "-frames:v",
+          "1",
+          "-q:v",
+          "4",
+          dest,
+        ],
         stdout: "null",
         stderr: "null",
       });

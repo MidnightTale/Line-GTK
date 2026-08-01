@@ -63,7 +63,7 @@ pub fn open(parent: &impl IsA<gtk::Window>, sidecar: Rc<Sidecar>, data_dir: &Pat
     let dependencies = libadwaita::PreferencesGroup::builder()
         .title(crate::i18n::t("diagnostics_dependencies"))
         .build();
-    for program in ["ffmpeg", "ffprobe", "pdftoppm", "pdftotext", "python3"] {
+    for program in ["ffmpeg", "ffprobe", "pdftoppm", "pdftotext"] {
         dependencies.add(&row(program, &program_version(program)));
     }
     dependencies.add(&row(

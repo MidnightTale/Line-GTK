@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
   workflow_dispatch:
 
@@ -60,3 +60,22 @@ jobs:
       - name: Install runtime and build libraries
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev ffmpeg
       - run: ./packaging/make-prebuild.sh
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    needs: [rust, protocol]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Flatpak build tools
+        run: sudo apt-get update && sudo apt-get install -y appstream flatpak flatpak-builder libgtk-4-dev libadwaita-1-dev ffmpeg
+      - name: Add Flathub
+        run: flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+      - name: Validate application metadata
+        run: appstreamcli validate --no-net packaging/flatpak/dev.linegtk.LineGtk.metainfo.xml
+      - name: Build and smoke-test Flatpak bundle
+        run: ./packaging/make-flatpak.sh

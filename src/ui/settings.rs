@@ -912,7 +912,7 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
     about.add(
         &libadwaita::ActionRow::builder()
             .title(i18n::t("about_version"))
-            .subtitle(i18n::t("about_version_value"))
+            .subtitle(env!("CARGO_PKG_VERSION"))
             .build(),
     );
     {

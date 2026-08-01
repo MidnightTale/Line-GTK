@@ -149,20 +149,25 @@ export function createMediaCache(runtime: MediaCacheRuntime) {
     path: string,
   ): Promise<{ w: number; h: number } | null> {
     try {
-      const code = `
-  from PIL import Image
-  im=Image.open(${JSON.stringify(path)})
-  print(im.size[0], im.size[1])
-  `;
-      const p = new Deno.Command("python3", {
-        args: ["-c", code],
+      const p = new Deno.Command("ffprobe", {
+        args: [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=width,height",
+          "-of",
+          "csv=s=x:p=0",
+          path,
+        ],
         stdout: "piped",
         stderr: "null",
       });
       const { success, stdout } = await p.output();
       if (!success) return null;
       const text = new TextDecoder().decode(stdout).trim();
-      const [ws, hs] = text.split(/\s+/);
+      const [ws, hs] = text.split("x");
       const w = Number(ws);
       const h = Number(hs);
       if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) {
@@ -277,18 +282,21 @@ export function createMediaCache(runtime: MediaCacheRuntime) {
       return null;
     }
     try {
-      const code = `
-  from PIL import Image
-  src=${JSON.stringify(src)}
-  dest=${JSON.stringify(dest)}
-  im=Image.open(src)
-  im.thumbnail((${THUMB_MAX},${THUMB_MAX}))
-  if im.mode not in ("RGB","L"):
-      im=im.convert("RGB")
-  im.save(dest, "JPEG", quality=80, optimize=True)
-  `;
-      const p = new Deno.Command("python3", {
-        args: ["-c", code],
+      const p = new Deno.Command("ffmpeg", {
+        args: [
+          "-y",
+          "-v",
+          "error",
+          "-i",
+          src,
+          "-vf",
+          `scale=${THUMB_MAX}:${THUMB_MAX}:force_original_aspect_ratio=decrease`,
+          "-frames:v",
+          "1",
+          "-q:v",
+          "4",
+          dest,
+        ],
         stdout: "null",
         stderr: "null",
       });

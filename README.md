@@ -24,7 +24,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 | Dependency | Notes |
 | --- | --- |
 | Rust | stable toolchain |
-| GTK4 + Libadwaita | e.g. `pacman -S gtk4 libadwaita` |
+| GTK4 + Libadwaita | `pacman -S gtk4 libadwaita` |
 | Deno | Build-time protocol compiler; source-tree runs use `deno` or `DENO` |
 | ffmpeg / ffprobe | voice record, video thumbs |
 | Optional | `pdftoppm`, `pdftotext` for PDF preview |
@@ -38,13 +38,16 @@ Wayland and X11 both work. Tested mainly on Arch-based desktops.
 ```bash
 # Development snapshot
 yay -S line-gtk-git
-# or: paru -S line-gtk-git
 
 # Tagged release
 yay -S line-gtk
 ```
 
-`line-gtk` and `line-gtk-git` conflict; install only one.
+## Install (Flatpak bundle)
+```bash
+flatpak install --user ./line-gtk-0.1.2-x86_64.flatpak
+flatpak run dev.linegtk.LineGtk
+```
 
 ## Build and run
 

@@ -66,6 +66,8 @@ fn discover_repo_root() -> Result<PathBuf> {
         // System package layout (AUR / distro install).
         PathBuf::from("/usr/share/line-gtk"),
         PathBuf::from("/usr/local/share/line-gtk"),
+        // Flatpak application layout.
+        PathBuf::from("/app/share/line-gtk"),
         env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         exe.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
     ];

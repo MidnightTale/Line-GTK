@@ -1,0 +1,39 @@
+id: dev.linegtk.LineGtk
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+command: line-gtk
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --filesystem=xdg-run/discord-ipc-0
+
+modules:
+  - name: line-gtk
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 line-gtk /app/bin/line-gtk
+      - install -d /app/share/line-gtk
+      - cp -a protocol assets /app/share/line-gtk/
+      - install -Dm644 dev.linegtk.LineGtk.desktop /app/share/applications/dev.linegtk.LineGtk.desktop
+      - sed -i 's/^Icon=.*/Icon=dev.linegtk.LineGtk/' /app/share/applications/dev.linegtk.LineGtk.desktop
+      - install -Dm644 assets/icons/hicolor/48x48/apps/line-gtk.png /app/share/icons/hicolor/48x48/apps/dev.linegtk.LineGtk.png
+      - install -Dm644 assets/icons/hicolor/64x64/apps/line-gtk.png /app/share/icons/hicolor/64x64/apps/dev.linegtk.LineGtk.png
+      - install -Dm644 assets/icons/hicolor/128x128/apps/line-gtk.png /app/share/icons/hicolor/128x128/apps/dev.linegtk.LineGtk.png
+      - install -Dm644 assets/icons/hicolor/256x256/apps/line-gtk.png /app/share/icons/hicolor/256x256/apps/dev.linegtk.LineGtk.png
+      - install -Dm644 assets/icons/hicolor/scalable/apps/line-gtk.svg /app/share/icons/hicolor/scalable/apps/dev.linegtk.LineGtk.svg
+      - install -Dm644 dev.linegtk.LineGtk.metainfo.xml /app/share/metainfo/dev.linegtk.LineGtk.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/dev.linegtk.LineGtk/LICENSE
+      - install -Dm644 README.md /app/share/doc/line-gtk/README.md
+    sources:
+      - type: dir
+        path: payload
+      - type: file
+        path: dev.linegtk.LineGtk.metainfo.xml
