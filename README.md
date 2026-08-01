@@ -59,10 +59,21 @@ cargo build --release
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 deno task --config protocol/deno.json check
 ```
+
+## Architecture
+
+The Rust UI entrypoint coordinates feature modules in `src/ui/`: chats,
+messages and voice playback, media viewing, attachment composition, calls,
+notifications, diagnostics, downloads, settings, friends, and login.
+
+The Deno entrypoint coordinates typed services in `protocol/src/`: commands,
+authentication, listening, calls, stickers, outgoing media, media caching,
+message presentation, contacts, cache policy, and private atomic storage. Keep
+feature implementation in these modules rather than growing either entrypoint.
 
 ---
 

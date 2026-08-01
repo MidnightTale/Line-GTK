@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert";
 import { picturePathOf, profileUrl } from "../src/contacts.ts";
-import { isMediaType, normalizeRaw } from "../src/messages.ts";
+import { coerceI64, isMediaType, normalizeRaw } from "../src/messages.ts";
 
 Deno.test("message normalization supplies metadata", () => {
   assertEquals(normalizeRaw({ text: "hello" }), {
@@ -9,6 +9,11 @@ Deno.test("message normalization supplies metadata", () => {
   });
   assertEquals(isMediaType("IMAGE"), true);
   assertEquals(isMediaType("NONE"), false);
+});
+
+Deno.test("thrift integer coercion preserves large identifiers", () => {
+  assertEquals(coerceI64("42"), 42);
+  assertEquals(coerceI64("9007199254740993"), 9007199254740993n);
 });
 
 Deno.test("contact picture helpers normalize LINE paths", () => {
