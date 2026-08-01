@@ -1,0 +1,59 @@
+# Maintainer: MidnightTale <mntale@pm.me>
+pkgname=line-gtk
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Unofficial native LINE client for Linux (GTK4 / Libadwaita)'
+arch=('x86_64')
+url='https://github.com/MidnightTale/Line-GTK'
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'libadwaita' 'ffmpeg' 'deno' 'hicolor-icon-theme')
+makedepends=('cargo' 'git')
+optdepends=(
+  'poppler: PDF preview in media viewer'
+  'gst-plugins-good: extra video playback codecs'
+  'gst-libav: extra video playback codecs'
+)
+conflicts=('line-gtk-git')
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/MidnightTale/Line-GTK/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "Line-GTK-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "Line-GTK-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd "Line-GTK-$pkgver"
+
+  install -Dm755 target/release/line-gtk "$pkgdir/usr/bin/line-gtk"
+
+  install -d "$pkgdir/usr/share/line-gtk"
+  cp -a protocol "$pkgdir/usr/share/line-gtk/protocol"
+  cp -a assets "$pkgdir/usr/share/line-gtk/assets"
+
+  # Keep sources for Deno; drop huge caches if any appear later.
+  rm -rf "$pkgdir/usr/share/line-gtk/protocol/node_modules" \
+         "$pkgdir/usr/share/line-gtk/protocol/.deno" 2>/dev/null || true
+
+  install -Dm644 packaging/dev.linegtk.LineGtk.desktop \
+    "$pkgdir/usr/share/applications/dev.linegtk.LineGtk.desktop"
+
+  for size in 48x48 64x64 128x128 256x256; do
+    install -Dm644 "assets/icons/hicolor/${size}/apps/line-gtk.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}/apps/line-gtk.png"
+  done
+  install -Dm644 assets/icons/hicolor/scalable/apps/line-gtk.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/line-gtk.svg"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

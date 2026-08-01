@@ -33,11 +33,24 @@ Wayland and X11 both work. Tested mainly on Arch-based desktops.
 
 ---
 
+## Install (Arch / AUR)
+
+```bash
+# Development snapshot
+yay -S line-gtk-git
+# or: paru -S line-gtk-git
+
+# Tagged release
+yay -S line-gtk
+```
+
+`line-gtk` and `line-gtk-git` conflict; install only one.
+
 ## Build and run
 
 ```bash
-git clone https://github.com/MidnightTale/line-gtk.git
-cd line-gtk
+git clone https://github.com/MidnightTale/Line-GTK.git
+cd Line-GTK
 cargo build --release
 ./target/release/line-gtk
 ```

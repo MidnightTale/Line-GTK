@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=LINE GTK
+Comment=Native unofficial LINE client
+Exec=line-gtk
+Icon=line-gtk
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;
+StartupWMClass=dev.linegtk.LineGtk
+StartupNotify=true

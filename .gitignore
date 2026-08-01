@@ -9,6 +9,5 @@ protocol/linejs-storage.json
 # OS
 .DS_Store
 *~
-protocol/deno.lock
-Cargo.lock
 protocol/vendor/linejs-call/README.md
+packaging/aur/README.md

@@ -47,15 +47,26 @@ vah264dec:MAX,vah265dec:MAX,vavp9dec:MAX,vaav1dec:MAX";
 
 fn discover_repo_root() -> Result<PathBuf> {
     if let Ok(p) = env::var("LINE_GTK_ROOT") {
-        return Ok(PathBuf::from(p));
+        let root = PathBuf::from(p);
+        if root.join("protocol/src/main.ts").exists() {
+            return Ok(root);
+        }
+        anyhow::bail!(
+            "LINE_GTK_ROOT={} missing protocol/src/main.ts",
+            root.display()
+        );
     }
+
     let exe = env::current_exe().context("current_exe")?;
     let mut candidates = vec![
+        // System package layout (AUR / distro install).
+        PathBuf::from("/usr/share/line-gtk"),
+        PathBuf::from("/usr/local/share/line-gtk"),
         env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         exe.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
     ];
     if let Some(p) = exe.parent().and_then(|p| p.parent()) {
-        // target/debug -> repo root
+        // target/release -> repo root (dev builds)
         candidates.push(p.parent().unwrap_or(p).to_path_buf());
         candidates.push(p.to_path_buf());
     }
@@ -64,5 +75,7 @@ fn discover_repo_root() -> Result<PathBuf> {
             return Ok(c);
         }
     }
-    Ok(PathBuf::from("/home/mid/Projects/line-gtk"))
+    anyhow::bail!(
+        "could not find LINE GTK resources (protocol/src/main.ts); set LINE_GTK_ROOT"
+    )
 }
