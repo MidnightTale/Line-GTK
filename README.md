@@ -55,10 +55,6 @@ cargo build --release
 ./target/release/line-gtk
 ```
 
-Packaged releases include a compiled protocol runtime and do not download Deno
-dependencies on first launch. Source-tree runs use the lockfile-pinned Deno
-dependencies.
-
 ## Development checks
 
 ```bash
@@ -67,9 +63,6 @@ cargo clippy --all-targets --all-features
 cargo test --all-targets --all-features
 deno task --config protocol/deno.json check
 ```
-
-The Settings → Account page includes Diagnostics for protocol health, dependency
-versions, media codecs, data paths, and the application log.
 
 ---
 
