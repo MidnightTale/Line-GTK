@@ -1,6 +1,6 @@
 # Maintainer: MidnightTale <mntale@pm.me>
 pkgname=line-gtk
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Unofficial native LINE client for Linux (GTK4 / Libadwaita)'
 arch=('x86_64')

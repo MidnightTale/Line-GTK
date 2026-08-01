@@ -750,6 +750,7 @@ async function forUiMessages(messages: Json[]): Promise<Json[]> {
       }
     } else if (ct === "IMAGE" || ct === "VIDEO") {
       const cached = await existingImage(thumbDest(id)) ||
+        await existingFullImage(id) ||
         await existingImage(mediaDest(id)) ||
         await existingImage(mediaDest(id, "png"));
       if (cached) {
@@ -999,7 +1000,14 @@ async function existingImage(path: string): Promise<string | null> {
 
 async function writeImageFile(dest: string, buf: Uint8Array): Promise<string | null> {
   if (!isImageBytes(buf)) return null;
-  await Deno.writeFile(dest, buf);
+  const tmp = `${dest}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    await Deno.writeFile(tmp, buf);
+    await Deno.rename(tmp, dest);
+  } catch (e) {
+    try { await Deno.remove(tmp); } catch { /* ignore */ }
+    throw e;
+  }
   return dest;
 }
 
@@ -1143,7 +1151,23 @@ async function writeFullImage(
 async function makeThumb(src: string, id: string): Promise<string | null> {
   const dest = thumbDest(id);
   const hit = await existingImage(dest);
-  if (hit) return hit;
+  // If we already have a full original, rebuild thumb from it (OBS preview thumbs
+  // are often cached first and would otherwise stick forever).
+  const srcIsFull = src.includes(".full.");
+  if (hit && !srcIsFull) return hit;
+  if (hit && srcIsFull) {
+    try {
+      const hs = await Deno.stat(hit);
+      const ss = await Deno.stat(src);
+      if (hs.size >= ss.size || (await isPreviewOrThumbImage(hit))) {
+        try {
+          await Deno.remove(hit);
+        } catch { /* ignore */ }
+      } else {
+        return hit;
+      }
+    } catch { /* recreate below */ }
+  }
   if (!(await isImageFile(src))) return null;
   try {
     const st = await Deno.stat(src);
@@ -1613,9 +1637,17 @@ async function summarizeRawMessage(
   }
 }
 
-async function hydrateMedia(messages: Json[], chatMid: string) {
+async function hydrateMedia(
+  messages: Json[],
+  chatMid: string,
+  opts: { isolated?: boolean } = {},
+) {
   if (!client || !stdoutAlive) return;
-  const epoch = bumpMediaEpoch(chatMid);
+  // Live listen hydrates must not bump the chat epoch — a concurrent fetch would
+  // cancel the download and leave the bubble stuck until restart.
+  const isolated = !!opts.isolated;
+  const epoch = isolated ? -1 : bumpMediaEpoch(chatMid);
+  const epochOk = () => isolated || mediaEpoch.get(chatMid) === epoch;
   const gen = workGen;
   const pending = messages
     .filter((m) => m.needsMedia && m.id)
@@ -1628,12 +1660,13 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
 
   const failOne = (id: string) => {
     if (!stdoutAlive || workGen !== gen) return;
+    if (!epochOk()) return;
     emitEvent("media_failed", { chatMid, messageId: id });
   };
 
   const work = async (m: Json) => {
     if (!client || !stdoutAlive || workGen !== gen) return;
-    if (mediaEpoch.get(chatMid) !== epoch) return;
+    if (!epochOk()) return;
     try {
       const id = String(m.id);
       const ct = normType(m.contentType);
@@ -1645,7 +1678,7 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
           failOne(id);
           return;
         }
-        if (mediaEpoch.get(chatMid) !== epoch) return;
+        if (!epochOk()) return;
         path = await ensureStickerImage(stkId);
         if (path) {
           emitEvent("media_ready", { chatMid, messageId: id, imagePath: path });
@@ -1742,7 +1775,7 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
             isPreview: true,
             isSquare: false,
           });
-          if (mediaEpoch.get(chatMid) !== epoch) return;
+          if (!epochOk()) return;
           const buf = new Uint8Array(await file.arrayBuffer());
           if (buf.length > 32 && isImageBytes(buf)) {
             await writeImageFile(thumbDest(id), buf);
@@ -1766,7 +1799,7 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
         }
       }
 
-      if (path && mediaEpoch.get(chatMid) === epoch) {
+      if (path && epochOk()) {
         // If hydrate somehow still got a preview, demote it to thumb and keep downloading.
         if (ct !== "VIDEO" && (await isPreviewOrThumbImage(path))) {
           try {
@@ -1779,12 +1812,13 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
           if (got && isImageBytes(got.buf)) {
             path = await writeFullImage(id, got.buf, got.mime);
           } else {
-            path = null;
+            // Keep preview thumb rather than failing the bubble.
+            path = await existingImage(thumbDest(id));
           }
         }
       }
 
-      if (path && mediaEpoch.get(chatMid) === epoch) {
+      if (path && epochOk()) {
         const uiPath = await uiMediaPath(id, path);
         m.imagePath = uiPath || path;
         m.needsMedia = false;
@@ -1811,7 +1845,7 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
           filePath: m.filePath ?? (ct === "VIDEO" ? null : path),
         });
         await sleep(30);
-      } else if (mediaEpoch.get(chatMid) === epoch) {
+      } else if (epochOk()) {
         // Still show thumb in UI if we have one; mark failed only when nothing.
         const thumb = await existingImage(thumbDest(id));
         if (thumb) {
@@ -1836,7 +1870,7 @@ async function hydrateMedia(messages: Json[], chatMid: string) {
   };
 
   await mapPool(first, MEDIA_CONCURRENCY, (m) => work(m));
-  if (mediaEpoch.get(chatMid) !== epoch) return;
+  if (!epochOk()) return;
   await sleep(120);
   await mapPool(rest, MEDIA_CONCURRENCY, (m) => work(m));
 }
@@ -2114,6 +2148,134 @@ async function upsertChatFromContact(mid: string) {
   if (row.picturePath && !row.avatarPath) hydrateAvatars([row]);
 }
 
+/**
+ * Hydrate media for a just-received TalkMessage using tm.getData() directly.
+ * refetchMessageData() walks recent history and often misses the brand-new id.
+ */
+async function hydrateLiveMedia(
+  tm: TalkMessage,
+  message: Json,
+  chatMid: string,
+) {
+  if (!client || !stdoutAlive) return;
+  const id = String(message.id ?? "");
+  const ct = normType(message.contentType);
+  if (!id) return;
+
+  if (ct === "STICKER" || ct === "AUDIO" || ct === "FILE") {
+    await hydrateMedia([message], chatMid, { isolated: true });
+    return;
+  }
+
+  const fail = () => {
+    if (!stdoutAlive) return;
+    emitEvent("media_failed", { chatMid, messageId: id });
+  };
+
+  try {
+    let path = await existingFullImage(id);
+
+    if (!path) {
+      try {
+        const blob = await tm.getData(false);
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        if (ct === "VIDEO") {
+          path = await materializeVideoPreview(id, buf);
+        } else if (isImageBytes(buf)) {
+          path = await writeFullImage(id, buf, blob.type || "");
+        } else if (buf.length > 1024) {
+          // Some video payloads lack an image magic header.
+          path = await materializeVideoPreview(id, buf);
+        }
+      } catch (e) {
+        console.error("[hydrateLive getData]", id, e);
+      }
+    }
+
+    if (!path && typeof message.imageUrl === "string" && message.imageUrl) {
+      path = await cacheUrl(String(message.imageUrl), fullDest(id, "jpg"));
+      if (path && (await isPreviewOrThumbImage(path))) {
+        try {
+          await Deno.copyFile(path, thumbDest(id));
+          await Deno.remove(path);
+        } catch { /* ignore */ }
+        path = null;
+      }
+    }
+
+    if (!path && client) {
+      try {
+        const file = await client.base.obs.downloadMessageData({
+          messageId: id,
+          isPreview: true,
+          isSquare: false,
+        });
+        const buf = new Uint8Array(await file.arrayBuffer());
+        if (buf.length > 32 && isImageBytes(buf)) {
+          await writeImageFile(thumbDest(id), buf);
+        }
+      } catch (e) {
+        console.error("[hydrateLive obs preview]", id, e);
+      }
+    }
+
+    if (!path) {
+      const got = await refetchMessageData(chatMid, id, {
+        allowNonImage: ct === "VIDEO",
+      });
+      if (got) {
+        if (ct === "VIDEO") {
+          path = await materializeVideoPreview(id, got.buf);
+        } else if (isImageBytes(got.buf)) {
+          path = await writeFullImage(id, got.buf, got.mime);
+        }
+      }
+    }
+
+    if (!path) {
+      path = await existingImage(thumbDest(id));
+    }
+
+    if (!path) {
+      fail();
+      return;
+    }
+
+    const uiPath = await uiMediaPath(id, path);
+    const imagePath = uiPath || path;
+    let filePath: string | null = null;
+    if (ct === "VIDEO") {
+      filePath = await existingFile(mediaDest(id, "mp4"));
+    } else if (!path.includes(".thumb.")) {
+      filePath = path;
+    }
+
+    message.imagePath = imagePath;
+    message.needsMedia = false;
+    if (filePath) message.filePath = filePath;
+
+    const cached = msgCache.get(chatMid);
+    if (cached) {
+      const row = cached.messages.find((x) => String(x.id) === id);
+      if (row) {
+        row.imagePath = imagePath;
+        row.needsMedia = false;
+        if (filePath) row.filePath = filePath;
+      }
+    }
+
+    emitEvent("media_ready", {
+      chatMid,
+      messageId: id,
+      imagePath,
+      filePath,
+    });
+  } catch (e) {
+    console.error("[hydrateLiveMedia]", id, e);
+    fail();
+  }
+}
+
 async function startListen() {
   if (!client || listening) return;
   listening = true;
@@ -2121,13 +2283,21 @@ async function startListen() {
   // Register BEFORE listen() so early ops are not missed.
   client.on("message", async (msg) => {
     try {
-      const message = await summarizeTalkMessage(msg as TalkMessage, { withMedia: false });
+      const tm = msg as TalkMessage;
+      const message = await summarizeTalkMessage(tm, { withMedia: false });
       const peer = message.mine ? String(message.to) : String(message.from);
       msgCache.delete(peer);
+      // Advance box cursor so later refetch can see this message.
+      storeBoxCursor(peer, {
+        messageId: message.id,
+        deliveredTime: message.createdTime,
+      });
       emitEvent("message", { message: { ...message, imagePath: null } });
       await upsertChatFromMessage(message);
       if (message.needsMedia) {
-        hydrateMedia([message], peer);
+        // Use the live TalkMessage.getData path — history refetch often misses
+        // brand-new messages and left bubbles on "Image unavailable" until restart.
+        void hydrateLiveMedia(tm, message, peer);
       }
     } catch (e) {
       console.error("[listen message]", e);

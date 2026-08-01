@@ -1,4 +1,5 @@
 mod config;
+mod desktop_notify;
 mod discord_rpc;
 mod i18n;
 mod protocol;

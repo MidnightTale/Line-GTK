@@ -149,6 +149,18 @@ pub struct AppState {
     pub self_picture_url: Rc<RefCell<Option<String>>>,
     /// Avoid double full rebuilds when warm cache + fetch return the same list.
     pub msg_list_fp: Rc<RefCell<Option<(String, usize, String, String)>>>,
+    /// Desktop notifications waiting for media hydrate (message id → meta).
+    pub notif_pending: Rc<RefCell<HashMap<String, PendingNotif>>>,
+    /// imagePath from media_ready that arrived before the bubble slot existed.
+    pub media_ready_paths: Rc<RefCell<HashMap<String, String>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingNotif {
+    pub chat_mid: String,
+    pub title: String,
+    pub body: String,
+    pub avatar_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +368,8 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         self_avatar_path: Rc::new(RefCell::new(None)),
         self_picture_url: Rc::new(RefCell::new(None)),
         msg_list_fp: Rc::new(RefCell::new(None)),
+        notif_pending: Rc::new(RefCell::new(HashMap::new())),
+        media_ready_paths: Rc::new(RefCell::new(HashMap::new())),
     };
 
     apply_ui_language(&state);
@@ -364,6 +378,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
     wire_composer_narrow(&state);
     wire_actions(&state);
     wire_scroll_pin(&state);
+    wire_notification_actions(&state);
     sync_tray(&state);
     apply_close_behavior(&state);
     sync_discord_rpc(&state);
@@ -777,27 +792,10 @@ fn pump_tray_actions(state: AppState, rx: async_channel::Receiver<crate::tray::T
         while let Ok(action) = rx.recv().await {
             match action {
                 crate::tray::TrayAction::Show => {
-                    state.window.set_visible(true);
-                    state.window.present();
+                    present_main_window(&state);
                 }
                 crate::tray::TrayAction::OpenChat { mid } => {
-                    state.window.set_visible(true);
-                    state.window.present();
-                    if !*state.session_ready.borrow() {
-                        toast(&state, &crate::i18n::t("still_restoring"));
-                        continue;
-                    }
-                    let chat = state
-                        .chats
-                        .borrow()
-                        .iter()
-                        .find(|c| c.mid == mid)
-                        .cloned();
-                    if let Some(chat) = chat {
-                        open_chat(&state, &chat);
-                    } else {
-                        toast(&state, &crate::i18n::t("tray_chat_missing"));
-                    }
+                    present_and_open_chat(&state, &mid);
                 }
                 crate::tray::TrayAction::MuteFor { secs } => {
                     set_global_notif_mute(&state, secs);
@@ -820,6 +818,42 @@ fn pump_tray_actions(state: AppState, rx: async_channel::Receiver<crate::tray::T
             }
         }
     });
+}
+
+fn present_main_window(state: &AppState) {
+    state.window.set_visible(true);
+    state.window.present();
+}
+
+fn present_and_open_chat(state: &AppState, mid: &str) {
+    present_main_window(state);
+    if !*state.session_ready.borrow() {
+        toast(state, &crate::i18n::t("still_restoring"));
+        return;
+    }
+    let chat = state
+        .chats
+        .borrow()
+        .iter()
+        .find(|c| c.mid == mid)
+        .cloned();
+    if let Some(chat) = chat {
+        open_chat(state, &chat);
+    } else {
+        toast(state, &crate::i18n::t("tray_chat_missing"));
+    }
+}
+
+fn wire_notification_actions(state: &AppState) {
+    let open = gio::SimpleAction::new("open-chat", Some(glib::VariantTy::STRING));
+    let s = state.clone();
+    open.connect_activate(move |_a, param| {
+        let Some(mid) = param.and_then(|p| p.str().map(str::to_string)) else {
+            return;
+        };
+        present_and_open_chat(&s, &mid);
+    });
+    state.app.add_action(&open);
 }
 /// Composer switches to icon-only send below this conversation width.
 const COMPOSER_NARROW_PX: i32 = 420;
@@ -2069,6 +2103,15 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             audio_path,
             file_path,
         } => {
+            // Always remember hydrated paths so list rebuilds / late bubbles can attach.
+            if !image_path.is_empty() && std::path::Path::new(&image_path).exists() {
+                state
+                    .media_ready_paths
+                    .borrow_mut()
+                    .insert(message_id.clone(), image_path.clone());
+                refresh_notification_media(state, &message_id, &image_path);
+            }
+
             if state.current_chat.borrow().as_deref() != Some(chat_mid.as_str()) {
                 return;
             }
@@ -2105,6 +2148,17 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
         } => {
             if state.current_chat.borrow().as_deref() != Some(chat_mid.as_str()) {
                 return;
+            }
+            // A later/parallel hydrate may already have the bytes on disk.
+            if let Some(path) = state.media_ready_paths.borrow().get(&message_id).cloned() {
+                if std::path::Path::new(&path).exists() {
+                    state
+                        .media_queue
+                        .borrow_mut()
+                        .push_back((message_id, path));
+                    pump_media_queue(state);
+                    return;
+                }
             }
             mark_media_failed(state, &message_id);
         }
@@ -2863,6 +2917,35 @@ fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
     if !msg.id.is_empty() && !state.seen_msg_ids.borrow_mut().insert(msg.id.clone()) {
         return;
     }
+
+    // Prefer a path that already finished hydrating (race with list rebuild).
+    let ready_path = {
+        let missing = msg
+            .image_path
+            .as_deref()
+            .map(|p| !std::path::Path::new(p).exists())
+            .unwrap_or(true);
+        if missing {
+            state
+                .media_ready_paths
+                .borrow()
+                .get(&msg.id)
+                .filter(|p| std::path::Path::new(p).exists())
+                .cloned()
+        } else {
+            None
+        }
+    };
+    let msg_owned;
+    let msg = if let Some(path) = ready_path {
+        msg_owned = MessageInfo {
+            image_path: Some(path),
+            ..msg.clone()
+        };
+        &msg_owned
+    } else {
+        msg
+    };
 
     let list = &state.message_list;
 
@@ -6649,6 +6732,12 @@ fn pump_media_queue(state: &AppState) {
     }
 
     let Some(bubble) = state.media_slots.borrow().get(&message_id).cloned() else {
+        // Bubble not mounted yet (list rebuild / idle chunk). Keep the path so
+        // append_message can attach it when the row appears; do not spin the queue.
+        state
+            .media_ready_paths
+            .borrow_mut()
+            .insert(message_id, image_path);
         let state = state.clone();
         glib::idle_add_local_once(move || pump_media_queue(&state));
         return;
@@ -6670,7 +6759,12 @@ fn pump_media_queue(state: &AppState) {
     let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
     let image_path2 = image_path.clone();
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&image_path2, max_px, animate));
+        let loaded = crate::sticker_anim::load_scaled(&image_path2, max_px, animate).or_else(|| {
+            // Brief retry — avoids rare races right after atomic rename.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            crate::sticker_anim::load_scaled(&image_path2, max_px, animate)
+        });
+        let _ = tx.send_blocking(loaded);
     });
     glib::spawn_future_local(async move {
         let frames = rx.recv().await.ok().flatten();
@@ -6748,6 +6842,7 @@ fn clear_messages(state: &AppState) {
     *state.new_sep_row.borrow_mut() = None;
     *state.pending_new_below.borrow_mut() = 0;
     state.jump_banner.set_reveal_child(false);
+    // Keep media_ready_paths across rebuilds so late slots can still attach.
 }
 
 fn message_tracks_media(msg: &MessageInfo) -> bool {
@@ -7137,22 +7232,134 @@ fn notify_incoming(state: &AppState, msg: &MessageInfo, peer_mid: &str) {
     if muted {
         return;
     }
-    let name = state
+    let (name, avatar_path) = state
         .chats
         .borrow()
         .iter()
         .find(|c| c.mid == peer_mid)
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| peer_mid.to_string());
+        .map(|c| (c.name.clone(), c.avatar_path.clone()))
+        .unwrap_or_else(|| (peer_mid.to_string(), None));
     let body = preview_body_ui(msg);
-    let n = gio::Notification::new(&name);
-    n.set_body(Some(&body));
-    n.set_priority(gio::NotificationPriority::Normal);
-    state
-        .app
-        .send_notification(Some(&format!("line-gtk-{}", msg.id)), &n);
+    let image_path = msg
+        .image_path
+        .as_deref()
+        .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        .map(str::to_string);
+
+    if !msg.id.is_empty() {
+        let mut pending = state.notif_pending.borrow_mut();
+        if pending.len() > 64 {
+            pending.clear();
+        }
+        pending.insert(
+            msg.id.clone(),
+            PendingNotif {
+                chat_mid: peer_mid.to_string(),
+                title: name.clone(),
+                body: body.clone(),
+                avatar_path: avatar_path.clone(),
+            },
+        );
+    }
+
+    send_desktop_notification(
+        state,
+        &name,
+        &body,
+        avatar_path.as_deref(),
+        image_path.as_deref(),
+        peer_mid,
+        &msg.id,
+        false,
+    );
+
     if state.config.borrow().notification_sound {
         play_notification_sound(state);
+    }
+}
+
+fn refresh_notification_media(state: &AppState, message_id: &str, image_path: &str) {
+    if !notifications_allowed(state) {
+        return;
+    }
+    let Some(meta) = state.notif_pending.borrow().get(message_id).cloned() else {
+        return;
+    };
+    let muted = state
+        .chats
+        .borrow()
+        .iter()
+        .find(|c| c.mid == meta.chat_mid)
+        .map(|c| c.muted)
+        .unwrap_or(false);
+    if muted {
+        return;
+    }
+    // Don't bump the banner again if the user is focused on this chat.
+    let viewing = state.current_chat.borrow().as_deref() == Some(meta.chat_mid.as_str());
+    if viewing && state.window.is_active() {
+        state.notif_pending.borrow_mut().remove(message_id);
+        return;
+    }
+
+    send_desktop_notification(
+        state,
+        &meta.title,
+        &meta.body,
+        meta.avatar_path.as_deref(),
+        Some(image_path),
+        &meta.chat_mid,
+        message_id,
+        true,
+    );
+}
+
+fn send_desktop_notification(
+    state: &AppState,
+    title: &str,
+    body: &str,
+    avatar_path: Option<&str>,
+    image_path: Option<&str>,
+    chat_mid: &str,
+    message_id: &str,
+    suppress_sound: bool,
+) {
+    match crate::desktop_notify::show_chat_notification(
+        title,
+        body,
+        avatar_path,
+        image_path,
+        chat_mid,
+        message_id,
+        state.tray_tx.clone(),
+        suppress_sound,
+    ) {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::warn!("notify-rust failed ({e}); falling back to gio::Notification");
+            let n = gio::Notification::new(title);
+            n.set_body(Some(body));
+            n.set_priority(gio::NotificationPriority::Normal);
+            n.set_default_action_and_target_value(
+                "app.open-chat",
+                Some(&chat_mid.to_variant()),
+            );
+            if let Some(path) = avatar_path.filter(|p| std::path::Path::new(p).exists()) {
+                let file = gio::File::for_path(path);
+                n.set_icon(&gio::FileIcon::new(&file));
+            } else if let Some(path) = image_path.filter(|p| std::path::Path::new(p).exists()) {
+                let file = gio::File::for_path(path);
+                n.set_icon(&gio::FileIcon::new(&file));
+            } else {
+                n.set_icon(&gio::ThemedIcon::new("line-gtk"));
+            }
+            let id = if message_id.is_empty() {
+                format!("line-gtk-{}", chat_mid)
+            } else {
+                format!("line-gtk-{message_id}")
+            };
+            state.app.send_notification(Some(&id), &n);
+        }
     }
 }
 
