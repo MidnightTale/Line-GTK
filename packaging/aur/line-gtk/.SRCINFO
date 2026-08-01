@@ -1,6 +1,6 @@
 pkgbase = line-gtk
 	pkgdesc = Unofficial native LINE client for Linux (GTK4 / Libadwaita)
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/MidnightTale/Line-GTK
 	arch = x86_64
@@ -17,7 +17,7 @@ pkgbase = line-gtk
 	optdepends = gst-libav: extra video playback codecs
 	conflicts = line-gtk-git
 	options = !lto
-	source = line-gtk-0.1.0.tar.gz::https://github.com/MidnightTale/Line-GTK/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = 8dcc3b67296336c1a823c19beaa0008eb96d92c608961bbf5bb33e79eec0379b
+	source = line-gtk-0.1.1.tar.gz::https://github.com/MidnightTale/Line-GTK/archive/refs/tags/v0.1.1.tar.gz
+	sha256sums = 2c1f0d124dbeac70d76d646e9d8fe490b6e3233f8a731d8fa32faa1267d280ec
 
 pkgname = line-gtk
