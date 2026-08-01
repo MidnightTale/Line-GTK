@@ -1,10 +1,14 @@
+mod call_window;
+mod diagnostics;
+mod downloads;
+mod friends;
 mod login;
 mod settings;
 mod shell;
-mod friends;
-mod call_window;
+mod state;
+mod virtual_list;
 
-use crate::config::{apply_animations, apply_font, apply_theme, AppConfig};
+use crate::config::{AppConfig, apply_animations, apply_font, apply_theme};
 use crate::protocol::{ChatInfo, FlexAction, MessageInfo, Profile, ProtocolEvent};
 use crate::sidecar::Sidecar;
 use anyhow::Result;
@@ -14,175 +18,11 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow};
+use state::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-
-/// Currently playing voice bubble (UI + process).
-pub struct VoicePlayback {
-    child: std::process::Child,
-    msg_id: String,
-    play_btn: gtk::Button,
-    wave: gtk::DrawingArea,
-    dur: gtk::Label,
-    duration_ms: u64,
-    started: std::time::Instant,
-    progress: Rc<RefCell<f32>>,
-    total_label: String,
-    tick: Option<glib::SourceId>,
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub app: Application,
-    pub sidecar: Rc<Sidecar>,
-    pub window: ApplicationWindow,
-    pub toast_overlay: libadwaita::ToastOverlay,
-    pub stack: gtk::Stack,
-    pub chat_list: gtk::ListBox,
-    pub message_list: gtk::ListBox,
-    pub message_scroll: gtk::ScrolledWindow,
-    pub composer: gtk::Entry,
-    pub composer_row: gtk::Box,
-    pub conversation: gtk::Box,
-    pub send_btn: gtk::Button,
-    pub status: gtk::Label,
-    pub login: Rc<login::LoginWidgets>,
-    pub profile_label: gtk::Label,
-    pub profile_avatar: gtk::Picture,
-    pub brand_label: gtk::Label,
-    pub brand_icon: gtk::Image,
-    pub chat_title: gtk::Label,
-    pub chat_subtitle: gtk::Label,
-    pub side_stack: gtk::Stack,
-    pub side_spinner: gtk::Spinner,
-    pub side_empty: gtk::Label,
-    pub side_load_label: gtk::Label,
-    pub msg_stack: gtk::Stack,
-    pub msg_spinner: gtk::Spinner,
-    pub msg_empty: gtk::Label,
-    pub msg_load_label: gtk::Label,
-    pub msg_idle: gtk::Label,
-    pub current_chat: Rc<RefCell<Option<String>>>,
-    pub chats: Rc<RefCell<Vec<ChatInfo>>>,
-    pub chat_avatars: Rc<RefCell<HashMap<String, gtk::Picture>>>,
-    pub chat_previews: Rc<RefCell<HashMap<String, gtk::Label>>>,
-    pub chat_unread_badges: Rc<RefCell<HashMap<String, gtk::Label>>>,
-    pub media_slots: Rc<RefCell<HashMap<String, gtk::Box>>>,
-    /// Message metadata for media bubbles (open/download after hydrate).
-    pub media_msgs: Rc<RefCell<HashMap<String, MessageInfo>>>,
-    pub receipt_slots: Rc<RefCell<HashMap<String, gtk::Label>>>,
-    pub msg_created: Rc<RefCell<HashMap<String, i64>>>,
-    pub last_msg_day: Rc<RefCell<Option<String>>>,
-    pub seen_msg_ids: Rc<RefCell<HashSet<String>>>,
-    pub last_incoming_id: Rc<RefCell<Option<String>>>,
-    pub read_upto: Rc<RefCell<HashMap<String, String>>>,
-    pub restored_last_chat: Rc<RefCell<bool>>,
-    pub media_queue: Rc<RefCell<VecDeque<(String, String)>>>,
-    pub media_pumping: Rc<RefCell<bool>>,
-    /// When true, keep the message pane pinned to the latest message.
-    pub stick_bottom: Rc<RefCell<bool>>,
-    /// True while we force-scroll to bottom (avoids false "user scrolled away").
-    pub scroll_pinning: Rc<RefCell<bool>>,
-    /// Bumped on each pin request so older timeout chains cannot clear pinning.
-    pub scroll_pin_gen: Rc<RefCell<u64>>,
-    /// "New" unread separator row in the open chat (cleared on Esc / send).
-    pub new_sep_row: Rc<RefCell<Option<gtk::ListBoxRow>>>,
-    pub pending_new_below: Rc<RefCell<u32>>,
-    pub jump_banner: gtk::Revealer,
-    pub jump_banner_btn: gtk::Button,
-    pub jump_banner_label: gtk::Label,
-    pub pending: Rc<RefCell<HashMap<u64, Pending>>>,
-    /// Outgoing placeholders shown grayed until the send request finishes.
-    pub pending_rows: Rc<RefCell<HashMap<String, gtk::ListBoxRow>>>,
-    pub restarting: Rc<RefCell<bool>>,
-    pub repo_root: PathBuf,
-    pub data_dir: PathBuf,
-    pub config: Rc<RefCell<AppConfig>>,
-    pub settings_btn: gtk::Button,
-    pub friends_btn: gtk::Button,
-    pub friends_ui: Rc<RefCell<Option<friends::FriendsUi>>>,
-    pub side_title: gtk::Label,
-    pub search_entry: gtk::SearchEntry,
-    pub compact_search_btn: gtk::Button,
-    pub compact_search_entry: gtk::SearchEntry,
-    pub sidebar: gtk::Box,
-    pub sidebar_paned: gtk::Paned,
-    pub side_header: gtk::Box,
-    pub sidebar_compact: Rc<RefCell<bool>>,
-    pub composer_narrow: Rc<RefCell<bool>>,
-    pub mic_btn: gtk::Button,
-    pub attach_btn: gtk::Button,
-    pub sticker_btn: gtk::Button,
-    pub sticker_popover: gtk::Popover,
-    pub call_btn: gtk::Button,
-    pub mute_btn: gtk::Button,
-    pub composer_stack: gtk::Stack,
-    pub record_cancel_btn: gtk::Button,
-    pub record_send_btn: gtk::Button,
-    pub record_timer: gtk::Label,
-    pub record_wave: gtk::DrawingArea,
-    pub upload_revealer: gtk::Revealer,
-    pub upload_bar: gtk::ProgressBar,
-    pub upload_label: gtk::Label,
-    pub recording: Rc<RefCell<Option<std::process::Child>>>,
-    pub recording_started: Rc<RefCell<Option<std::time::Instant>>>,
-    pub recording_levels: Rc<RefCell<Vec<f32>>>,
-    pub recording_tick: Rc<RefCell<Option<glib::SourceId>>>,
-    /// Active voice-message playback (at most one).
-    pub voice_playback: Rc<RefCell<Option<VoicePlayback>>>,
-    pub session_ready: Rc<RefCell<bool>>,
-    pub active_call_peer: Rc<RefCell<Option<String>>>,
-    pub incoming_call_from: Rc<RefCell<Option<String>>>,
-    pub call_ui: Rc<RefCell<Option<call_window::CallUi>>>,
-    pub call_mic_muted: Rc<RefCell<bool>>,
-    pub call_deafened: Rc<RefCell<bool>>,
-    pub tray: Rc<RefCell<Option<crate::tray::TrayController>>>,
-    pub tray_tx: async_channel::Sender<crate::tray::TrayAction>,
-    pub discord: crate::discord_rpc::DiscordRpc,
-    /// Unix seconds when the LINE session became ready (for Discord elapsed time).
-    pub discord_session_start: Rc<RefCell<Option<i64>>>,
-    pub self_mid: Rc<RefCell<Option<String>>>,
-    pub self_display_name: Rc<RefCell<String>>,
-    pub self_avatar_path: Rc<RefCell<Option<String>>>,
-    pub self_picture_url: Rc<RefCell<Option<String>>>,
-    /// Avoid double full rebuilds when warm cache + fetch return the same list.
-    pub msg_list_fp: Rc<RefCell<Option<(String, usize, String, String)>>>,
-    /// Desktop notifications waiting for media hydrate (message id → meta).
-    pub notif_pending: Rc<RefCell<HashMap<String, PendingNotif>>>,
-    /// imagePath from media_ready that arrived before the bubble slot existed.
-    pub media_ready_paths: Rc<RefCell<HashMap<String, String>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PendingNotif {
-    pub chat_mid: String,
-    pub title: String,
-    pub body: String,
-    pub avatar_path: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Pending {
-    Login,
-    ListChats,
-    ListFriends,
-    FetchMessages { chat_mid: String },
-    Send {
-        chat_mid: String,
-        placeholder_id: String,
-    },
-    ListStickers,
-    DownloadMedia {
-        chat_mid: String,
-        message_id: String,
-        /// open_viewer | save_dialog | play_audio
-        action: String,
-        content_type: String,
-        suggest_name: String,
-    },
-}
 
 pub fn run(repo_root: PathBuf, data_dir: PathBuf) -> Result<()> {
     let app = Application::builder()
@@ -206,7 +46,6 @@ pub fn run(repo_root: PathBuf, data_dir: PathBuf) -> Result<()> {
 fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<()> {
     shell::load_css();
     register_app_icons(&repo_root);
-    ensure_desktop_integration(&repo_root);
     let config = Rc::new(RefCell::new(AppConfig::load(&data_dir)));
     apply_theme(&config.borrow().theme);
     apply_font(&config.borrow().font_family, config.borrow().font_scale);
@@ -319,6 +158,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         pending: Rc::new(RefCell::new(HashMap::new())),
         pending_rows: Rc::new(RefCell::new(HashMap::new())),
         restarting: Rc::new(RefCell::new(false)),
+        recovery_attempts: Rc::new(RefCell::new(0)),
         repo_root,
         data_dir,
         config,
@@ -437,103 +277,6 @@ fn apply_brand_icon(image: &gtk::Image, repo_root: &std::path::Path) {
     } else {
         image.set_icon_name(Some("line-gtk"));
     }
-}
-
-/// Install icons + app-id desktop file so docks/taskbars pick up the real icon
-/// (tray embeds a pixmap; Wayland shells usually resolve via .desktop + icon theme).
-fn ensure_desktop_integration(repo_root: &std::path::Path) {
-    let Some(data_home) = dirs::data_dir() else {
-        return;
-    };
-    let icon_src = repo_root.join("assets/icons/hicolor");
-    if !icon_src.is_dir() {
-        return;
-    }
-
-    let icon_dst_root = data_home.join("icons/hicolor");
-    for size in ["48x48", "64x64", "128x128", "256x256", "scalable"] {
-        let apps_src = icon_src.join(size).join("apps");
-        if !apps_src.is_dir() {
-            continue;
-        }
-        let apps_dst = icon_dst_root.join(size).join("apps");
-        if let Err(e) = std::fs::create_dir_all(&apps_dst) {
-            eprintln!("[icons] mkdir {}: {e}", apps_dst.display());
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&apps_src) else {
-            continue;
-        };
-        for ent in entries.flatten() {
-            let name = ent.file_name();
-            let Some(name_str) = name.to_str() else {
-                continue;
-            };
-            if !(name_str.starts_with("line-gtk.") && (name_str.ends_with(".png") || name_str.ends_with(".svg")))
-            {
-                continue;
-            }
-            let dst = apps_dst.join(&name);
-            let src = ent.path();
-            let need = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
-                (Ok(s), Ok(d)) => s.len() != d.len(),
-                (Ok(_), Err(_)) => true,
-                _ => false,
-            };
-            if need {
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    eprintln!("[icons] copy {} → {}: {e}", src.display(), dst.display());
-                }
-            }
-        }
-    }
-
-    // Refresh icon cache when available (best-effort).
-    let _ = std::process::Command::new("gtk-update-icon-cache")
-        .args(["-f", "-t"])
-        .arg(&icon_dst_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let apps_dir = data_home.join("applications");
-    if let Err(e) = std::fs::create_dir_all(&apps_dir) {
-        eprintln!("[desktop] mkdir {}: {e}", apps_dir.display());
-        return;
-    }
-
-    let bin = std::env::current_exe()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| repo_root.join("target/release/line-gtk").display().to_string());
-    let root = repo_root.display().to_string();
-    let desktop = format!(
-        "[Desktop Entry]\n\
-         Name=LINE GTK\n\
-         Comment=Native unofficial LINE client\n\
-         Exec=env LINE_GTK_ROOT={root} {bin}\n\
-         Icon=line-gtk\n\
-         Terminal=false\n\
-         Type=Application\n\
-         Categories=Network;InstantMessaging;\n\
-         StartupWMClass=dev.linegtk.LineGtk\n\
-         StartupNotify=true\n"
-    );
-    // Basename must match GTK application_id for a single dock/launcher entry.
-    let path = apps_dir.join("dev.linegtk.LineGtk.desktop");
-    if let Err(e) = std::fs::write(&path, &desktop) {
-        eprintln!("[desktop] write {}: {e}", path.display());
-    }
-    // Remove the old duplicate that caused two "LINE GTK" icons in launchers.
-    let legacy = apps_dir.join("line-gtk.desktop");
-    if legacy.exists() {
-        let _ = std::fs::remove_file(&legacy);
-    }
-    let _ = std::process::Command::new("update-desktop-database")
-        .arg(&apps_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
 }
 
 fn apply_close_behavior(state: &AppState) {
@@ -667,12 +410,8 @@ fn apply_self_profile(
     if !display_name.is_empty() {
         *state.self_display_name.borrow_mut() = display_name.to_string();
         state.profile_label.set_text(display_name);
-        state
-            .profile_label
-            .set_tooltip_text(Some(display_name));
-        state
-            .profile_avatar
-            .set_tooltip_text(Some(display_name));
+        state.profile_label.set_tooltip_text(Some(display_name));
+        state.profile_avatar.set_tooltip_text(Some(display_name));
     }
     if let Some(url) = picture_url.filter(|s| !s.is_empty()) {
         let full = if url.starts_with("http") {
@@ -831,12 +570,7 @@ fn present_and_open_chat(state: &AppState, mid: &str) {
         toast(state, &crate::i18n::t("still_restoring"));
         return;
     }
-    let chat = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == mid)
-        .cloned();
+    let chat = state.chats.borrow().iter().find(|c| c.mid == mid).cloned();
     if let Some(chat) = chat {
         open_chat(state, &chat);
     } else {
@@ -854,6 +588,14 @@ fn wire_notification_actions(state: &AppState) {
         present_and_open_chat(&s, &mid);
     });
     state.app.add_action(&open);
+
+    let retry = gio::SimpleAction::new("retry-protocol", None);
+    let s = state.clone();
+    retry.connect_activate(move |_, _| {
+        *s.recovery_attempts.borrow_mut() = 0;
+        recover_sidecar(&s);
+    });
+    state.app.add_action(&retry);
 }
 /// Composer switches to icon-only send below this conversation width.
 const COMPOSER_NARROW_PX: i32 = 420;
@@ -1098,7 +840,10 @@ fn apply_ui_motion(state: &AppState) {
     state.jump_banner.set_transition_duration(rev_ms);
 
     state.login.stage.set_transition_type(stack_ty);
-    state.login.stage.set_transition_duration(if on { 200 } else { 0 });
+    state
+        .login
+        .stage
+        .set_transition_duration(if on { 200 } else { 0 });
 }
 
 fn wire_scroll_pin(state: &AppState) {
@@ -1201,7 +946,10 @@ fn send_current(state: &AppState) {
             dismiss_new_marker(state);
             pin_messages_to_latest(state);
         }
-        Err(e) => toast(state, &crate::i18n::tf("send_failed", &[("error", &e.to_string())])),
+        Err(e) => toast(
+            state,
+            &crate::i18n::tf("send_failed", &[("error", &e.to_string())]),
+        ),
     }
 }
 
@@ -1300,7 +1048,9 @@ fn apply_ui_language(state: &AppState) {
         .msg_load_label
         .set_text(&crate::i18n::t("loading_messages"));
     state.msg_empty.set_text(&crate::i18n::t("no_messages"));
-    state.msg_idle.set_text(&crate::i18n::t("select_chat_start"));
+    state
+        .msg_idle
+        .set_text(&crate::i18n::t("select_chat_start"));
     if state.current_chat.borrow().is_none() {
         state.chat_title.set_text(&crate::i18n::t("select_chat"));
         state.chat_subtitle.set_text(&crate::i18n::t("pick_chat"));
@@ -1344,7 +1094,13 @@ fn youtube_id(url: &str) -> Option<String> {
     }
     if let Some(idx) = url.find("youtu.be/") {
         let rest = &url[idx + 9..];
-        let id = rest.split('?').next().unwrap_or("").split('/').next().unwrap_or("");
+        let id = rest
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
         if !id.is_empty() {
             return Some(id.to_string());
         }
@@ -1355,7 +1111,9 @@ fn youtube_id(url: &str) -> Option<String> {
 fn extract_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in text.split_whitespace() {
-        let t = token.trim_matches(|c: char| matches!(c, ')' | '(' | ']' | '[' | '.' | ',' | ';' | '"' | '\''));
+        let t = token.trim_matches(|c: char| {
+            matches!(c, ')' | '(' | ']' | '[' | '.' | ',' | ';' | '"' | '\'')
+        });
         if t.starts_with("http://") || t.starts_with("https://") {
             out.push(t.to_string());
         }
@@ -1507,15 +1265,16 @@ fn wire_actions(state: &AppState) {
                     s2.chats.borrow_mut().clear();
                     login::show_qr_stage(&s2.login);
                     s2.stack.set_visible_child_name("login");
-                    s2.login
-                        .hint
-                        .set_text(&crate::i18n::t("logged_out_hint"));
+                    s2.login.hint.set_text(&crate::i18n::t("logged_out_hint"));
                     sync_discord_rpc(&s2);
                     // Kill the old Deno process so listen/hydrate cannot keep writing.
                     *s2.restarting.borrow_mut() = true;
                     if let Err(e) = s2.sidecar.restart() {
                         *s2.restarting.borrow_mut() = false;
-                        toast(&s2, &format!("restart failed: {e}"));
+                        toast(
+                            &s2,
+                            &crate::i18n::tf("restart_failed_err", &[("error", &e.to_string())]),
+                        );
                         return;
                     }
                     // Fresh sidecar emits Ready → QR login (see ProtocolEvent::Ready).
@@ -1551,7 +1310,10 @@ fn wire_actions(state: &AppState) {
                     *s2.restarting.borrow_mut() = true;
                     if let Err(e) = s2.sidecar.restart() {
                         *s2.restarting.borrow_mut() = false;
-                        toast(&s2, &format!("restart failed: {e}"));
+                        toast(
+                            &s2,
+                            &crate::i18n::tf("restart_failed_err", &[("error", &e.to_string())]),
+                        );
                     }
                 })
             },
@@ -1770,7 +1532,10 @@ fn open_chat(state: &AppState, chat: &ChatInfo) {
         }
         Err(e) => {
             set_msg_state(state, "empty", Some(&format!("Failed: {e}")));
-            toast(state, &crate::i18n::tf("fetch_failed", &[("error", &e.to_string())]));
+            toast(
+                state,
+                &crate::i18n::tf("fetch_failed", &[("error", &e.to_string())]),
+            );
         }
     }
     sync_discord_rpc(state);
@@ -1780,12 +1545,18 @@ fn restart_qr_login(state: &AppState) {
     *state.restarting.borrow_mut() = true;
     state.pending.borrow_mut().clear();
     login::show_qr_stage(&state.login);
-    state.login.hint.set_text(&crate::i18n::t("restarting_login"));
+    state
+        .login
+        .hint
+        .set_text(&crate::i18n::t("restarting_login"));
     state.stack.set_visible_child_name("login");
 
     if let Err(e) = state.sidecar.restart() {
         *state.restarting.borrow_mut() = false;
-        toast(state, &format!("restart failed: {e}"));
+        toast(
+            state,
+            &crate::i18n::tf("restart_failed_err", &[("error", &e.to_string())]),
+        );
     }
 }
 
@@ -1830,6 +1601,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             avatar_path,
             picture_url,
         } => {
+            *state.recovery_attempts.borrow_mut() = 0;
             let result = serde_json::json!({
                 "mid": mid,
                 "displayName": display_name,
@@ -1853,10 +1625,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             } else {
                 error.clone()
             };
-            show_login(
-                state,
-                &format!("{msg}\nTap Retry to sign in with QR."),
-            );
+            show_login(state, &format!("{msg}\nTap Retry to sign in with QR."));
             state.login.retry_btn.set_visible(true);
             *state.discord_session_start.borrow_mut() = None;
             sync_discord_rpc(state);
@@ -1866,10 +1635,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             show_login(state, &crate::i18n::t("login_qr_hint"));
             login::show_qr_stage(&state.login);
             if let Err(e) = login::set_qr(&state.login.qr_picture, &url) {
-                state
-                    .login
-                    .hint
-                    .set_text(&format!("QR URL: {url}\n({e})"));
+                state.login.hint.set_text(&format!("QR URL: {url}\n({e})"));
             }
         }
         ProtocolEvent::Pin { pin } => {
@@ -1880,7 +1646,11 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             state.status.set_text(&crate::i18n::t("live"));
             sync_discord_rpc(state);
         }
-        ProtocolEvent::CallIncoming { call_id: _, from, kind: _ } => {
+        ProtocolEvent::CallIncoming {
+            call_id: _,
+            from,
+            kind: _,
+        } => {
             if !calls_experimental_enabled(state) {
                 // Locked: ignore ringing UI (still experimental).
                 let _ = state.sidecar.call_decline();
@@ -1897,12 +1667,8 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
         }
         ProtocolEvent::CallCanceled { from, .. } => {
             let name = peer_display_name(state, &from);
-            toast(
-                state,
-                &crate::i18n::tf("call_canceled", &[("name", &name)]),
-            );
-            let was_incoming =
-                state.incoming_call_from.borrow().as_deref() == Some(from.as_str());
+            toast(state, &crate::i18n::tf("call_canceled", &[("name", &name)]));
+            let was_incoming = state.incoming_call_from.borrow().as_deref() == Some(from.as_str());
             let was_active = state.active_call_peer.borrow().as_deref() == Some(from.as_str());
             if was_incoming {
                 *state.incoming_call_from.borrow_mut() = None;
@@ -2152,10 +1918,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             // A later/parallel hydrate may already have the bytes on disk.
             if let Some(path) = state.media_ready_paths.borrow().get(&message_id).cloned() {
                 if std::path::Path::new(&path).exists() {
-                    state
-                        .media_queue
-                        .borrow_mut()
-                        .push_back((message_id, path));
+                    state.media_queue.borrow_mut().push_back((message_id, path));
                     pump_media_queue(state);
                     return;
                 }
@@ -2255,9 +2018,12 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     };
                     state.upload_label.set_text(&text);
                     let s = state.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(450), move || {
-                        hide_upload_progress(&s);
-                    });
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(450),
+                        move || {
+                            hide_upload_progress(&s);
+                        },
+                    );
                 } else {
                     hide_upload_progress(state);
                 }
@@ -2304,7 +2070,9 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     if let Some(ui) = state.friends_ui.borrow().as_ref() {
                         ui.stack.set_visible_child_name("empty");
                         ui.empty.set_text(
-                            error.as_deref().unwrap_or("Failed to load friends"),
+                            error
+                                .as_deref()
+                                .unwrap_or(&crate::i18n::t("friends_load_failed")),
                         );
                     }
                 }
@@ -2393,13 +2161,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                                 meta.audio_path = Some(path.to_string());
                             }
                         }
-                        finish_media_action(
-                            state,
-                            &action,
-                            path,
-                            &suggest_name,
-                            &content_type,
-                        );
+                        finish_media_action(state, &action, path, &suggest_name, &content_type);
                     } else {
                         toast(state, &crate::i18n::t("media_download_failed"));
                     }
@@ -2408,10 +2170,53 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             }
         }
         ProtocolEvent::Error(e) => toast(state, &e),
-        ProtocolEvent::Exited(_) => {
+        ProtocolEvent::Exited(code) => {
             if !*state.restarting.borrow() {
-                toast(state, "Protocol engine exited");
+                tracing::warn!(code, "protocol engine exited unexpectedly");
+                schedule_sidecar_recovery(state);
             }
+        }
+    }
+}
+
+const MAX_SIDECAR_RECOVERY_ATTEMPTS: u8 = 3;
+
+fn schedule_sidecar_recovery(state: &AppState) {
+    let attempt = {
+        let mut attempts = state.recovery_attempts.borrow_mut();
+        if *attempts >= MAX_SIDECAR_RECOVERY_ATTEMPTS {
+            let notice = libadwaita::Toast::new(&crate::i18n::t("protocol_recovery_failed"));
+            notice.set_button_label(Some(&crate::i18n::t("retry")));
+            notice.set_action_name(Some("app.retry-protocol"));
+            notice.set_timeout(0);
+            state.toast_overlay.add_toast(notice);
+            state.status.set_text(&crate::i18n::t("protocol_offline"));
+            return;
+        }
+        *attempts += 1;
+        *attempts
+    };
+    let delay = 1_u64 << (attempt - 1);
+    state.status.set_text(&crate::i18n::tf(
+        "protocol_reconnecting",
+        &[("attempt", &attempt.to_string())],
+    ));
+    let s = state.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_secs(delay), move || {
+        recover_sidecar(&s);
+    });
+}
+
+fn recover_sidecar(state: &AppState) {
+    match state.sidecar.recover() {
+        Ok(()) => {
+            state
+                .status
+                .set_text(&crate::i18n::t("protocol_restarting"));
+        }
+        Err(error) => {
+            tracing::error!(%error, "protocol recovery failed");
+            schedule_sidecar_recovery(state);
         }
     }
 }
@@ -2425,7 +2230,10 @@ fn on_logged_in(state: &AppState, result: &serde_json::Value) {
                 &profile.mid,
                 &profile.display_name,
                 profile.avatar_path.as_deref(),
-                profile.picture_url.as_deref().or(profile.picture_path.as_deref()),
+                profile
+                    .picture_url
+                    .as_deref()
+                    .or(profile.picture_path.as_deref()),
             );
             state.stack.set_visible_child_name("shell");
             // Soft transitions only after we're past the cold boot.
@@ -2435,7 +2243,9 @@ fn on_logged_in(state: &AppState, result: &serde_json::Value) {
                     .set_transition_type(gtk::StackTransitionType::Crossfade);
                 state.stack.set_transition_duration(180);
             } else {
-                state.stack.set_transition_type(gtk::StackTransitionType::None);
+                state
+                    .stack
+                    .set_transition_type(gtk::StackTransitionType::None);
                 state.stack.set_transition_duration(0);
             }
             state.status.set_text(&crate::i18n::t("loading_chats"));
@@ -2448,7 +2258,10 @@ fn on_logged_in(state: &AppState, result: &serde_json::Value) {
             maybe_restore_last_chat(state);
             sync_discord_rpc(state);
         }
-        Err(e) => toast(state, &format!("bad profile: {e}")),
+        Err(e) => toast(
+            state,
+            &crate::i18n::tf("bad_profile", &[("error", &e.to_string())]),
+        ),
     }
 }
 
@@ -2462,9 +2275,7 @@ fn saved_auth_exists(data_dir: &std::path::Path) -> bool {
 
 fn show_shell_restoring(state: &AppState) {
     state.stack.set_visible_child_name("shell");
-    state
-        .status
-        .set_text(&crate::i18n::t("restoring"));
+    state.status.set_text(&crate::i18n::t("restoring"));
     state.side_spinner.set_spinning(true);
     state.side_spinner.set_visible(true);
     if state.chats.borrow().is_empty() {
@@ -2492,8 +2303,7 @@ fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bool) {
     }
 
     for chat in &chats {
-        let (row, avatar, preview, badge) =
-            build_chat_row(chat, *state.sidebar_compact.borrow());
+        let (row, avatar, preview, badge) = build_chat_row(chat, *state.sidebar_compact.borrow());
         state
             .chat_avatars
             .borrow_mut()
@@ -2599,12 +2409,8 @@ fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
         return;
     }
 
-    let (row, avatar, preview, badge) =
-        build_chat_row(&chat, *state.sidebar_compact.borrow());
-    state
-        .chat_avatars
-        .borrow_mut()
-        .insert(mid.clone(), avatar);
+    let (row, avatar, preview, badge) = build_chat_row(&chat, *state.sidebar_compact.borrow());
+    state.chat_avatars.borrow_mut().insert(mid.clone(), avatar);
     state
         .chat_previews
         .borrow_mut()
@@ -2661,7 +2467,9 @@ fn update_chat_row_name(row: &gtk::ListBoxRow, name: &str) {
     row.set_tooltip_text(Some(name));
     // row > box > overlay + text_col > top > name label
     let Some(outer) = row.child() else { return };
-    let Ok(box_) = outer.downcast::<gtk::Box>() else { return };
+    let Ok(box_) = outer.downcast::<gtk::Box>() else {
+        return;
+    };
     let mut child = box_.first_child();
     while let Some(w) = child {
         if w.css_classes().iter().any(|c| c == "line-chat-text") {
@@ -2836,14 +2644,8 @@ fn build_chat_row(
 }
 
 fn message_list_fingerprint(messages: &[MessageInfo]) -> (usize, String, String) {
-    let first = messages
-        .first()
-        .map(|m| m.id.clone())
-        .unwrap_or_default();
-    let last = messages
-        .last()
-        .map(|m| m.id.clone())
-        .unwrap_or_default();
+    let first = messages.first().map(|m| m.id.clone()).unwrap_or_default();
+    let last = messages.last().map(|m| m.id.clone()).unwrap_or_default();
     (messages.len(), first, last)
 }
 
@@ -2875,9 +2677,10 @@ fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     // Append in idle chunks so image-heavy threads don't freeze the window.
     let total = messages.len();
     set_msg_state(state, "list", None);
-    state
-        .chat_subtitle
-        .set_text(&crate::i18n::tf("messages_count", &[("n", &total.to_string())]));
+    state.chat_subtitle.set_text(&crate::i18n::tf(
+        "messages_count",
+        &[("n", &total.to_string())],
+    ));
 
     let last_incoming = messages
         .iter()
@@ -3227,7 +3030,11 @@ fn day_key(ts_ms: i64) -> String {
         ts_ms
     };
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -3262,7 +3069,11 @@ fn format_msg_time(ts_ms: i64) -> String {
         ts_ms
     };
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|d| d.with_timezone(&chrono::Local).format("%-I:%M %p").to_string())
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%-I:%M %p")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -3497,7 +3308,8 @@ fn stop_voice_playback(state: &AppState) {
     let _ = pb.child.wait();
     *pb.progress.borrow_mut() = 0.0;
     pb.play_btn.set_icon_name("media-playback-start-symbolic");
-    pb.play_btn.set_tooltip_text(Some(&crate::i18n::t("play_voice")));
+    pb.play_btn
+        .set_tooltip_text(Some(&crate::i18n::t("play_voice")));
     pb.play_btn.remove_css_class("playing");
     pb.wave.remove_css_class("playing");
     pb.wave.queue_draw();
@@ -3594,7 +3406,11 @@ fn draw_waveform(
     let muted = area.color();
     let (base_r, base_g, base_b) = if mine {
         match accent {
-            Some(c) => (f64::from(c.red()), f64::from(c.green()), f64::from(c.blue())),
+            Some(c) => (
+                f64::from(c.red()),
+                f64::from(c.green()),
+                f64::from(c.blue()),
+            ),
             None => (
                 f64::from(muted.red()),
                 f64::from(muted.green()),
@@ -3725,9 +3541,19 @@ fn wav_tail_level(path: &std::path::Path) -> f32 {
 
 fn wire_record_wave(state: &AppState) {
     let levels = state.recording_levels.clone();
-    state.record_wave.set_draw_func(move |area, cr, width, height| {
-        draw_waveform(area, cr, width as f64, height as f64, &levels.borrow(), true, None);
-    });
+    state
+        .record_wave
+        .set_draw_func(move |area, cr, width, height| {
+            draw_waveform(
+                area,
+                cr,
+                width as f64,
+                height as f64,
+                &levels.borrow(),
+                true,
+                None,
+            );
+        });
 
     // Custom DrawingAreas do not auto-repaint when the color scheme flips.
     let root = state.window.clone().upcast::<gtk::Widget>();
@@ -3905,10 +3731,7 @@ fn full_image_candidate(path: &str) -> Option<String> {
     let p = std::path::Path::new(path);
     let parent = p.parent()?;
     let name = p.file_name()?.to_str()?;
-    let id = name
-        .split('.')
-        .next()
-        .filter(|s| !s.is_empty())?;
+    let id = name.split('.').next().filter(|s| !s.is_empty())?;
     for ext in ["jpg", "jpeg", "png", "webp", "gif"] {
         let cand = parent.join(format!("{id}.full.{ext}"));
         if cand.is_file() {
@@ -3938,8 +3761,7 @@ fn local_media_path(msg: &MessageInfo, for_viewer: bool) -> Option<String> {
     }
     if ct == "VIDEO" {
         if let Some(p) = msg.file_path.as_ref().filter(|p| {
-            std::path::Path::new(p).exists()
-                && p.to_ascii_lowercase().ends_with(".mp4")
+            std::path::Path::new(p).exists() && p.to_ascii_lowercase().ends_with(".mp4")
         }) {
             return Some(p.clone());
         }
@@ -3948,9 +3770,11 @@ fn local_media_path(msg: &MessageInfo, for_viewer: bool) -> Option<String> {
             return None;
         }
     }
-    if let Some(p) = msg.file_path.as_ref().filter(|p| {
-        std::path::Path::new(p).exists() && !is_thumb_media_path(p)
-    }) {
+    if let Some(p) = msg
+        .file_path
+        .as_ref()
+        .filter(|p| std::path::Path::new(p).exists() && !is_thumb_media_path(p))
+    {
         if !(for_viewer && ct == "IMAGE" && image_looks_low_res(p)) {
             return Some(p.clone());
         }
@@ -3961,16 +3785,28 @@ fn local_media_path(msg: &MessageInfo, for_viewer: bool) -> Option<String> {
             if let Some(p) = msg.file_path.as_ref().and_then(|p| full_image_candidate(p)) {
                 return Some(p);
             }
-            if let Some(p) = msg.image_path.as_ref().and_then(|p| full_image_candidate(p)) {
+            if let Some(p) = msg
+                .image_path
+                .as_ref()
+                .and_then(|p| full_image_candidate(p))
+            {
                 return Some(p);
             }
             return None;
         }
-        if let Some(p) = msg.image_path.as_ref().filter(|p| std::path::Path::new(p).exists()) {
+        if let Some(p) = msg
+            .image_path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).exists())
+        {
             return Some(p.clone());
         }
     } else if !for_viewer {
-        if let Some(p) = msg.image_path.as_ref().filter(|p| std::path::Path::new(p).exists()) {
+        if let Some(p) = msg
+            .image_path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).exists())
+        {
             return Some(p.clone());
         }
     }
@@ -3995,7 +3831,13 @@ fn request_media_download(state: &AppState, msg: &MessageInfo, action: &str) {
         .unwrap_or_else(|| msg.clone());
     let for_viewer = action == "open_viewer";
     if let Some(path) = local_media_path(&msg, for_viewer) {
-        finish_media_action(state, action, &path, &suggest_media_name(&msg), &msg.content_type);
+        finish_media_action(
+            state,
+            action,
+            &path,
+            &suggest_media_name(&msg),
+            &msg.content_type,
+        );
         return;
     }
     state.status.set_text(&crate::i18n::t("media_downloading"));
@@ -4041,47 +3883,12 @@ fn finish_media_action(
     }
 }
 
-fn unique_download_dest(dir: &std::path::Path, suggest_name: &str) -> PathBuf {
-    let safe = suggest_name
-        .chars()
-        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
-        .collect::<String>();
-    let safe = if safe.trim().is_empty() {
-        "download.bin".to_string()
-    } else {
-        safe
-    };
-    let candidate = dir.join(&safe);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let stem = std::path::Path::new(&safe)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("download");
-    let ext = std::path::Path::new(&safe)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    for i in 1..10_000 {
-        let alt = dir.join(format!("{stem}-{i}{ext}"));
-        if !alt.exists() {
-            return alt;
-        }
-    }
-    dir.join(format!("{stem}-dup{ext}"))
-}
-
 fn copy_media_to_dest(state: &AppState, src: &str, dest: &std::path::Path) {
     match std::fs::copy(src, dest) {
         Ok(_) => {
             toast(
                 state,
-                &crate::i18n::tf(
-                    "media_saved",
-                    &[("path", &dest.display().to_string())],
-                ),
+                &crate::i18n::tf("media_saved", &[("path", &dest.display().to_string())]),
             );
             state.status.set_text(&crate::i18n::t("media_saved_status"));
         }
@@ -4104,7 +3911,7 @@ fn save_media_as(state: &AppState, path: &str, suggest_name: &str, content_type:
     }
 
     if !cfg.download_ask_every_time {
-        let dest = unique_download_dest(&dest_dir, suggest_name);
+        let dest = downloads::unique_download_dest(&dest_dir, suggest_name);
         copy_media_to_dest(state, path, &dest);
         return;
     }
@@ -4143,12 +3950,7 @@ fn save_media_as(state: &AppState, path: &str, suggest_name: &str, content_type:
     );
 }
 
-fn wire_media_open_click(
-    state: &AppState,
-    pic: &gtk::Picture,
-    msg: &MessageInfo,
-    _kind: &str,
-) {
+fn wire_media_open_click(state: &AppState, pic: &gtk::Picture, msg: &MessageInfo, _kind: &str) {
     wire_media_open_click_widget(state, pic.upcast_ref::<gtk::Widget>(), msg);
 }
 
@@ -4589,18 +4391,7 @@ fn append_image_viewer(
                 if let Some(dest) = slot.as_ref() {
                     // Transparent edges so the themed DrawingArea background shows through.
                     dest.fill(0);
-                    pixbuf.scale(
-                        dest,
-                        0,
-                        0,
-                        width,
-                        height,
-                        ox,
-                        oy,
-                        z,
-                        z,
-                        interp,
-                    );
+                    pixbuf.scale(dest, 0, 0, width, height, ox, oy, z, z, interp);
                     gdk::prelude::GdkCairoContextExt::set_source_pixbuf(cr, dest, 0.0, 0.0);
                     let _ = cr.paint();
                 }
@@ -4642,12 +4433,12 @@ fn append_image_viewer(
         Rc::new(move || {
             let aw = area.width().max(1) as f64;
             let ah = area.height().max(1) as f64;
-            let z = (aw / nat_w as f64).min(ah / nat_h as f64).min(1.0).max(0.05);
+            let z = (aw / nat_w as f64)
+                .min(ah / nat_h as f64)
+                .min(1.0)
+                .max(0.05);
             *zoom.borrow_mut() = z;
-            *offset.borrow_mut() = (
-                (aw - nat_w as f64 * z) * 0.5,
-                (ah - nat_h as f64 * z) * 0.5,
-            );
+            *offset.borrow_mut() = ((aw - nat_w as f64 * z) * 0.5, (ah - nat_h as f64 * z) * 0.5);
             area.queue_draw();
         })
     };
@@ -4883,9 +4674,7 @@ fn append_image_viewer(
                 let z = (*zoom.borrow()).max(0.01);
                 let (ox, oy) = *offset.borrow();
                 if let Some(stroke) = active_stroke.borrow_mut().as_mut() {
-                    stroke
-                        .points
-                        .push(((sx + dx - ox) / z, (sy + dy - oy) / z));
+                    stroke.points.push(((sx + dx - ox) / z, (sy + dy - oy) / z));
                 }
                 area.queue_draw();
             } else {
@@ -5210,7 +4999,10 @@ fn append_text_viewer(body: &gtk::Box, path: &str) {
             }
         }
         Err(e) => {
-            buf.set_text(&format!("Failed to read file: {e}"));
+            buf.set_text(&crate::i18n::tf(
+                "file_read_failed",
+                &[("error", &e.to_string())],
+            ));
         }
     }
     scroll.set_child(Some(&tv));
@@ -5381,10 +5173,7 @@ fn ffprobe_duration_ms(path: &std::path::Path) -> Option<u64> {
 fn copy_into_media_cache(state: &AppState, src: &std::path::Path) -> anyhow::Result<PathBuf> {
     let dir = state.data_dir.join("cache/media");
     std::fs::create_dir_all(&dir)?;
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
     let name = format!(
         "out-{}-{}.{}",
         std::time::SystemTime::now()
@@ -5438,10 +5227,7 @@ fn open_sticker_picker(state: &AppState) {
 
     match state.sidecar.list_stickers() {
         Ok(id) => {
-            state
-                .pending
-                .borrow_mut()
-                .insert(id, Pending::ListStickers);
+            state.pending.borrow_mut().insert(id, Pending::ListStickers);
         }
         Err(e) => {
             state.sticker_popover.popdown();
@@ -5527,7 +5313,10 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
             .and_then(|v| v.as_str())
             .unwrap_or("Stickers")
             .to_string();
-        let is_recent = pack.get("recent").and_then(|v| v.as_bool()).unwrap_or(false)
+        let is_recent = pack
+            .get("recent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
             || pack_id == "__recent__";
         let display_name = if is_recent {
             crate::i18n::t("stickers_recent")
@@ -5854,17 +5643,15 @@ fn try_paste_clipboard_attachment(state: &AppState) -> bool {
 
     if has_image {
         let s = state.clone();
-        clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| {
-            match res {
-                Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
-                    Ok(path) => send_local_media_path(&s, path),
-                    Err(e) => toast(
-                        &s,
-                        &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
-                    ),
-                },
-                _ => paste_clipboard_image_bytes(&s),
-            }
+        clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
+            Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
+                Ok(path) => send_local_media_path(&s, path),
+                Err(e) => toast(
+                    &s,
+                    &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+                ),
+            },
+            _ => paste_clipboard_image_bytes(&s),
         });
         return true;
     }
@@ -6305,8 +6092,7 @@ fn filter_chats(state: &AppState, query: &str) {
             chats
                 .get(idx as usize)
                 .map(|c| {
-                    c.name.to_lowercase().contains(&q)
-                        || c.preview.to_lowercase().contains(&q)
+                    c.name.to_lowercase().contains(&q) || c.preview.to_lowercase().contains(&q)
                 })
                 .unwrap_or(true)
         };
@@ -6386,24 +6172,25 @@ fn handle_flex_action(state: &AppState, chat_mid: &str, message_id: &str, action
         }
     }
     if kind == "message" {
-        let text = action
-            .data
-            .clone()
-            .unwrap_or_else(|| action.label.clone());
+        let text = action.data.clone().unwrap_or_else(|| action.label.clone());
         if let Err(e) = state.sidecar.send_message(chat_mid, &text) {
-            toast(state, &format!("send failed: {e}"));
+            toast(
+                state,
+                &crate::i18n::tf("send_failed", &[("error", &e.to_string())]),
+            );
         }
         return;
     }
     // postback / default
     let data = action.data.clone().unwrap_or_else(|| action.label.clone());
-    match state.sidecar.send_postback(
-        chat_mid,
-        message_id,
-        &data,
-        action.uri.as_deref(),
-    ) {
-        Ok(_) => toast(state, &crate::i18n::tf("action_sent", &[("label", &action.label)])),
+    match state
+        .sidecar
+        .send_postback(chat_mid, message_id, &data, action.uri.as_deref())
+    {
+        Ok(_) => toast(
+            state,
+            &crate::i18n::tf("action_sent", &[("label", &action.label)]),
+        ),
         Err(e) => toast(
             state,
             &crate::i18n::tf("action_failed", &[("error", &e.to_string())]),
@@ -6541,12 +6328,7 @@ fn wrap_video_thumb(state: &AppState, pic: &gtk::Picture, msg: &MessageInfo) -> 
     overlay
 }
 
-fn append_video_placeholder(
-    state: &AppState,
-    bubble: &gtk::Box,
-    msg: &MessageInfo,
-    failed: bool,
-) {
+fn append_video_placeholder(state: &AppState, bubble: &gtk::Box, msg: &MessageInfo, failed: bool) {
     let box_ = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -6704,7 +6486,7 @@ fn attach_texture_async_anim(picture: gtk::Picture, path: String, max_px: i32, a
                     if let Some(box_) = parent.downcast_ref::<gtk::Box>() {
                         box_.remove(&picture);
                         let label = gtk::Label::builder()
-                            .label("Image unavailable")
+                            .label(crate::i18n::t("image_unavailable"))
                             .xalign(0.0)
                             .css_classes(["dim-label", "line-media-failed"])
                             .build();
@@ -6759,11 +6541,12 @@ fn pump_media_queue(state: &AppState) {
     let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
     let image_path2 = image_path.clone();
     std::thread::spawn(move || {
-        let loaded = crate::sticker_anim::load_scaled(&image_path2, max_px, animate).or_else(|| {
-            // Brief retry — avoids rare races right after atomic rename.
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            crate::sticker_anim::load_scaled(&image_path2, max_px, animate)
-        });
+        let loaded =
+            crate::sticker_anim::load_scaled(&image_path2, max_px, animate).or_else(|| {
+                // Brief retry — avoids rare races right after atomic rename.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                crate::sticker_anim::load_scaled(&image_path2, max_px, animate)
+            });
         let _ = tx.send_blocking(loaded);
     });
     glib::spawn_future_local(async move {
@@ -6828,7 +6611,7 @@ fn pump_media_queue(state: &AppState) {
 
 fn clear_messages(state: &AppState) {
     stop_voice_playback(state);
-    clear_list(&state.message_list);
+    state.message_list.clear();
     state.media_slots.borrow_mut().clear();
     state.media_msgs.borrow_mut().clear();
     state.receipt_slots.borrow_mut().clear();
@@ -6975,17 +6758,7 @@ fn snap_adj_to_bottom(adj: &gtk::Adjustment) {
 }
 
 fn scroll_last_row_into_view(state: &AppState) {
-    let Some(last) = state.message_list.last_child() else {
-        return;
-    };
-    let mut w: gtk::Widget = state.message_list.clone().upcast();
-    while let Some(parent) = w.parent() {
-        if let Ok(viewport) = parent.clone().downcast::<gtk::Viewport>() {
-            viewport.scroll_to(&last, None);
-            return;
-        }
-        w = parent;
-    }
+    state.message_list.scroll_to_end();
     snap_adj_to_bottom(&state.message_scroll.vadjustment());
 }
 
@@ -7340,10 +7113,7 @@ fn send_desktop_notification(
             let n = gio::Notification::new(title);
             n.set_body(Some(body));
             n.set_priority(gio::NotificationPriority::Normal);
-            n.set_default_action_and_target_value(
-                "app.open-chat",
-                Some(&chat_mid.to_variant()),
-            );
+            n.set_default_action_and_target_value("app.open-chat", Some(&chat_mid.to_variant()));
             if let Some(path) = avatar_path.filter(|p| std::path::Path::new(p).exists()) {
                 let file = gio::File::for_path(path);
                 n.set_icon(&gio::FileIcon::new(&file));
@@ -7563,9 +7333,7 @@ fn toast(state: &AppState, msg: &str) {
         eprintln!("[soft] {msg}");
         return;
     }
-    state
-        .toast_overlay
-        .add_toast(libadwaita::Toast::new(msg));
+    state.toast_overlay.add_toast(libadwaita::Toast::new(msg));
 }
 
 fn peer_display_name(state: &AppState, mid: &str) -> String {
@@ -7723,36 +7491,29 @@ fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMode<'_>) {
             let cfg = state.config.borrow();
             (cfg.call_mic_volume, cfg.call_spk_volume)
         };
-        let ui = call_window::open_call_window(
-            &state.app,
-            &state.window,
-            peer_name,
-            mic_v,
-            spk_v,
-        );
+        let ui = call_window::open_call_window(&state.app, &state.window, peer_name, mic_v, spk_v);
         {
             let s = state.clone();
             ui.hangup_btn.connect_clicked(move |_| end_voice_call(&s));
         }
         {
             let s = state.clone();
-            ui.answer_btn.connect_clicked(move |_| answer_voice_call(&s));
+            ui.answer_btn
+                .connect_clicked(move |_| answer_voice_call(&s));
         }
         {
             let s = state.clone();
-            ui.decline_btn.connect_clicked(move |_| decline_voice_call(&s));
+            ui.decline_btn
+                .connect_clicked(move |_| decline_voice_call(&s));
         }
         {
             let s = state.clone();
             ui.mute_btn.connect_toggled(move |btn| {
                 let muted = btn.is_active();
                 *s.call_mic_muted.borrow_mut() = muted;
-                let _ = s.sidecar.call_set_audio(
-                    muted,
-                    *s.call_deafened.borrow(),
-                    None,
-                    None,
-                );
+                let _ = s
+                    .sidecar
+                    .call_set_audio(muted, *s.call_deafened.borrow(), None, None);
                 if let Some(ui) = s.call_ui.borrow().as_ref() {
                     call_window::update_mute_visual(ui, muted);
                 }
@@ -7763,12 +7524,9 @@ fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMode<'_>) {
             ui.deafen_btn.connect_toggled(move |btn| {
                 let deafened = btn.is_active();
                 *s.call_deafened.borrow_mut() = deafened;
-                let _ = s.sidecar.call_set_audio(
-                    *s.call_mic_muted.borrow(),
-                    deafened,
-                    None,
-                    None,
-                );
+                let _ = s
+                    .sidecar
+                    .call_set_audio(*s.call_mic_muted.borrow(), deafened, None, None);
                 if let Some(ui) = s.call_ui.borrow().as_ref() {
                     call_window::update_deafen_visual(ui, deafened);
                 }
@@ -7833,7 +7591,10 @@ fn close_active_call_ui(state: &AppState) {
 
 fn handle_call_state(state: &AppState, peer: &str, call_state: &str, error: Option<&str>) {
     if !calls_experimental_enabled(state)
-        && matches!(call_state, "ringing" | "connecting" | "connected" | "acquiring")
+        && matches!(
+            call_state,
+            "ringing" | "connecting" | "connected" | "acquiring"
+        )
     {
         let _ = state.sidecar.call_end();
         close_active_call_ui(state);
@@ -7868,10 +7629,7 @@ fn handle_call_state(state: &AppState, peer: &str, call_state: &str, error: Opti
             if err.contains("relogin_android_required") || err.contains("DESKTOPWIN") {
                 call_error_toast(state, err);
             } else {
-                toast(
-                    state,
-                    &crate::i18n::tf("call_failed", &[("error", err)]),
-                );
+                toast(state, &crate::i18n::tf("call_failed", &[("error", err)]));
             }
         }
         _ => {}

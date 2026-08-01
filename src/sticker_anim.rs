@@ -45,10 +45,7 @@ fn with_decode_slot<R>(f: impl FnOnce() -> R) -> R {
     let lim = decode_limiter();
     let mut guard = lim.active.lock().unwrap_or_else(|e| e.into_inner());
     while *guard >= lim.max {
-        guard = lim
-            .cv
-            .wait(guard)
-            .unwrap_or_else(|e| e.into_inner());
+        guard = lim.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
     }
     *guard += 1;
     drop(guard);
@@ -187,10 +184,7 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     if full_w == 0 || full_h == 0 || full_w * full_h > 2048 * 2048 {
         return None;
     }
-    let plays = info
-        .animation_control
-        .map(|a| a.num_plays)
-        .unwrap_or(0);
+    let plays = info.animation_control.map(|a| a.num_plays).unwrap_or(0);
 
     let scale = if max_px > 0 {
         (max_px as f64 / full_w.max(full_h) as f64).min(1.0)
@@ -215,8 +209,12 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
         };
         let Some(fc) = reader.info().frame_control else {
             if frames.is_empty() {
-                let rgba =
-                    expand_to_rgba(&buf[..out.buffer_size()], out.color_type, out.width, out.height)?;
+                let rgba = expand_to_rgba(
+                    &buf[..out.buffer_size()],
+                    out.color_type,
+                    out.width,
+                    out.height,
+                )?;
                 let rgba = if tw != full_w as u32 || th != full_h as u32 {
                     let img = image::RgbaImage::from_raw(out.width, out.height, rgba)?;
                     image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle)
@@ -288,9 +286,7 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
                         for c in 0..3 {
                             let s = src[si + c] as u32;
                             let d = canvas[di + c] as u32;
-                            canvas[di + c] = ((s * src_a
-                                + d * dst_a * (255 - src_a) / 255
-                                + 127)
+                            canvas[di + c] = ((s * src_a + d * dst_a * (255 - src_a) / 255 + 127)
                                 / out_a.max(1)) as u8;
                         }
                         canvas[di + 3] = out_a as u8;

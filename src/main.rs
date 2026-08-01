@@ -13,22 +13,25 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("line-gtk");
+    config::ensure_private_dir(&data_dir)?;
+    let appender = tracing_appender::rolling::never(&data_dir, "line-gtk.log");
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(log_writer)
+        .with_ansi(false)
         .init();
 
     // Prefer GPU video decoders (NVDEC / Vulkan / VA-API) for GtkVideo / GStreamer.
     prefer_gstreamer_hw_decoders();
 
     let repo_root = discover_repo_root()?;
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("line-gtk");
-    std::fs::create_dir_all(&data_dir)?;
-
     tracing::info!(?repo_root, ?data_dir, "starting LINE GTK");
     ui::run(repo_root, data_dir)
 }
@@ -76,7 +79,5 @@ fn discover_repo_root() -> Result<PathBuf> {
             return Ok(c);
         }
     }
-    anyhow::bail!(
-        "could not find LINE GTK resources (protocol/src/main.ts); set LINE_GTK_ROOT"
-    )
+    anyhow::bail!("could not find LINE GTK resources (protocol/src/main.ts); set LINE_GTK_ROOT")
 }

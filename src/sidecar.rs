@@ -1,31 +1,52 @@
 use crate::protocol::{ProtocolEvent, Request, Response};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_channel::{Receiver, Sender};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Sidecar {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     next_id: AtomicU64,
+    generation: Arc<AtomicU64>,
+    pending_ids: Arc<Mutex<HashSet<u64>>>,
+    timeout_tx: std::sync::mpsc::Sender<(u64, Instant)>,
     event_tx: Sender<ProtocolEvent>,
     pub events: Receiver<ProtocolEvent>,
     repo_root: PathBuf,
     data_dir: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct SidecarStatus {
+    pub runtime: &'static str,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub pending_requests: usize,
+}
+
 impl Sidecar {
     pub fn spawn(repo_root: &Path, data_dir: &Path) -> Result<Self> {
-        let (tx, rx) = async_channel::unbounded::<ProtocolEvent>();
+        let (tx, rx) = async_channel::bounded::<ProtocolEvent>(1024);
+        let pending_ids = Arc::new(Mutex::new(HashSet::new()));
+        let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+        spawn_timeout_worker(timeout_rx, pending_ids.clone(), tx.clone());
         let sidecar = Self {
             child: Arc::new(Mutex::new(None)),
             stdin: Arc::new(Mutex::new(None)),
             next_id: AtomicU64::new(1),
+            generation: Arc::new(AtomicU64::new(0)),
+            pending_ids,
+            timeout_tx,
             event_tx: tx,
             events: rx,
             repo_root: repo_root.to_path_buf(),
@@ -36,29 +57,42 @@ impl Sidecar {
     }
 
     fn start_process(&self) -> Result<()> {
-        let deno = find_deno()?;
         let script = self.repo_root.join("protocol/src/main.ts");
-        if !script.exists() {
+        let compiled = self.repo_root.join("protocol/line-gtk-protocol");
+        if !compiled.is_file() && !script.exists() {
             return Err(anyhow!("protocol sidecar missing at {}", script.display()));
         }
-        std::fs::create_dir_all(&self.data_dir)?;
+        crate::config::ensure_private_dir(&self.data_dir)?;
+        let cfg = crate::config::AppConfig::load(&self.data_dir);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let mut child = Command::new(&deno)
-            .arg("run")
-            .arg("-A")
-            .arg(&script)
+        let (mut command, runtime) = if compiled.is_file() {
+            (Command::new(&compiled), compiled)
+        } else {
+            let deno = find_deno()?;
+            let mut command = Command::new(&deno);
+            command
+                .arg("run")
+                .arg("--no-prompt")
+                // Attachments may be selected from anywhere, but writes remain
+                // confined to application data. Network endpoints are negotiated
+                // dynamically by LINE and cannot be safely enumerated.
+                .arg("--allow-read")
+                .arg(format!("--allow-write={}", self.data_dir.display()))
+                .arg("--allow-net")
+                .arg("--allow-run=python3,ffmpeg,ffprobe")
+                .arg("--allow-sys")
+                .arg("--allow-env=HOME,PATH,DENO_DIR,Q_DEBUG,NODE_DEBUG,NO_COLOR,LINE_GTK_DATA,LINE_GTK_LANG,LINE_GTK_CACHE_RETENTION,LINE_GTK_AUDIO_INPUT,LINE_GTK_AUDIO_OUTPUT,LINE_DEVICE,LINE_VERSION,LINE_CALL_DEVNAME,LINE_CALL_DEVICE_INFO,LINE_CALL_OPUS_SIGNAL,LINE_CALL_DEBUG")
+                .arg(&script);
+            (command, deno)
+        };
+
+        let mut child = command
             .current_dir(self.repo_root.join("protocol"))
             .env("LINE_GTK_DATA", &self.data_dir)
-            .env("LINE_GTK_LANG", {
-                let cfg = crate::config::AppConfig::load(&self.data_dir);
-                cfg.language
-            })
-            .env("LINE_GTK_CACHE_RETENTION", {
-                let cfg = crate::config::AppConfig::load(&self.data_dir);
-                cfg.cache_retention
-            })
+            .env("LINE_GTK_LANG", cfg.language.clone())
+            .env("LINE_GTK_CACHE_RETENTION", cfg.cache_retention.clone())
             .env("LINE_GTK_AUDIO_INPUT", {
-                let cfg = crate::config::AppConfig::load(&self.data_dir);
                 if cfg.audio_input.is_empty() {
                     "default".into()
                 } else {
@@ -66,7 +100,6 @@ impl Sidecar {
                 }
             })
             .env("LINE_GTK_AUDIO_OUTPUT", {
-                let cfg = crate::config::AppConfig::load(&self.data_dir);
                 if cfg.audio_output.is_empty() {
                     "default".into()
                 } else {
@@ -77,24 +110,43 @@ impl Sidecar {
                 "PATH",
                 format!(
                     "{}:{}",
-                    deno.parent().unwrap_or(Path::new(".")).display(),
+                    runtime.parent().unwrap_or(Path::new(".")).display(),
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to spawn deno at {}", deno.display()))?;
+            .with_context(|| {
+                format!("failed to spawn protocol runtime at {}", runtime.display())
+            })?;
 
         let stdout = child.stdout.take().context("sidecar stdout missing")?;
         let stdin = child.stdin.take().context("sidecar stdin missing")?;
+        let stderr = child.stderr.take().context("sidecar stderr missing")?;
         let tx = self.event_tx.clone();
+        let pending_ids = self.pending_ids.clone();
+        let current_generation = self.generation.clone();
 
         thread::Builder::new()
             .name("line-sidecar-stdout".into())
-            .spawn(move || read_loop(stdout, tx))
+            .spawn(move || {
+                read_loop(stdout, tx.clone(), pending_ids);
+                if current_generation.load(Ordering::SeqCst) == generation {
+                    let _ = tx.send_blocking(ProtocolEvent::Exited(-1));
+                }
+            })
             .context("failed to start sidecar reader")?;
+
+        thread::Builder::new()
+            .name("line-sidecar-stderr".into())
+            .spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(|line| line.ok()) {
+                    tracing::warn!(target: "line_gtk::protocol", "{line}");
+                }
+            })
+            .context("failed to start sidecar stderr reader")?;
 
         *self.child.lock().map_err(|_| anyhow!("child lock"))? = Some(child);
         *self.stdin.lock().map_err(|_| anyhow!("stdin lock"))? = Some(stdin);
@@ -103,6 +155,48 @@ impl Sidecar {
 
     /// Kill the protocol process and start a fresh one (for Retry during PIN).
     pub fn restart(&self) -> Result<()> {
+        self.stop_process();
+        // Drop stale auth so Ready always goes through QR again.
+        for name in ["auth-token.txt", "auth-device.txt"] {
+            let _ = std::fs::remove_file(self.data_dir.join(name));
+        }
+        self.start_process()
+    }
+
+    /// Restart after an unexpected crash while preserving the linked session.
+    pub fn recover(&self) -> Result<()> {
+        self.stop_process();
+        self.start_process()
+    }
+
+    pub fn status(&self) -> SidecarStatus {
+        let (running, pid) = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| {
+                child.as_mut().map(|process| {
+                    let running = process.try_wait().ok().flatten().is_none();
+                    (running, Some(process.id()))
+                })
+            })
+            .unwrap_or((false, None));
+        SidecarStatus {
+            runtime: if self.repo_root.join("protocol/line-gtk-protocol").is_file() {
+                "compiled"
+            } else {
+                "deno"
+            },
+            running,
+            pid,
+            pending_requests: self.pending_ids.lock().map(|ids| ids.len()).unwrap_or(0),
+        }
+    }
+
+    fn stop_process(&self) {
+        // Invalidate the reader before closing stdout so an intentional restart
+        // is not reported as an unexpected crash.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
                 let _ = child.kill();
@@ -112,10 +206,9 @@ impl Sidecar {
         if let Ok(mut stdin) = self.stdin.lock() {
             *stdin = None;
         }
-        // Drop stale auth so Ready always goes through QR again.
-        let auth = self.data_dir.join("auth-token.txt");
-        let _ = std::fs::remove_file(auth);
-        self.start_process()
+        if let Ok(mut pending) = self.pending_ids.lock() {
+            pending.clear();
+        }
     }
 
     pub fn request(&self, method: &str, params: Option<Value>) -> Result<u64> {
@@ -131,8 +224,20 @@ impl Sidecar {
         let stdin = stdin_guard
             .as_mut()
             .ok_or_else(|| anyhow!("sidecar stdin unavailable"))?;
-        stdin.write_all(line.as_bytes())?;
-        stdin.flush()?;
+        self.pending_ids
+            .lock()
+            .map_err(|_| anyhow!("pending request lock"))?
+            .insert(id);
+        if let Err(error) = stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.flush())
+        {
+            if let Ok(mut pending) = self.pending_ids.lock() {
+                pending.remove(&id);
+            }
+            return Err(error.into());
+        }
+        let _ = self.timeout_tx.send((id, Instant::now()));
         Ok(id)
     }
 
@@ -162,7 +267,12 @@ impl Sidecar {
         )
     }
 
-    pub fn send_audio(&self, chat_mid: &str, file_path: &str, duration_ms: Option<u64>) -> Result<u64> {
+    pub fn send_audio(
+        &self,
+        chat_mid: &str,
+        file_path: &str,
+        duration_ms: Option<u64>,
+    ) -> Result<u64> {
         let mut params = json!({ "chatMid": chat_mid, "filePath": file_path });
         if let Some(ms) = duration_ms {
             params["durationMs"] = json!(ms);
@@ -326,17 +436,6 @@ impl Sidecar {
     }
 }
 
-impl Drop for Sidecar {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-}
-
 fn find_deno() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("DENO") {
         return Ok(PathBuf::from(p));
@@ -359,7 +458,11 @@ fn which(bin: &str) -> Option<PathBuf> {
     })
 }
 
-fn read_loop<R: std::io::Read>(stdout: R, tx: Sender<ProtocolEvent>) {
+fn read_loop<R: std::io::Read>(
+    stdout: R,
+    tx: Sender<ProtocolEvent>,
+    pending_ids: Arc<Mutex<HashSet<u64>>>,
+) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -515,13 +618,11 @@ fn read_loop<R: std::io::Read>(stdout: R, tx: Sender<ProtocolEvent>) {
                                 })
                                 .unwrap_or_default();
                             ProtocolEvent::FriendsUpdated { friends }
-                        },
+                        }
                         "chat_upsert" => {
-                            let chat = resp
-                                .extra
-                                .get("chat")
-                                .cloned()
-                                .and_then(|v| serde_json::from_value::<crate::protocol::ChatInfo>(v).ok());
+                            let chat = resp.extra.get("chat").cloned().and_then(|v| {
+                                serde_json::from_value::<crate::protocol::ChatInfo>(v).ok()
+                            });
                             match chat {
                                 Some(chat) => ProtocolEvent::ChatUpsert {
                                     chat,
@@ -750,6 +851,9 @@ fn read_loop<R: std::io::Read>(stdout: R, tx: Sender<ProtocolEvent>) {
                         break;
                     }
                 } else if let Some(id) = resp.id {
+                    if let Ok(mut pending) = pending_ids.lock() {
+                        pending.remove(&id);
+                    }
                     let ev = ProtocolEvent::Response {
                         id,
                         ok: resp.ok.unwrap_or(false),
@@ -766,5 +870,51 @@ fn read_loop<R: std::io::Read>(stdout: R, tx: Sender<ProtocolEvent>) {
             }
         }
     }
-    // Do not emit Exited here — restart intentionally closes stdout.
+}
+
+fn spawn_timeout_worker(
+    rx: std::sync::mpsc::Receiver<(u64, Instant)>,
+    pending_ids: Arc<Mutex<HashSet<u64>>>,
+    event_tx: Sender<ProtocolEvent>,
+) {
+    let _ = thread::Builder::new()
+        .name("line-sidecar-timeouts".into())
+        .spawn(move || {
+            let mut deadlines = Vec::<(u64, Instant)>::new();
+            loop {
+                match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(item) => deadlines.push(item),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                while let Ok(item) = rx.try_recv() {
+                    deadlines.push(item);
+                }
+                let now = Instant::now();
+                deadlines.retain(|(id, started)| {
+                    if now.duration_since(*started) < REQUEST_TIMEOUT {
+                        return true;
+                    }
+                    let timed_out = pending_ids
+                        .lock()
+                        .map(|mut pending| pending.remove(id))
+                        .unwrap_or(false);
+                    if timed_out {
+                        let _ = event_tx.send_blocking(ProtocolEvent::Response {
+                            id: *id,
+                            ok: false,
+                            result: Value::Null,
+                            error: Some("protocol request timed out".into()),
+                        });
+                    }
+                    false
+                });
+            }
+        });
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        self.stop_process();
+    }
 }

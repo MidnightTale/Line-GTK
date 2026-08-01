@@ -109,7 +109,9 @@ pub struct MessageInfo {
 
 #[derive(Debug, Clone)]
 pub enum ProtocolEvent {
-    Ready { has_auth: bool },
+    Ready {
+        has_auth: bool,
+    },
     Session {
         mid: String,
         display_name: String,
@@ -118,9 +120,15 @@ pub enum ProtocolEvent {
         avatar_path: Option<String>,
         picture_url: Option<String>,
     },
-    SessionFailed { error: String },
-    Qr { url: String },
-    Pin { pin: String },
+    SessionFailed {
+        error: String,
+    },
+    Qr {
+        url: String,
+    },
+    Pin {
+        pin: String,
+    },
     Listening,
     Message(MessageInfo),
     Chats {
@@ -132,8 +140,13 @@ pub enum ProtocolEvent {
         messages: Vec<MessageInfo>,
         cached: bool,
     },
-    AvatarReady { mid: String, avatar_path: String },
-    FriendsUpdated { friends: Vec<ChatInfo> },
+    AvatarReady {
+        mid: String,
+        avatar_path: String,
+    },
+    FriendsUpdated {
+        friends: Vec<ChatInfo>,
+    },
     ChatUpsert {
         chat: ChatInfo,
         created: bool,
@@ -199,4 +212,43 @@ pub enum ProtocolEvent {
     },
     Error(String),
     Exited(i32),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_event_envelope_and_extra_fields() {
+        let response: Response =
+            serde_json::from_str(r#"{"event":"ready","hasAuth":true,"dataDir":"/tmp/line-gtk"}"#)
+                .unwrap();
+        assert_eq!(response.event.as_deref(), Some("ready"));
+        assert_eq!(response.extra["hasAuth"], true);
+        assert_eq!(response.extra["dataDir"], "/tmp/line-gtk");
+    }
+
+    #[test]
+    fn message_defaults_tolerate_protocol_evolution() {
+        let message: MessageInfo = serde_json::from_str(r#"{"id":"42","text":"hello"}"#).unwrap();
+        assert_eq!(message.id, "42");
+        assert_eq!(message.text, "hello");
+        assert_eq!(message.created_time, 0);
+        assert!(!message.mine);
+        assert!(message.image_path.is_none());
+    }
+
+    #[test]
+    fn request_omits_absent_params() {
+        let request = Request {
+            id: 7,
+            method: "list_chats".into(),
+            params: None,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "id": 7, "method": "list_chats" })
+        );
+    }
 }

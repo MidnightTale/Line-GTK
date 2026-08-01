@@ -1,4 +1,4 @@
-use crate::config::{apply_animations, apply_font, apply_theme, AppConfig};
+use crate::config::{AppConfig, apply_animations, apply_font, apply_theme};
 use crate::i18n;
 use crate::sidecar::Sidecar;
 use gtk::gio;
@@ -618,10 +618,7 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
             dialog.add_response(confirm_id, &confirm_label);
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
-            dialog.set_response_appearance(
-                confirm_id,
-                libadwaita::ResponseAppearance::Destructive,
-            );
+            dialog.set_response_appearance(confirm_id, libadwaita::ResponseAppearance::Destructive);
 
             let cfg = cfg.clone();
             let data_dir = data_dir.clone();
@@ -722,23 +719,20 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
             let data_dir = data_dir.clone();
             let toast = toast.clone();
             let row = row_choose.clone();
-            dialog.select_folder(
-                Some(&parent),
-                None::<&gio::Cancellable>,
-                move |result| {
-                    let Ok(file) = result else {
-                        return;
-                    };
-                    let Some(path) = file.path() else {
-                        return;
-                    };
-                    let path_str = path.display().to_string();
-                    cfg.borrow_mut().set_download_dir_for(kind, path_str.clone());
-                    cfg.borrow().save(&data_dir);
-                    row.set_subtitle(&path_str);
-                    toast(&i18n::t("download_folder_saved"));
-                },
-            );
+            dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+                let Ok(file) = result else {
+                    return;
+                };
+                let Some(path) = file.path() else {
+                    return;
+                };
+                let path_str = path.display().to_string();
+                cfg.borrow_mut()
+                    .set_download_dir_for(kind, path_str.clone());
+                cfg.borrow().save(&data_dir);
+                row.set_subtitle(&path_str);
+                toast(&i18n::t("download_folder_saved"));
+            });
         });
         let cfg = deps.config.clone();
         let data_dir = deps.data_dir.clone();
@@ -900,6 +894,21 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
         .title(i18n::t("about"))
         .description(i18n::t("about_desc"))
         .build();
+    {
+        let row = libadwaita::ActionRow::builder()
+            .title(i18n::t("diagnostics"))
+            .subtitle(i18n::t("diagnostics_subtitle"))
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        let sidecar = deps.sidecar.clone();
+        let data_dir = deps.data_dir.clone();
+        let parent = win.clone();
+        row.connect_activated(move |_| {
+            super::diagnostics::open(&parent, sidecar.clone(), &data_dir);
+        });
+        about.add(&row);
+    }
     about.add(
         &libadwaita::ActionRow::builder()
             .title(i18n::t("about_version"))
@@ -912,9 +921,7 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
             .subtitle(i18n::t("about_maintainer_name"))
             .activatable(true)
             .build();
-        row.add_suffix(
-            &gtk::Image::from_icon_name("go-next-symbolic"),
-        );
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
         row.connect_activated(|_| {
             let _ = gio::AppInfo::launch_default_for_uri(
                 "https://github.com/MidnightTale",
@@ -929,9 +936,7 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
             .subtitle(i18n::t("about_source_url"))
             .activatable(true)
             .build();
-        row.add_suffix(
-            &gtk::Image::from_icon_name("go-next-symbolic"),
-        );
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
         row.connect_activated(|_| {
             let _ = gio::AppInfo::launch_default_for_uri(
                 "https://github.com/MidnightTale/line-gtk",

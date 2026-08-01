@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
 use gtk::glib;
@@ -49,7 +49,7 @@ pub fn build_login_page() -> LoginWidgets {
         .build();
 
     let subtitle = gtk::Label::builder()
-        .label("QR code with LINE mobile")
+        .label(crate::i18n::t("login_subtitle"))
         .css_classes(["dim-label", "line-login-subtitle"])
         .wrap(true)
         .justify(gtk::Justification::Center)
@@ -96,7 +96,7 @@ pub fn build_login_page() -> LoginWidgets {
         .build();
 
     let pin_caption = gtk::Label::builder()
-        .label("Enter this PIN on your phone")
+        .label(crate::i18n::t("login_pin_caption"))
         .css_classes(["title-3"])
         .justify(gtk::Justification::Center)
         .wrap(true)
@@ -117,7 +117,7 @@ pub fn build_login_page() -> LoginWidgets {
     card.append(&stage);
 
     let hint = gtk::Label::builder()
-        .label("QR code with LINE mobile")
+        .label(crate::i18n::t("login_qr_hint"))
         .wrap(true)
         .justify(gtk::Justification::Center)
         .max_width_chars(40)
@@ -125,14 +125,14 @@ pub fn build_login_page() -> LoginWidgets {
         .build();
 
     let retry_btn = gtk::Button::builder()
-        .label("Retry QR login")
+        .label(crate::i18n::t("login_retry"))
         .css_classes(["pill", "suggested-action"])
         .halign(gtk::Align::Center)
         .visible(false)
         .build();
 
     let note = gtk::Label::builder()
-        .label("Unofficial. LINE ToS risk applies. Prefer a secondary session.")
+        .label(crate::i18n::t("login_note"))
         .css_classes(["caption", "dim-label"])
         .wrap(true)
         .justify(gtk::Justification::Center)

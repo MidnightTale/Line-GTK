@@ -12,9 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum TrayAction {
     Show,
     Quit,
-    OpenChat { mid: String },
+    OpenChat {
+        mid: String,
+    },
     /// `secs == 0` clears the timed mute. Otherwise mute notifications for that many seconds.
-    MuteFor { secs: u64 },
+    MuteFor {
+        secs: u64,
+    },
     /// Flip Discord Rich Presence on/off (persisted in settings).
     ToggleDiscordRpc,
 }

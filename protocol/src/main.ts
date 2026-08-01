@@ -3,10 +3,24 @@
  * NDJSON over stdin/stdout. Heavy I/O is cached + async so GTK stays snappy.
  */
 
-import { Client, loginWithAuthToken, loginWithQR, TalkMessage } from "@evex/linejs";
+import {
+  Client,
+  loginWithAuthToken,
+  loginWithQR,
+  TalkMessage,
+} from "@evex/linejs";
 import { FileStorage } from "@evex/linejs/storage";
 import { fromFileUrl, join } from "@std/path";
 import { Buffer } from "node:buffer";
+import {
+  atomicWriteJson,
+  atomicWriteTextFile,
+  ensurePrivateDir,
+} from "./storage.ts";
+import { AuthStore, LineDevice } from "./auth.ts";
+import { CachePolicy, policyFor } from "./cache_policy.ts";
+import { friendName, picturePathOf, profileUrl } from "./contacts.ts";
+import { isMediaType, normalizeRaw } from "./messages.ts";
 
 type Json = Record<string, unknown>;
 
@@ -24,21 +38,20 @@ type ChatRow = {
 
 const dataDir = Deno.env.get("LINE_GTK_DATA") ??
   join(Deno.env.get("HOME") ?? ".", ".local", "share", "line-gtk");
-await Deno.mkdir(dataDir, { recursive: true });
+await ensurePrivateDir(dataDir);
 const cacheDir = join(dataDir, "cache");
 const avatarDir = join(cacheDir, "avatars");
 const mediaDir = join(cacheDir, "media");
 const stickerDir = join(cacheDir, "stickers");
-await Deno.mkdir(avatarDir, { recursive: true });
-await Deno.mkdir(mediaDir, { recursive: true });
-await Deno.mkdir(stickerDir, { recursive: true });
+await ensurePrivateDir(avatarDir);
+await ensurePrivateDir(mediaDir);
+await ensurePrivateDir(stickerDir);
 
 const storagePath = join(dataDir, "linejs-storage.json");
-const authPath = join(dataDir, "auth-token.txt");
-const authDevicePath = join(dataDir, "auth-device.txt");
+const authStore = new AuthStore(dataDir);
 /** Docs: reliable PLANET audio needs ANDROID / ANDROIDSECONDARY, not DESKTOPWIN. */
 const LINE_DEVICE = (Deno.env.get("LINE_DEVICE")?.trim() ||
-  "ANDROIDSECONDARY") as "ANDROID" | "ANDROIDSECONDARY" | "DESKTOPWIN";
+  "ANDROIDSECONDARY") as LineDevice;
 const LINE_VERSION = Deno.env.get("LINE_VERSION")?.trim() || "26.6.2";
 /** Only for primary ANDROID tokens (example leaves this unset for secondary). */
 const LINE_CALL_DEVNAME = Deno.env.get("LINE_CALL_DEVNAME")?.trim() || "";
@@ -51,85 +64,10 @@ const LINE_CALL_OPUS_SIGNAL = (() => {
 const chatCachePath = join(cacheDir, "chats.json");
 const contactCachePath = join(cacheDir, "contacts.json");
 const msgDiskDir = join(cacheDir, "messages");
-await Deno.mkdir(msgDiskDir, { recursive: true });
+await ensurePrivateDir(msgDiskDir);
 
-const DAY_MS = 86_400_000;
-const WEEK_MS = 7 * DAY_MS;
-const MONTH_MS = 30 * DAY_MS;
-const FOREVER_MS = Number.MAX_SAFE_INTEGER;
-
-type CachePolicy = {
-  memChat: number;
-  memMsg: number;
-  diskChat: number;
-  diskMsg: number;
-  ownedPack: number;
-  contactsRefresh: number;
-  /** 0 = never expire miss markers */
-  animMiss: number;
-};
-
-function policyFor(retention: string): CachePolicy {
-  switch ((retention || "smart").toLowerCase()) {
-    case "day":
-      return {
-        memChat: 30 * 60_000,
-        memMsg: 15 * 60_000,
-        diskChat: DAY_MS,
-        diskMsg: DAY_MS,
-        ownedPack: DAY_MS,
-        contactsRefresh: 30 * 60_000,
-        animMiss: DAY_MS,
-      };
-    case "week":
-      return {
-        memChat: 60 * 60_000,
-        memMsg: 30 * 60_000,
-        diskChat: WEEK_MS,
-        diskMsg: WEEK_MS,
-        ownedPack: WEEK_MS,
-        contactsRefresh: 2 * 60 * 60_000,
-        animMiss: WEEK_MS,
-      };
-    case "month":
-      return {
-        memChat: 2 * 60 * 60_000,
-        memMsg: 60 * 60_000,
-        diskChat: MONTH_MS,
-        diskMsg: MONTH_MS,
-        ownedPack: MONTH_MS,
-        contactsRefresh: 6 * 60 * 60_000,
-        animMiss: MONTH_MS,
-      };
-    case "forever":
-      return {
-        memChat: 6 * 60 * 60_000,
-        memMsg: 2 * 60 * 60_000,
-        diskChat: FOREVER_MS,
-        diskMsg: FOREVER_MS,
-        ownedPack: WEEK_MS,
-        contactsRefresh: 6 * 60 * 60_000,
-        animMiss: 0,
-      };
-    case "smart":
-    default:
-      // Stickers / avatars / media files stay on disk forever.
-      // Messages ~30d, chats ~14d, warm memory for snappy reopen.
-      // anim.miss expires weekly so packs that later gain animation recheck.
-      return {
-        memChat: 30 * 60_000,
-        memMsg: 20 * 60_000,
-        diskChat: 14 * DAY_MS,
-        diskMsg: 30 * DAY_MS,
-        ownedPack: DAY_MS,
-        contactsRefresh: 30 * 60_000,
-        animMiss: WEEK_MS,
-      };
-  }
-}
-
-let cacheRetention =
-  (Deno.env.get("LINE_GTK_CACHE_RETENTION") || "smart").toLowerCase();
+let cacheRetention = (Deno.env.get("LINE_GTK_CACHE_RETENTION") || "smart")
+  .toLowerCase();
 let cachePolicyState = policyFor(cacheRetention);
 let cachePolicyCheckedAt = 0;
 
@@ -215,8 +153,7 @@ globalThis.addEventListener("unhandledrejection", (ev) => {
       msg = String(reason ?? "unhandledrejection");
     }
   }
-  const loggedOut =
-    msg.includes("NOT_AUTHORIZED") ||
+  const loggedOut = msg.includes("NOT_AUTHORIZED") ||
     msg.includes("LOGGED_OUT") ||
     msg.includes("AUTHENTICATION") ||
     msg.includes("V3_TOKEN_CLIENT_LOGGED_OUT") ||
@@ -266,7 +203,10 @@ function asI64(v: unknown): bigint | number {
     }
   }
   // last resort — thrift I64 must be numeric
-  if (typeof v === "object" && v !== null && typeof (v as { toString?: () => string }).toString === "function") {
+  if (
+    typeof v === "object" && v !== null &&
+    typeof (v as { toString?: () => string }).toString === "function"
+  ) {
     const s = String(v);
     if (/^-?\d+$/.test(s)) {
       try {
@@ -346,32 +286,20 @@ function normType(t: unknown): string {
   return String(t ?? "NONE").toUpperCase();
 }
 
-function isVisualType(ct: string) {
-  return ct === "IMAGE" || ct === "VIDEO" || ct === "STICKER";
-}
-
-function isMediaType(ct: string) {
-  return isVisualType(ct) || ct === "AUDIO" || ct === "FILE";
-}
-
-/** LINE sometimes omits contentMetadata; linejs crashes on `.e2eeVersion`. */
-function normalizeRaw(raw: Record<string, unknown> | null | undefined): Record<string, unknown> {
-  const r = { ...(raw ?? {}) };
-  if (r.contentMetadata == null || typeof r.contentMetadata !== "object") {
-    r.contentMetadata = {};
-  }
-  return r;
-}
-
 async function fromRawTalkSafe(raw: unknown): Promise<TalkMessage> {
   const normalized = normalizeRaw(raw as Record<string, unknown>);
-  return await TalkMessage.fromRawTalk(normalized as Parameters<typeof TalkMessage.fromRawTalk>[0], client!);
+  return await TalkMessage.fromRawTalk(
+    normalized as unknown as Parameters<typeof TalkMessage.fromRawTalk>[0],
+    client!,
+  );
 }
 
 function patchE2eeGuards() {
   if (!client) return;
-  const e2ee = client.base.e2ee as {
-    decryptE2EEMessage: (m: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  const e2ee = client.base.e2ee as unknown as {
+    decryptE2EEMessage: (
+      m: Record<string, unknown>,
+    ) => Promise<Record<string, unknown>>;
   };
   const orig = e2ee.decryptE2EEMessage.bind(e2ee);
   e2ee.decryptE2EEMessage = async (messageObj) => {
@@ -432,7 +360,7 @@ async function loadStickerIndex() {
 
 async function saveStickerIndex() {
   try {
-    await Deno.writeTextFile(
+    await atomicWriteTextFile(
       stickerIndexPath,
       JSON.stringify(stickerIndex.slice(0, 200), null, 2),
     );
@@ -460,7 +388,9 @@ function rememberSticker(
 
 function forgetSticker(stickerId: string, packageId?: string) {
   stickerIndex = stickerIndex.filter((s) => {
-    if (packageId) return !(s.stickerId === stickerId && s.packageId === packageId);
+    if (packageId) {
+      return !(s.stickerId === stickerId && s.packageId === packageId);
+    }
     return s.stickerId !== stickerId;
   });
   void saveStickerIndex();
@@ -489,7 +419,10 @@ async function fetchOwnedPackages(): Promise<OwnedPackage[]> {
       limit: 80,
       locale: { language: "en", country: "TH" },
     } as never) as Record<string, unknown>;
-    const list = (res.productList ?? res["1"] ?? []) as Record<string, unknown>[];
+    const list = (res.productList ?? res["1"] ?? []) as Record<
+      string,
+      unknown
+    >[];
     const packages = list
       .map((p) => ({
         id: String(p.id ?? p["1"] ?? ""),
@@ -576,7 +509,9 @@ async function ensurePackIcon(packageId: string): Promise<string | null> {
   return null;
 }
 
-async function ensureStickerAnimation(stickerId: string): Promise<string | null> {
+async function ensureStickerAnimation(
+  stickerId: string,
+): Promise<string | null> {
   await refreshCachePolicy();
   const animDest = join(stickerDir, `${stickerId}.anim.png`);
   const missDest = join(stickerDir, `${stickerId}.anim.miss`);
@@ -598,9 +533,9 @@ async function ensureStickerAnimation(stickerId: string): Promise<string | null>
     if (path) return path;
   }
   try {
-    await Deno.writeTextFile(missDest, "");
-  } catch {
-    /* ignore */
+    await atomicWriteTextFile(missDest, "");
+  } catch (error) {
+    console.error("[sticker-animation-miss-cache]", error);
   }
   return null;
 }
@@ -706,7 +641,9 @@ function extractFlex(meta: Record<string, string>): Json | null {
       const label = String(a.label || o.text || a.data || a.uri || "Action");
       const kind = String(a.type || "postback").toLowerCase();
       const data = a.data != null ? String(a.data) : null;
-      const uri = a.uri != null ? String(a.uri) : (a.url != null ? String(a.url) : null);
+      const uri = a.uri != null
+        ? String(a.uri)
+        : (a.url != null ? String(a.url) : null);
       const key = `${kind}|${label}|${data || ""}|${uri || ""}`;
       if (!seen.has(key) && actions.length < 24) {
         seen.add(key);
@@ -822,7 +759,7 @@ async function refetchMessageData(
   }
 }
 
-async function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
+function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const existing = inFlight.get(key);
   if (existing) return existing as Promise<T>;
   const p = fn().finally(() => inFlight.delete(key));
@@ -844,36 +781,25 @@ async function mapPool<T, R>(
     }
   }
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, () => run()),
+    Array.from(
+      { length: Math.min(concurrency, Math.max(items.length, 1)) },
+      () => run(),
+    ),
   );
   return out;
 }
 
 async function saveAuth(token: string, device = LINE_DEVICE) {
-  await Deno.writeTextFile(authPath, token);
-  await Deno.writeTextFile(authDevicePath, device);
+  await authStore.save(token, device);
 }
 async function loadAuth(): Promise<string | null> {
-  try {
-    const t = (await Deno.readTextFile(authPath)).trim();
-    return t.length ? t : null;
-  } catch {
-    return null;
-  }
+  return await authStore.loadToken();
 }
-async function loadAuthDevice(): Promise<string> {
-  try {
-    const d = (await Deno.readTextFile(authDevicePath)).trim();
-    if (d) return d;
-  } catch { /* miss */ }
-  return "DESKTOPWIN"; // legacy installs before Android call migration
+async function loadAuthDevice(): Promise<LineDevice> {
+  return await authStore.loadDevice();
 }
 async function clearAuth() {
-  for (const p of [authPath, authDevicePath]) {
-    try {
-      await Deno.remove(p);
-    } catch { /* ignore */ }
-  }
+  await authStore.clear();
 }
 
 function myMid(): string {
@@ -891,38 +817,14 @@ function isMineFrom(from: unknown): boolean {
   return !!mid && !!f && f === mid;
 }
 
-function friendName(user: { mid: string; raw: { contact?: { displayName?: string; picturePath?: string } } }) {
-  return user.raw.contact?.displayName || user.mid;
-}
-
-function profileUrl(picturePath?: string | null): string | null {
-  if (!picturePath) return null;
-  if (picturePath.startsWith("http")) return picturePath;
-  return `https://profile.line-scdn.net${picturePath.startsWith("/") ? "" : "/"}${picturePath}`;
-}
-
-function picturePathOf(profile: Record<string, unknown> | null | undefined): string | null {
-  if (!profile) return null;
-  const candidates: unknown[] = [
-    profile.picturePath,
-    profile.pictureStatus,
-    (profile as { picture?: { path?: string } }).picture?.path,
-    (profile as { raw?: { contact?: { picturePath?: string } } }).raw?.contact
-      ?.picturePath,
-  ];
-  for (const raw of candidates) {
-    if (typeof raw === "string" && raw.trim()) return raw.trim();
-  }
-  return null;
-}
-
 async function myProfilePayload(profile: {
   mid: string;
   displayName?: string;
   statusMessage?: string;
-  [k: string]: unknown;
 }) {
-  let picturePath = picturePathOf(profile as Record<string, unknown>);
+  let picturePath = picturePathOf(
+    profile as unknown as Record<string, unknown>,
+  );
   if (!picturePath) {
     picturePath = contactIndex.get(profile.mid)?.picturePath ?? null;
   }
@@ -960,7 +862,9 @@ function isImageBytes(buf: Uint8Array): boolean {
   // JPEG
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;
   // PNG
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+  if (
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
+  ) {
     return true;
   }
   // GIF
@@ -998,14 +902,21 @@ async function existingImage(path: string): Promise<string | null> {
   return null;
 }
 
-async function writeImageFile(dest: string, buf: Uint8Array): Promise<string | null> {
+async function writeImageFile(
+  dest: string,
+  buf: Uint8Array,
+): Promise<string | null> {
   if (!isImageBytes(buf)) return null;
-  const tmp = `${dest}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const tmp = `${dest}.tmp-${Date.now()}-${
+    Math.random().toString(16).slice(2)
+  }`;
   try {
     await Deno.writeFile(tmp, buf);
     await Deno.rename(tmp, dest);
   } catch (e) {
-    try { await Deno.remove(tmp); } catch { /* ignore */ }
+    try {
+      await Deno.remove(tmp);
+    } catch { /* ignore */ }
     throw e;
   }
   return dest;
@@ -1029,7 +940,10 @@ async function cacheUrl(url: string, dest: string): Promise<string | null> {
   }
 }
 
-async function avatarPathFor(mid: string, picturePath?: string | null): Promise<string | null> {
+async function avatarPathFor(
+  mid: string,
+  picturePath?: string | null,
+): Promise<string | null> {
   const dest = join(avatarDir, `${mid}.jpg`);
   const hit = await existingImage(dest);
   if (hit) return hit;
@@ -1070,7 +984,9 @@ print(im.size[0], im.size[1])
     const [ws, hs] = text.split(/\s+/);
     const w = Number(ws);
     const h = Number(hs);
-    if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) return null;
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w < 1 || h < 1) {
+      return null;
+    }
     return { w, h };
   } catch {
     return null;
@@ -1203,7 +1119,10 @@ im.save(dest, "JPEG", quality=80, optimize=True)
 }
 
 /** Prefer a small thumb for UI; keep original on disk for cache. */
-async function uiMediaPath(id: string, original: string | null): Promise<string | null> {
+async function uiMediaPath(
+  id: string,
+  original: string | null,
+): Promise<string | null> {
   if (!original) return null;
   const thumb = await makeThumb(original, id);
   return thumb || original;
@@ -1228,7 +1147,15 @@ async function isValidAudioFile(path: string | null): Promise<boolean> {
       // Still might be tiny valid; probe with ffprobe if available.
     }
     const p = new Deno.Command("ffprobe", {
-      args: ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+      args: [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "csv=p=0",
+        path,
+      ],
       stdout: "piped",
       stderr: "null",
     }).spawn();
@@ -1241,12 +1168,16 @@ async function isValidAudioFile(path: string | null): Promise<boolean> {
   }
 }
 
-async function downloadAudioBytes(messageId: string, chatMid: string): Promise<{
-  buf: Uint8Array;
-  mime: string;
-} | null> {
+async function downloadAudioBytes(messageId: string, chatMid: string): Promise<
+  {
+    buf: Uint8Array;
+    mime: string;
+  } | null
+> {
   // Prefer TalkMessage.getData (E2EE-aware).
-  const got = await refetchMessageData(chatMid, messageId, { allowNonImage: true });
+  const got = await refetchMessageData(chatMid, messageId, {
+    allowNonImage: true,
+  });
   if (got && got.buf.length >= 1024) return got;
   if (!client) return null;
   try {
@@ -1270,12 +1201,16 @@ async function loadDiskContacts() {
   try {
     const raw = JSON.parse(await Deno.readTextFile(contactCachePath));
     if (!raw?.contacts) return;
-    for (const [mid, c] of Object.entries(raw.contacts as Record<string, {
-      name: string;
-      picturePath: string | null;
-      kind?: string;
-      muted?: boolean;
-    }>)) {
+    for (
+      const [mid, c] of Object.entries(
+        raw.contacts as Record<string, {
+          name: string;
+          picturePath: string | null;
+          kind?: string;
+          muted?: boolean;
+        }>,
+      )
+    ) {
       contactIndex.set(mid, {
         name: c.name,
         picturePath: c.picturePath ?? null,
@@ -1295,11 +1230,10 @@ async function saveDiskContacts() {
   > = {};
   for (const [mid, c] of contactIndex) contacts[mid] = c;
   try {
-    await Deno.writeTextFile(
-      contactCachePath,
-      JSON.stringify({ at: Date.now(), contacts }),
-    );
-  } catch { /* ignore */ }
+    await atomicWriteJson(contactCachePath, { at: Date.now(), contacts });
+  } catch (error) {
+    console.error("[contacts-cache]", error);
+  }
 }
 
 async function loadDiskMessages(chatMid: string): Promise<Json[] | null> {
@@ -1316,11 +1250,13 @@ async function loadDiskMessages(chatMid: string): Promise<Json[] | null> {
 
 async function saveDiskMessages(chatMid: string, messages: Json[]) {
   try {
-    await Deno.writeTextFile(
-      join(msgDiskDir, `${chatMid}.json`),
-      JSON.stringify({ at: Date.now(), messages }),
-    );
-  } catch { /* ignore */ }
+    await atomicWriteJson(join(msgDiskDir, `${chatMid}.json`), {
+      at: Date.now(),
+      messages,
+    });
+  } catch (error) {
+    console.error("[messages-cache]", chatMid, error);
+  }
 }
 
 let contactsAt = 0;
@@ -1361,7 +1297,8 @@ async function refreshContactIndex(force = false) {
           name: c.displayName || mid,
           picturePath: c.picturePath ?? null,
           kind,
-          muted: !!(c as { notificationDisabled?: boolean }).notificationDisabled,
+          muted: !!(c as { notificationDisabled?: boolean })
+            .notificationDisabled,
         });
       }
     } catch (e) {
@@ -1374,7 +1311,8 @@ async function refreshContactIndex(force = false) {
             name: c.displayName || mid,
             picturePath: c.picturePath ?? null,
             kind: /BOT/i.test(type) ? "bot" : "dm",
-            muted: !!(c as { notificationDisabled?: boolean }).notificationDisabled,
+            muted: !!(c as { notificationDisabled?: boolean })
+              .notificationDisabled,
           });
         } catch {
           /* bot/OA without contact entry */
@@ -1458,7 +1396,9 @@ async function summarizeTalkMessage(
     const flex = null;
     return {
       id,
-      text: duration ? `Voice message (${Math.round(Number(duration) / 1000)}s)` : text,
+      text: duration
+        ? `Voice message (${Math.round(Number(duration) / 1000)}s)`
+        : text,
       from: raw.from ?? "",
       to: raw.to ?? "",
       mine: isMineFrom(raw.from),
@@ -1492,7 +1432,9 @@ async function summarizeTalkMessage(
           const blob = await tm.getData(false);
           const buf = new Uint8Array(await blob.arrayBuffer());
           if (isImageBytes(buf)) {
-            const ext = (blob.type || "").includes("png") || buf[0] === 0x89 ? "png" : "jpg";
+            const ext = (blob.type || "").includes("png") || buf[0] === 0x89
+              ? "png"
+              : "jpg";
             filePath = await writeFullImage(id, buf, blob.type || ext);
             imagePath = (await uiMediaPath(id, filePath)) || filePath;
           }
@@ -1585,7 +1527,8 @@ async function summarizeTalkMessage(
     stickerPackageId: stkPkg || null,
     flex,
     durationMs: meta.DURATION ? Number(meta.DURATION) : null,
-    needsMedia: (contentType === "IMAGE" || contentType === "VIDEO" || contentType === "STICKER")
+    needsMedia: (contentType === "IMAGE" || contentType === "VIDEO" ||
+        contentType === "STICKER")
       ? !imagePath
       : contentType === "AUDIO"
       ? true
@@ -1602,7 +1545,7 @@ async function summarizeRawMessage(
     return await summarizeTalkMessage(tm, opts);
   } catch (e) {
     console.error("[summarizeRawMessage]", e);
-    const r = normalizeRaw(raw as Record<string, unknown>);
+    const r = normalizeRaw(raw as unknown as Record<string, unknown>);
     const meta = (r.contentMetadata ?? {}) as Record<string, string>;
     const contentType = normType(r.contentType);
     let text = String(r.text ?? meta.ALT_TEXT ?? meta.STKTXT ?? "");
@@ -1610,8 +1553,9 @@ async function summarizeRawMessage(
       if (contentType === "AUDIO") text = "Voice message";
       else if (contentType === "IMAGE") text = "[Image]";
       else if (contentType === "VIDEO") text = "[Video]";
-      else if (contentType === "FILE") text = meta.FILE_NAME || meta.FILENAME || "[File]";
-      else if (contentType === "STICKER") text = "[Sticker]";
+      else if (contentType === "FILE") {
+        text = meta.FILE_NAME || meta.FILENAME || "[File]";
+      } else if (contentType === "STICKER") text = "[Sticker]";
       else if (contentType !== "NONE") text = `[${contentType}]`;
     }
     return {
@@ -1808,7 +1752,9 @@ async function hydrateMedia(
               await Deno.remove(path);
             }
           } catch { /* ignore */ }
-          const got = await refetchMessageData(chatMid, id, { allowNonImage: false });
+          const got = await refetchMessageData(chatMid, id, {
+            allowNonImage: false,
+          });
           if (got && isImageBytes(got.buf)) {
             path = await writeFullImage(id, got.buf, got.mime);
           } else {
@@ -1946,8 +1892,10 @@ async function hydratePreviews(chats: ChatRow[]) {
 
   if (chatCache) {
     try {
-      await Deno.writeTextFile(chatCachePath, JSON.stringify(chatCache));
-    } catch { /* ignore */ }
+      await atomicWriteJson(chatCachePath, chatCache);
+    } catch (error) {
+      console.error("[chat-preview-cache]", error);
+    }
   }
 }
 
@@ -2024,8 +1972,10 @@ async function hydrateAvatars(chats: ChatRow[]) {
   });
   if (chatCache) {
     try {
-      await Deno.writeTextFile(chatCachePath, JSON.stringify(chatCache));
-    } catch { /* ignore */ }
+      await atomicWriteJson(chatCachePath, chatCache);
+    } catch (error) {
+      console.error("[chat-avatar-cache]", error);
+    }
   }
 }
 
@@ -2107,8 +2057,10 @@ async function upsertChatFromMessage(message: Json) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== peer)];
   chatCache.at = Date.now();
   try {
-    await Deno.writeTextFile(chatCachePath, JSON.stringify(chatCache));
-  } catch { /* ignore */ }
+    await atomicWriteJson(chatCachePath, chatCache);
+  } catch (error) {
+    console.error("[chat-message-cache]", peer, error);
+  }
 
   emitEvent("chat_upsert", { chat: row, created });
   emitEvent("chat_preview", { mid: peer, preview, lastActivity: activity });
@@ -2142,8 +2094,10 @@ async function upsertChatFromContact(mid: string) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== mid)];
   chatCache.at = Date.now();
   try {
-    await Deno.writeTextFile(chatCachePath, JSON.stringify(chatCache));
-  } catch { /* ignore */ }
+    await atomicWriteJson(chatCachePath, chatCache);
+  } catch (error) {
+    console.error("[chat-contact-cache]", mid, error);
+  }
   emitEvent("chat_upsert", { chat: row, created });
   if (row.picturePath && !row.avatarPath) hydrateAvatars([row]);
 }
@@ -2276,7 +2230,7 @@ async function hydrateLiveMedia(
   }
 }
 
-async function startListen() {
+function startListen() {
   if (!client || listening) return;
   listening = true;
 
@@ -2332,28 +2286,37 @@ async function startListen() {
     }
   });
 
-  client.on("call:incoming", (ev: { callMid?: string; from?: string; kind?: string }) => {
-    const callId = String(ev.callMid ?? "");
-    const from = String(ev.from ?? "");
-    const kind = String(ev.kind ?? "AUDIO");
-    incomingOffer = { callId, from, kind };
-    emitEvent("call_incoming", { callId, from, kind });
-  });
-  client.on("call:cancel", (ev: { callMid?: string; from?: string; reason?: string }) => {
-    const from = String(ev.from ?? "");
-    if (incomingOffer?.from === from || incomingOffer?.callId === String(ev.callMid ?? "")) {
-      incomingOffer = null;
-    }
-    emitEvent("call_canceled", {
-      callId: String(ev.callMid ?? ""),
-      from,
-      reason: String(ev.reason ?? ""),
-    });
-    // Peer canceled / ended — tear down our active session too.
-    if (activeCall && (activeCall.peer === from || !from)) {
-      void endActiveCall();
-    }
-  });
+  client.on(
+    "call:incoming",
+    (ev: { callMid?: string; from?: string; kind?: string }) => {
+      const callId = String(ev.callMid ?? "");
+      const from = String(ev.from ?? "");
+      const kind = String(ev.kind ?? "AUDIO");
+      incomingOffer = { callId, from, kind };
+      emitEvent("call_incoming", { callId, from, kind });
+    },
+  );
+  client.on(
+    "call:cancel",
+    (ev: { callMid?: string; from?: string; reason?: string }) => {
+      const from = String(ev.from ?? "");
+      if (
+        incomingOffer?.from === from ||
+        incomingOffer?.callId === String(ev.callMid ?? "")
+      ) {
+        incomingOffer = null;
+      }
+      emitEvent("call_canceled", {
+        callId: String(ev.callMid ?? ""),
+        from,
+        reason: String(ev.reason ?? ""),
+      });
+      // Peer canceled / ended — tear down our active session too.
+      if (activeCall && (activeCall.peer === from || !from)) {
+        void endActiveCall();
+      }
+    },
+  );
 
   client.listen({ talk: true, square: false });
   emitEvent("listening");
@@ -2386,7 +2349,8 @@ type ActiveCall = {
 let activeCall: ActiveCall | null = null;
 let incomingOffer: { callId: string; from: string; kind: string } | null = null;
 let callAudioInput = Deno.env.get("LINE_GTK_AUDIO_INPUT")?.trim() || "default";
-let callAudioOutput = Deno.env.get("LINE_GTK_AUDIO_OUTPUT")?.trim() || "default";
+let callAudioOutput = Deno.env.get("LINE_GTK_AUDIO_OUTPUT")?.trim() ||
+  "default";
 
 function setCallAudioDevices(input?: string, output?: string) {
   if (input && input.trim()) callAudioInput = input.trim();
@@ -2396,8 +2360,12 @@ function setCallAudioDevices(input?: string, output?: string) {
 }
 
 function setCallGains(micGain?: unknown, spkGain?: unknown) {
-  if (micGain !== undefined) callAudioCtl.micGain = clampGain(micGain, callAudioCtl.micGain);
-  if (spkGain !== undefined) callAudioCtl.spkGain = clampGain(spkGain, callAudioCtl.spkGain);
+  if (micGain !== undefined) {
+    callAudioCtl.micGain = clampGain(micGain, callAudioCtl.micGain);
+  }
+  if (spkGain !== undefined) {
+    callAudioCtl.spkGain = clampGain(spkGain, callAudioCtl.spkGain);
+  }
 }
 
 /** Android PLANET defaults from https://linejs.evex.land/docs/call */
@@ -2671,7 +2639,9 @@ async function doCallStart(id: number | string | null, peerMid: string) {
         logTransportDebug(ev, { mediaSendCount, mediaRecvCount });
       },
     });
-    call.transport = transport;
+    call.transport = transport as unknown as NonNullable<
+      ActiveCall["transport"]
+    >;
 
     if (call.aborted) {
       callLog("aborted before connect");
@@ -2745,7 +2715,10 @@ async function doCallStart(id: number | string | null, peerMid: string) {
 
     emitEvent("call_state", { callId, peer: peerMid, state: "connected" });
     callLog("starting audio I/O");
-    call.stopAudio = await startCallAudioIO(transport, opusCodecFactory);
+    call.stopAudio = await startCallAudioIO(
+      transport,
+      opusCodecFactory as unknown as Parameters<typeof startCallAudioIO>[1],
+    );
     callLog("audio I/O running");
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e);
@@ -2754,16 +2727,15 @@ async function doCallStart(id: number | string | null, peerMid: string) {
       return;
     }
     const lower = raw.toLowerCase();
-    const msg =
-      lower.includes("fakecall") ||
+    const msg = lower.includes("fakecall") ||
         lower.includes("103") ||
         lower.includes("406") ||
         lower.includes("timeout") ||
         lower.includes("media") ||
         lower.includes("denied") ||
         lower.includes("reject")
-        ? raw
-        : raw;
+      ? raw
+      : raw;
     callLog("FAILED", { err: msg });
     emitEvent("call_state", {
       callId,
@@ -2844,7 +2816,10 @@ async function doCallDecline(id: number | string | null) {
 
 async function startCallAudioIO(
   transport: {
-    send: (payload: Uint8Array, opts?: { timestampStep?: number }) => Promise<void>;
+    send: (
+      payload: Uint8Array,
+      opts?: { timestampStep?: number },
+    ) => Promise<void>;
     receive: () => AsyncIterable<Uint8Array>;
   },
   opusCodecFactory: () => Promise<{
@@ -3225,9 +3200,10 @@ async function doMarkRead(
     return;
   }
   try {
-    const seq = typeof client.base.getReqseq === "function"
-      ? await client.base.getReqseq()
-      : client.base.getReqseq;
+    const requestSequence = client.base.getReqseq;
+    const seq = typeof requestSequence === "function"
+      ? await requestSequence.call(client.base)
+      : Number(requestSequence);
     // thrift STRING (ftype 11) — must be string, not i64/bigint
     await client.base.talk.sendChatChecked({
       chatMid: String(chatMid),
@@ -3253,7 +3229,9 @@ async function doLoginQr(id: number | string | null) {
   authDead = false;
   const storage = new FileStorage(storagePath);
   // Docs: QR defaults to ANDROIDSECONDARY for call-capable sessions.
-  const device = LINE_DEVICE === "DESKTOPWIN" ? "ANDROIDSECONDARY" : LINE_DEVICE;
+  const device = LINE_DEVICE === "DESKTOPWIN"
+    ? "ANDROIDSECONDARY"
+    : LINE_DEVICE;
   client = await loginWithQR(
     {
       onReceiveQRUrl: (url) => emitEvent("qr", { url }),
@@ -3336,8 +3314,14 @@ async function doListChats(id: number | string | null, force = false) {
 
   await refreshCachePolicy();
   await dedupe(`list_chats:${force}`, async () => {
-    if (!force && chatCache && Date.now() - chatCache.at < cachePolicy().memChat) {
-      ok(id, { chats: chatCache.chats, count: chatCache.chats.length, cached: true });
+    if (
+      !force && chatCache && Date.now() - chatCache.at < cachePolicy().memChat
+    ) {
+      ok(id, {
+        chats: chatCache.chats,
+        count: chatCache.chats.length,
+        cached: true,
+      });
       return;
     }
 
@@ -3363,7 +3347,9 @@ async function doListChats(id: number | string | null, force = false) {
         const mid = String(box.id ?? "");
         if (!mid) continue;
         storeBoxCursor(mid, box.lastDeliveredMessageId);
-        const prevPreview = chatCache?.chats.find((x) => x.mid === mid)?.preview ?? "";
+        const prevPreview = chatCache?.chats.find((x) =>
+          x.mid === mid
+        )?.preview ?? "";
         byMid.set(mid, {
           mid,
           name: contactIndex.get(mid)?.name || mid,
@@ -3416,8 +3402,15 @@ async function doListChats(id: number | string | null, force = false) {
         const users = await client!.fetchUsers();
         for (const user of users) {
           const name = friendName(user);
-          const picturePath = user.raw.contact?.picturePath ?? null;
-          contactIndex.set(user.mid, { name, picturePath, kind: "dm", muted: false });
+          const picturePath = picturePathOf(
+            user as unknown as Record<string, unknown>,
+          );
+          contactIndex.set(user.mid, {
+            name,
+            picturePath,
+            kind: "dm",
+            muted: false,
+          });
           const prev = byMid.get(user.mid);
           if (prev) {
             prev.name = name;
@@ -3450,17 +3443,24 @@ async function doListChats(id: number | string | null, force = false) {
     }
 
     const chats = [...byMid.values()].sort((a, b) => {
-      if (b.lastActivity !== a.lastActivity) return b.lastActivity - a.lastActivity;
+      if (b.lastActivity !== a.lastActivity) {
+        return b.lastActivity - a.lastActivity;
+      }
       return a.name.localeCompare(b.name);
     });
 
     chatCache = { at: Date.now(), chats };
     try {
-      await Deno.writeTextFile(chatCachePath, JSON.stringify(chatCache));
-    } catch { /* ignore */ }
+      await atomicWriteJson(chatCachePath, chatCache);
+    } catch (error) {
+      console.error("[chat-list-cache]", error);
+    }
 
     ok(id, { chats, count: chats.length, cached: false });
-    emitEvent("progress", { scope: "chats", state: chats.length ? "ready" : "empty" });
+    emitEvent("progress", {
+      scope: "chats",
+      state: chats.length ? "ready" : "empty",
+    });
 
     // Background fills — CDN avatars + last-message previews (throttled)
     hydrateAvatars(chats);
@@ -3566,16 +3566,17 @@ async function doFetchMessages(
           emitEvent("progress", { scope: "messages", chatMid, state: "empty" });
           return;
         }
-        const messages = await client!.base.talk.getPreviousMessagesV2WithRequest({
-          request: {
-            messageBoxId: chatMid,
-            endMessageId: {
-              messageId: cursor.messageId,
-              deliveredTime: cursor.deliveredTime,
+        const messages = await client!.base.talk
+          .getPreviousMessagesV2WithRequest({
+            request: {
+              messageBoxId: chatMid,
+              endMessageId: {
+                messageId: cursor.messageId,
+                deliveredTime: cursor.deliveredTime,
+              },
+              messagesCount: limit,
             },
-            messagesCount: limit,
-          },
-        });
+          });
         out = [];
         for (const raw of messages) {
           try {
@@ -3625,7 +3626,10 @@ async function doFetchMessages(
 }
 
 function sentMessagePayload(
-  sent: { id?: unknown; createdTime?: unknown; contentType?: unknown } | null | undefined,
+  sent:
+    | { id?: unknown; createdTime?: unknown; contentType?: unknown }
+    | null
+    | undefined,
   chatMid: string,
   text: string,
 ): Json {
@@ -3648,7 +3652,11 @@ function sentMessagePayload(
   };
 }
 
-async function doSend(id: number | string | null, chatMid: string, text: string) {
+async function doSend(
+  id: number | string | null,
+  chatMid: string,
+  text: string,
+) {
   if (!client) {
     fail(id, "not_logged_in");
     return;
@@ -3658,7 +3666,9 @@ async function doSend(id: number | string | null, chatMid: string, text: string)
     return;
   }
 
-  let sent: { id?: unknown; createdTime?: unknown; contentType?: unknown } | null = null;
+  let sent:
+    | { id?: unknown; createdTime?: unknown; contentType?: unknown }
+    | null = null;
 
   // Prefer plain first (avoids e2ee contentMetadata crashes on some peers), then e2ee.
   try {
@@ -3666,25 +3676,29 @@ async function doSend(id: number | string | null, chatMid: string, text: string)
       to: chatMid,
       text,
       e2ee: false,
-    }) as typeof sent;
+    }) as unknown as typeof sent;
   } catch (e1) {
     try {
       sent = await client.base.talk.sendMessage({
         to: chatMid,
         text,
         e2ee: true,
-      }) as typeof sent;
+      }) as unknown as typeof sent;
     } catch (e2) {
       try {
         const chat = await client.getChat(chatMid);
         const m = await chat.sendMessage(text);
-        const message = await summarizeTalkMessage(m, { withMedia: false }).catch(() =>
-          sentMessagePayload(
-            { id: (m as { raw?: { id?: unknown } }).raw?.id, createdTime: Date.now() },
-            chatMid,
-            text,
-          )
-        );
+        const message = await summarizeTalkMessage(m, { withMedia: false })
+          .catch(() =>
+            sentMessagePayload(
+              {
+                id: (m as { raw?: { id?: unknown } }).raw?.id,
+                createdTime: Date.now(),
+              },
+              chatMid,
+              text,
+            )
+          );
         msgCache.delete(chatMid);
         chatCache = null;
         touchChatPreviewFromMessage(message);
@@ -3830,8 +3844,9 @@ async function doSendSticker(
     STKVER: stkVer,
   };
 
-  let sent: { id?: unknown; createdTime?: unknown; contentType?: unknown } | null =
-    null;
+  let sent:
+    | { id?: unknown; createdTime?: unknown; contentType?: unknown }
+    | null = null;
   try {
     // Stickers are sent as contentType+metadata (not E2EE text chunks).
     sent = await client.base.talk.sendMessage({
@@ -3839,14 +3854,14 @@ async function doSendSticker(
       contentType: "STICKER",
       contentMetadata: meta,
       e2ee: false,
-    }) as typeof sent;
+    }) as unknown as typeof sent;
   } catch (e1) {
     try {
       sent = await client.base.talk.sendMessage({
         to: chatMid,
         contentType: "STICKER",
         contentMetadata: meta,
-      }) as typeof sent;
+      }) as unknown as typeof sent;
     } catch (e2) {
       const raw = e2 instanceof Error
         ? e2.message
@@ -3906,7 +3921,10 @@ function guessMime(name: string, oType: MediaOType): string {
 
 function normalizeMediaOType(raw: string, fileName: string): MediaOType {
   const t = raw.trim().toLowerCase();
-  if (t === "image" || t === "gif" || t === "video" || t === "audio" || t === "file") {
+  if (
+    t === "image" || t === "gif" || t === "video" || t === "audio" ||
+    t === "file"
+  ) {
     if (t === "image" && fileName.toLowerCase().endsWith(".gif")) return "gif";
     return t;
   }
@@ -3965,7 +3983,10 @@ im.save(dest, "JPEG", quality=80, optimize=True)
   }
 }
 
-async function extractVideoThumb(filePath: string, messageId: string): Promise<string | null> {
+async function extractVideoThumb(
+  filePath: string,
+  messageId: string,
+): Promise<string | null> {
   const dest = thumbDest(messageId);
   try {
     const p = new Deno.Command("ffmpeg", {
@@ -4015,7 +4036,13 @@ async function cacheOutgoingMedia(
   messageId: string,
   filePath: string,
   oType: MediaOType,
-): Promise<{ imagePath: string | null; audioPath: string | null; filePath: string | null }> {
+): Promise<
+  {
+    imagePath: string | null;
+    audioPath: string | null;
+    filePath: string | null;
+  }
+> {
   try {
     const data = await Deno.readFile(filePath);
     if (oType === "audio") {
@@ -4091,7 +4118,7 @@ async function sendE2EEMedia(opts: {
   const params: Record<string, string> = { type: "file" };
   if (oType === "gif") params.cat = "original";
 
-  const e2ee = client.base.e2ee as {
+  const e2ee = client.base.e2ee as unknown as {
     encryptByKeyMaterial: (
       data: Buffer,
       key?: Buffer,
@@ -4102,7 +4129,7 @@ async function sendE2EEMedia(opts: {
       contentType: number,
     ) => Promise<string[] | Buffer[]>;
   };
-  const obs = client.base.obs as {
+  const obs = client.base.obs as unknown as {
     uploadObjectForService: (options: Record<string, unknown>) => Promise<{
       objId: string;
       objHash: string;
@@ -4218,14 +4245,24 @@ async function doSendMedia(
     const data = await Deno.readFile(filePath);
     if (data.length < 32) {
       fail(id, "file_too_small");
-      emitEvent("upload_progress", { chatMid, progress: 0, label: "", done: true });
+      emitEvent("upload_progress", {
+        chatMid,
+        progress: 0,
+        label: "",
+        done: true,
+      });
       return;
     }
     const name = filePath.split("/").pop() || "file.bin";
     const oType = normalizeMediaOType(oTypeRaw ?? "auto", name);
     if (oType === "audio" && data.length < 1024) {
       fail(id, "audio_file_too_small");
-      emitEvent("upload_progress", { chatMid, progress: 0, label: "", done: true });
+      emitEvent("upload_progress", {
+        chatMid,
+        progress: 0,
+        label: "",
+        done: true,
+      });
       return;
     }
     const mime = guessMime(name, oType);
@@ -4242,11 +4279,15 @@ async function doSendMedia(
     } else if (oType === "video") {
       const thumbPath = await extractVideoThumb(filePath, `out-${Date.now()}`);
       if (thumbPath) {
-        preview = new Blob([await Deno.readFile(thumbPath)], { type: "image/jpeg" });
+        preview = new Blob([await Deno.readFile(thumbPath)], {
+          type: "image/jpeg",
+        });
       }
     }
 
-    let sent: { id?: unknown; createdTime?: unknown; contentType?: unknown } | null = null;
+    let sent:
+      | { id?: unknown; createdTime?: unknown; contentType?: unknown }
+      | null = null;
     let lastErr: unknown = null;
 
     if (supportsE2EEMedia(chatMid)) {
@@ -4279,10 +4320,17 @@ async function doSendMedia(
         }
       }
       if (!sent) {
-        emitEvent("upload_progress", { chatMid, progress: 0, label: "", done: true });
+        emitEvent("upload_progress", {
+          chatMid,
+          progress: 0,
+          label: "",
+          done: true,
+        });
         fail(
           id,
-          lastErr instanceof Error ? lastErr.message : String(lastErr ?? "e2ee_media_failed"),
+          lastErr instanceof Error
+            ? lastErr.message
+            : String(lastErr ?? "e2ee_media_failed"),
         );
         return;
       }
@@ -4300,19 +4348,22 @@ async function doSendMedia(
         report(0.85, "Finishing…");
         let realId: string | null = null;
         try {
-          const recent = await client.base.talk.getPreviousMessagesV2WithRequest({
-            request: {
-              messageBoxId: chatMid,
-              endMessageId: boxCursor.get(chatMid)
-                ? {
-                  messageId: boxCursor.get(chatMid)!.messageId,
-                  deliveredTime: boxCursor.get(chatMid)!.deliveredTime,
-                }
-                : undefined,
-              messagesCount: 20,
-            },
-          }).catch(() => [] as unknown[]);
-          const mine = (recent as Array<{ id?: unknown; from?: string; contentType?: unknown }>)
+          const recent = await client.base.talk
+            .getPreviousMessagesV2WithRequest({
+              request: {
+                messageBoxId: chatMid,
+                endMessageId: boxCursor.get(chatMid)
+                  ? {
+                    messageId: boxCursor.get(chatMid)!.messageId,
+                    deliveredTime: boxCursor.get(chatMid)!.deliveredTime,
+                  }
+                  : undefined,
+                messagesCount: 20,
+              },
+            }).catch(() => [] as unknown[]);
+          const mine = (recent as Array<
+            { id?: unknown; from?: string; contentType?: unknown }
+          >)
             .filter((m) => isMineFrom(m.from))
             .reverse();
           const wantCt = mediaContentType(oType);
@@ -4325,7 +4376,12 @@ async function doSendMedia(
           contentType: mediaContentType(oType),
         };
       } catch (e3) {
-        emitEvent("upload_progress", { chatMid, progress: 0, label: "", done: true });
+        emitEvent("upload_progress", {
+          chatMid,
+          progress: 0,
+          label: "",
+          done: true,
+        });
         fail(
           id,
           e3 instanceof Error ? e3.message : String(e3),
@@ -4349,7 +4405,8 @@ async function doSendMedia(
       fileName: name,
       filePath: cached.filePath || filePath,
       durationMs: dur ?? null,
-      needsMedia: !cached.imagePath && (oType === "image" || oType === "gif" || oType === "video"),
+      needsMedia: !cached.imagePath &&
+        (oType === "image" || oType === "gif" || oType === "video"),
     };
     touchChatPreviewFromMessage(message);
     emitEvent("upload_progress", {
@@ -4360,7 +4417,12 @@ async function doSendMedia(
     });
     ok(id, { message });
   } catch (e) {
-    emitEvent("upload_progress", { chatMid, progress: 0, label: "", done: true });
+    emitEvent("upload_progress", {
+      chatMid,
+      progress: 0,
+      label: "",
+      done: true,
+    });
     fail(id, e instanceof Error ? e.message : String(e));
   }
 }
@@ -4394,13 +4456,18 @@ function sniffMediaExt(
     buf[7] === 0x70
   ) {
     const brand = new TextDecoder().decode(buf.slice(8, 12));
-    if (hintCt === "AUDIO" || brand.startsWith("M4A") || brand.includes("mp4a")) {
+    if (
+      hintCt === "AUDIO" || brand.startsWith("M4A") || brand.includes("mp4a")
+    ) {
       return "m4a";
     }
     return "mp4";
   }
   if (fileName && fileName.includes(".")) {
-    const ext = fileName.split(".").pop()!.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const ext = fileName.split(".").pop()!.toLowerCase().replace(
+      /[^a-z0-9]/g,
+      "",
+    );
     if (ext) return ext.slice(0, 8);
   }
   if (hintCt === "AUDIO") return "m4a";
@@ -4467,7 +4534,10 @@ async function doDownloadMedia(
       if (hit.includes(".thumb.")) continue;
       try {
         const st = await Deno.stat(hit);
-        if (hintCt === "VIDEO" && /\.(jpe?g|png|webp)$/i.test(hit) && st.size < 200_000) {
+        if (
+          hintCt === "VIDEO" && /\.(jpe?g|png|webp)$/i.test(hit) &&
+          st.size < 200_000
+        ) {
           continue;
         }
         if (hintCt === "IMAGE") {
@@ -4555,7 +4625,11 @@ async function handle(req: Json) {
         );
         break;
       case "send_message":
-        await doSend(id, String(params.chatMid ?? ""), String(params.text ?? ""));
+        await doSend(
+          id,
+          String(params.chatMid ?? ""),
+          String(params.text ?? ""),
+        );
         break;
       case "send_audio":
         await doSendAudio(
@@ -4603,7 +4677,9 @@ async function handle(req: Json) {
       case "call_start":
         setCallAudioDevices(
           typeof params.audioInput === "string" ? params.audioInput : undefined,
-          typeof params.audioOutput === "string" ? params.audioOutput : undefined,
+          typeof params.audioOutput === "string"
+            ? params.audioOutput
+            : undefined,
         );
         setCallGains(params.micGain, params.spkGain);
         await doCallStart(id, String(params.mid ?? params.chatMid ?? ""));
@@ -4611,7 +4687,9 @@ async function handle(req: Json) {
       case "call_answer":
         setCallAudioDevices(
           typeof params.audioInput === "string" ? params.audioInput : undefined,
-          typeof params.audioOutput === "string" ? params.audioOutput : undefined,
+          typeof params.audioOutput === "string"
+            ? params.audioOutput
+            : undefined,
         );
         setCallGains(params.micGain, params.spkGain);
         await doCallAnswer(id);
@@ -4628,10 +4706,16 @@ async function handle(req: Json) {
           callAudioCtl.deafened = !!params.deafened;
         }
         if (params.micGain !== undefined) {
-          callAudioCtl.micGain = clampGain(params.micGain, callAudioCtl.micGain);
+          callAudioCtl.micGain = clampGain(
+            params.micGain,
+            callAudioCtl.micGain,
+          );
         }
         if (params.spkGain !== undefined) {
-          callAudioCtl.spkGain = clampGain(params.spkGain, callAudioCtl.spkGain);
+          callAudioCtl.spkGain = clampGain(
+            params.spkGain,
+            callAudioCtl.spkGain,
+          );
         }
         ok(id, {
           muted: callAudioCtl.muted,
@@ -4725,16 +4809,30 @@ async function handle(req: Json) {
         }
         const userid = String(params.userid ?? "").replace(/^@/, "");
         try {
-          const contact = await client.base.talk.findContactByUserid({
-            userid,
-          });
+          const findByUserId = client.base.talk
+            .findContactByUserid as unknown as (
+              args: { userid: string },
+            ) => Promise<{
+              mid?: string;
+              displayName?: string;
+              picturePath?: string;
+            }>;
+          const contact = await findByUserId({ userid });
           const mid = contact?.mid;
           if (!mid) {
             fail(id, "user_not_found");
             break;
           }
           try {
-            await client.base.talk.tryFriendRequest({
+            const requestFriend = client.base.talk
+              .tryFriendRequest as unknown as (
+                args: {
+                  mid: string;
+                  method: string;
+                  friendRequestParams: string;
+                },
+              ) => Promise<unknown>;
+            await requestFriend({
               mid,
               method: "USERID",
               friendRequestParams: userid,
@@ -4843,10 +4941,9 @@ if (needsAndroidRelogin) {
 } else if (bootAuth) {
   try {
     const storage = new FileStorage(storagePath);
-    const device =
-      bootDevice === "ANDROID" || bootDevice === "ANDROIDSECONDARY"
-        ? bootDevice
-        : "ANDROIDSECONDARY";
+    const device = bootDevice === "ANDROID" || bootDevice === "ANDROIDSECONDARY"
+      ? bootDevice
+      : "ANDROIDSECONDARY";
     client = await loginWithAuthToken(bootAuth, {
       device,
       version: LINE_VERSION,

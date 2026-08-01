@@ -27,8 +27,7 @@ pub struct FriendsDeps {
     pub request_list: Rc<dyn Fn()>,
 }
 
-const THAI_CONSONANTS: &str =
-    "กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรลวศษสหฬอฮ";
+const THAI_CONSONANTS: &str = "กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรลวศษสหฬอฮ";
 
 pub fn open_friends(parent: &impl IsA<gtk::Window>, deps: FriendsDeps) -> FriendsUi {
     let window = gtk::Window::builder()
@@ -200,10 +199,7 @@ pub fn open_friends(parent: &impl IsA<gtk::Window>, deps: FriendsDeps) -> Friend
             if idx < 0 {
                 return;
             }
-            let mid = row_mids2
-                .borrow()
-                .get(idx as usize)
-                .and_then(|m| m.clone());
+            let mid = row_mids2.borrow().get(idx as usize).and_then(|m| m.clone());
             let Some(mid) = mid else { return };
             if let Some(friend) = friends2.borrow().iter().find(|f| f.mid == mid).cloned() {
                 on_open(friend);
@@ -228,12 +224,14 @@ pub fn open_friends(parent: &impl IsA<gtk::Window>, deps: FriendsDeps) -> Friend
 
 pub fn apply_friends(ui: &FriendsUi, mut friends: Vec<ChatInfo>) {
     friends.sort_by(|a, b| {
-        friend_sort_key(&a.name).cmp(&friend_sort_key(&b.name)).then_with(|| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.mid.cmp(&b.mid))
-        })
+        friend_sort_key(&a.name)
+            .cmp(&friend_sort_key(&b.name))
+            .then_with(|| {
+                a.name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.mid.cmp(&b.mid))
+            })
     });
     *ui.friends.borrow_mut() = friends.clone();
     ui.avatars.borrow_mut().clear();
@@ -310,9 +308,7 @@ fn append_friend_row(ui: &FriendsUi, friend: &ChatInfo) {
         }
     }
     avatar_frame.append(&avatar);
-    ui.avatars
-        .borrow_mut()
-        .insert(friend.mid.clone(), avatar);
+    ui.avatars.borrow_mut().insert(friend.mid.clone(), avatar);
 
     let text = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -499,7 +495,7 @@ fn is_decorative(ch: char) -> bool {
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{200D}'
             | '\u{20E3}'
-            | '★' | '☆' | '•' | '·' | '|' | '~' | '-' | '_' | '.'
+            | '•' | '·' | '|' | '~' | '-' | '_' | '.'
     ) || ch.is_ascii_punctuation()
 }
 

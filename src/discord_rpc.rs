@@ -3,7 +3,7 @@
 //! Runs on a background thread so the GTK UI never blocks on Discord sockets.
 //! Reconnects automatically when Discord restarts.
 
-use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
+use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -281,7 +281,5 @@ fn apply_presence(client: &mut DiscordIpcClient, presence: &Presence) -> Result<
         act = act.assets(assets);
     }
 
-    client
-        .set_activity(act)
-        .map_err(|e| e.to_string())
+    client.set_activity(act).map_err(|e| e.to_string())
 }

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GTK development libraries
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --all-targets --all-features
+      - run: cargo build --locked --release
+
+  protocol:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: protocol
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno task check
+      - name: Compile offline sidecar
+        working-directory: .
+        run: ./scripts/build-sidecar.sh
+      - name: Verify compiled sidecar starts without network access
+        working-directory: .
+        run: |
+          data_dir="$RUNNER_TEMP/line-gtk-offline"
+          mkdir -p "$data_dir"
+          timeout 3 env LINE_GTK_DATA="$data_dir" protocol/line-gtk-protocol > "$RUNNER_TEMP/sidecar.out" || test $? = 124
+          grep -q '"event":"ready"' "$RUNNER_TEMP/sidecar.out"
+
+  package:
+    runs-on: ubuntu-24.04
+    needs: [rust, protocol]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: Swatinem/rust-cache@v2
+      - name: Install runtime and build libraries
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev ffmpeg
+      - run: ./packaging/make-prebuild.sh

@@ -1,7 +1,17 @@
 {
   "tasks": {
-    "sidecar": "deno run -A src/main.ts",
-    "dev": "deno run -A --watch src/main.ts"
+    "sidecar": "deno run --no-prompt --allow-read --allow-write --allow-net --allow-run=python3,ffmpeg,ffprobe --allow-sys --allow-env src/main.ts",
+    "dev": "deno run --no-prompt --watch --allow-read --allow-write --allow-net --allow-run=python3,ffmpeg,ffprobe --allow-sys --allow-env src/main.ts",
+    "check": "deno fmt --check && deno lint && deno check src/main.ts && deno test --allow-read --allow-write tests/"
+  },
+  "lint": {
+    "exclude": ["vendor/"],
+    "rules": {
+      "exclude": ["no-import-prefix"]
+    }
+  },
+  "fmt": {
+    "exclude": ["vendor/"]
   },
   "imports": {
     "@evex/linejs": "jsr:@evex/linejs@^3.2.1",

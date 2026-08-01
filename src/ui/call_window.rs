@@ -1,7 +1,7 @@
-use gtk::prelude::*;
 use gtk::glib;
-use libadwaita::prelude::*;
+use gtk::prelude::*;
 use libadwaita::ApplicationWindow;
+use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
@@ -303,13 +303,11 @@ pub fn update_deafen_visual(ui: &CallUi, deafened: bool) {
         ui.deafen_btn.set_active(deafened);
     }
     if deafened {
-        ui.deafen_btn
-            .set_icon_name("audio-volume-muted-symbolic");
+        ui.deafen_btn.set_icon_name("audio-volume-muted-symbolic");
         ui.deafen_btn
             .set_tooltip_text(Some(&crate::i18n::t("call_undeafen")));
     } else {
-        ui.deafen_btn
-            .set_icon_name("audio-volume-high-symbolic");
+        ui.deafen_btn.set_icon_name("audio-volume-high-symbolic");
         ui.deafen_btn
             .set_tooltip_text(Some(&crate::i18n::t("call_deafen")));
     }

@@ -1,15 +1,16 @@
 use gtk::CssProvider;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    pub theme: String,   // system | dark | light
+    pub theme: String,    // system | dark | light
     pub language: String, // en | th
-    pub font_scale: f64, // UI scale 0.60 .. 1.40 (1.0 = 100%)
+    pub font_scale: f64,  // UI scale 0.60 .. 1.40 (1.0 = 100%)
     /// Any installed font family name, e.g. "Noto Sans Thai", "Inter", "Sarasa Gothic"
     pub font_family: String,
     /// UI motion: page crossfades, message enter, hover easing. Off = instant.
@@ -106,18 +107,69 @@ impl AppConfig {
     pub fn load(data_dir: &std::path::Path) -> Self {
         let path = Self::path(data_dir);
         let mut cfg = match fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|error| {
+                tracing::error!(?path, %error, "invalid settings; using defaults");
+                Self::default()
+            }),
             Err(_) => Self::default(),
         };
-        cfg.font_scale = cfg.font_scale.clamp(0.60, 1.40);
+        cfg.normalize();
         cfg
     }
 
     pub fn save(&self, data_dir: &std::path::Path) {
-        let path = Self::path(data_dir);
-        if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, s);
+        if let Err(error) = self.save_atomic(data_dir) {
+            tracing::error!(?data_dir, %error, "failed to save settings");
         }
+    }
+
+    fn save_atomic(&self, data_dir: &Path) -> std::io::Result<()> {
+        ensure_private_dir(data_dir)?;
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let contents = serde_json::to_vec_pretty(&normalized)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let path = Self::path(data_dir);
+        let temporary = data_dir.join(".settings.json.tmp");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        if !matches!(self.theme.as_str(), "system" | "dark" | "light") {
+            self.theme = "system".into();
+        }
+        if !matches!(self.language.as_str(), "en" | "th") {
+            self.language = "en".into();
+        }
+        if !matches!(
+            self.cache_retention.as_str(),
+            "smart" | "day" | "week" | "month" | "forever"
+        ) {
+            self.cache_retention = "smart".into();
+        }
+        self.font_scale = finite_or(self.font_scale, 1.0).clamp(0.60, 1.40);
+        self.notification_sound_volume =
+            finite_or(self.notification_sound_volume, 1.0).clamp(0.0, 2.0);
+        self.call_mic_volume = finite_or(self.call_mic_volume, 1.0).clamp(0.0, 2.5);
+        self.call_spk_volume = finite_or(self.call_spk_volume, 1.0).clamp(0.0, 2.5);
+        self.sidebar_width = self.sidebar_width.clamp(80, 520);
+        self.notifications_muted_until = self.notifications_muted_until.max(0);
     }
 
     /// Discord Application ID from settings, env, or the built-in default.
@@ -185,6 +237,80 @@ impl AppConfig {
     }
 }
 
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+
+pub fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_rejects_invalid_values() {
+        let mut cfg = AppConfig {
+            theme: "purple".into(),
+            language: "xx".into(),
+            cache_retention: "century".into(),
+            font_scale: f64::NAN,
+            notification_sound_volume: 99.0,
+            call_mic_volume: -2.0,
+            sidebar_width: 9_999,
+            notifications_muted_until: -1,
+            ..AppConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.theme, "system");
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.cache_retention, "smart");
+        assert_eq!(cfg.font_scale, 1.0);
+        assert_eq!(cfg.notification_sound_volume, 2.0);
+        assert_eq!(cfg.call_mic_volume, 0.0);
+        assert_eq!(cfg.sidebar_width, 520);
+        assert_eq!(cfg.notifications_muted_until, 0);
+    }
+
+    #[test]
+    fn save_is_atomic_and_private() {
+        let dir = std::env::temp_dir().join(format!(
+            "line-gtk-config-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let cfg = AppConfig::default();
+        cfg.save_atomic(&dir).expect("save settings");
+        assert_eq!(AppConfig::load(&dir).language, cfg.language);
+        assert!(!dir.join(".settings.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(AppConfig::path(&dir))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+}
+
 pub fn apply_theme(theme: &str) {
     let mgr = libadwaita::StyleManager::default();
     let scheme = match theme {
@@ -200,9 +326,7 @@ pub fn apply_font(family: &str, scale: f64) {
     let family = family.trim();
     let size = 11.0 * scale;
     let css = if family.is_empty() {
-        format!(
-            ".line-shell, .line-shell label, .line-shell entry {{ font-size: {size}pt; }}"
-        )
+        format!(".line-shell, .line-shell label, .line-shell entry {{ font-size: {size}pt; }}")
     } else {
         let escaped = family.replace('\\', "\\\\").replace('"', "\\\"");
         format!(
@@ -223,7 +347,7 @@ pub fn apply_font(family: &str, scale: f64) {
             *slot = Some(provider);
         }
         let provider = slot.as_ref().expect("font provider");
-        provider.load_from_data(&css);
+        provider.load_from_string(&css);
     });
 }
 
@@ -302,9 +426,9 @@ pub fn apply_animations(enabled: bool) {
         }
         let provider = slot.as_ref().expect("motion provider");
         if enabled {
-            provider.load_from_data(MOTION_CSS);
+            provider.load_from_string(MOTION_CSS);
         } else {
-            provider.load_from_data("/* animations disabled */");
+            provider.load_from_string("/* animations disabled */");
         }
     });
 }

@@ -6,8 +6,8 @@ pkgdesc='Unofficial native LINE client for Linux (GTK4 / Libadwaita)'
 arch=('x86_64')
 url='https://github.com/MidnightTale/Line-GTK'
 license=('GPL-3.0-or-later')
-depends=('gtk4' 'libadwaita' 'ffmpeg' 'deno' 'hicolor-icon-theme')
-makedepends=('cargo' 'git')
+depends=('gtk4' 'libadwaita' 'ffmpeg' 'hicolor-icon-theme')
+makedepends=('cargo' 'deno' 'git')
 optdepends=(
   'poppler: PDF preview in media viewer'
   'gst-plugins-good: extra video playback codecs'
@@ -29,6 +29,7 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
+  ./scripts/build-sidecar.sh
 }
 
 package() {

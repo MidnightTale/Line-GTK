@@ -25,7 +25,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 | --- | --- |
 | Rust | stable toolchain |
 | GTK4 + Libadwaita | e.g. `pacman -S gtk4 libadwaita` |
-| Deno | `~/.deno/bin/deno` or set `DENO` |
+| Deno | Build-time protocol compiler; source-tree runs use `deno` or `DENO` |
 | ffmpeg / ffprobe | voice record, video thumbs |
 | Optional | `pdftoppm`, `pdftotext` for PDF preview |
 
@@ -54,6 +54,22 @@ cd Line-GTK
 cargo build --release
 ./target/release/line-gtk
 ```
+
+Packaged releases include a compiled protocol runtime and do not download Deno
+dependencies on first launch. Source-tree runs use the lockfile-pinned Deno
+dependencies.
+
+## Development checks
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
+cargo test --all-targets --all-features
+deno task --config protocol/deno.json check
+```
+
+The Settings → Account page includes Diagnostics for protocol health, dependency
+versions, media codecs, data paths, and the application log.
 
 ---
 

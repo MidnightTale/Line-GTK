@@ -3,7 +3,7 @@ use gtk::prelude::*;
 pub struct ShellWidgets {
     pub page: gtk::Box,
     pub chat_list: gtk::ListBox,
-    pub message_list: gtk::ListBox,
+    pub message_list: super::virtual_list::VirtualMessageList,
     pub message_scroll: gtk::ScrolledWindow,
     pub composer: gtk::Entry,
     pub composer_row: gtk::Box,
@@ -153,7 +153,7 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["line-side-header"])
         .build();
     let side_title = gtk::Label::builder()
-        .label("Chats")
+        .label(crate::i18n::t("chats"))
         .xalign(0.0)
         .hexpand(true)
         .css_classes(["title-3", "line-side-title"])
@@ -228,14 +228,14 @@ pub fn build_shell_page() -> ShellWidgets {
     let side_load_spin = gtk::Spinner::builder().spinning(true).build();
     side_load_spin.set_size_request(28, 28);
     let side_load_label = gtk::Label::builder()
-        .label("Loading chats…")
+        .label(crate::i18n::t("loading_chats"))
         .css_classes(["dim-label"])
         .build();
     side_loading.append(&side_load_spin);
     side_loading.append(&side_load_label);
 
     let side_empty = gtk::Label::builder()
-        .label("No chats yet")
+        .label(crate::i18n::t("no_chats"))
         .css_classes(["dim-label", "title-4"])
         .justify(gtk::Justification::Center)
         .build();
@@ -273,13 +273,13 @@ pub fn build_shell_page() -> ShellWidgets {
         .hexpand(true)
         .build();
     let chat_title = gtk::Label::builder()
-        .label("Select a chat")
+        .label(crate::i18n::t("select_chat"))
         .xalign(0.0)
         .css_classes(["title-3"])
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     let chat_subtitle = gtk::Label::builder()
-        .label("Pick someone from the left")
+        .label(crate::i18n::t("pick_chat"))
         .xalign(0.0)
         .css_classes(["dim-label", "caption"])
         .build();
@@ -315,16 +315,8 @@ pub fn build_shell_page() -> ShellWidgets {
         .hexpand(true)
         .css_classes(["line-msg-scroll"])
         .build();
-    let message_list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["line-msg-list"])
-        .valign(gtk::Align::End)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-    message_scroll.set_child(Some(&message_list));
+    let message_list = super::virtual_list::VirtualMessageList::new();
+    message_scroll.set_child(Some(message_list.widget()));
 
     let msg_loading = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -335,20 +327,20 @@ pub fn build_shell_page() -> ShellWidgets {
     let msg_spinner = gtk::Spinner::builder().spinning(true).build();
     msg_spinner.set_size_request(32, 32);
     let msg_load_label = gtk::Label::builder()
-        .label("Loading messages…")
+        .label(crate::i18n::t("loading_messages"))
         .css_classes(["dim-label"])
         .build();
     msg_loading.append(&msg_spinner);
     msg_loading.append(&msg_load_label);
 
     let msg_empty = gtk::Label::builder()
-        .label("No messages in this chat")
+        .label(crate::i18n::t("no_messages"))
         .css_classes(["dim-label", "title-4"])
         .justify(gtk::Justification::Center)
         .build();
 
     let msg_idle = gtk::Label::builder()
-        .label("Select a chat to start")
+        .label(crate::i18n::t("select_chat_start"))
         .css_classes(["dim-label", "title-4"])
         .justify(gtk::Justification::Center)
         .build();
@@ -377,7 +369,7 @@ pub fn build_shell_page() -> ShellWidgets {
         .halign(gtk::Align::Center)
         .build();
     let jump_banner_label = gtk::Label::builder()
-        .label("New messages")
+        .label(crate::i18n::t("new_messages_badge"))
         .css_classes(["caption"])
         .build();
     let jump_icon = gtk::Image::from_icon_name("go-down-symbolic");
@@ -417,7 +409,7 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["flat", "circular", "line-composer-icon"])
         .build();
     let send_btn = gtk::Button::builder()
-        .label("Send")
+        .label(crate::i18n::t("send"))
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action", "pill", "line-send-btn"])
         .build();
@@ -438,7 +430,12 @@ pub fn build_shell_page() -> ShellWidgets {
         .icon_name("user-trash-symbolic")
         .tooltip_text("Cancel recording")
         .valign(gtk::Align::Center)
-        .css_classes(["flat", "circular", "destructive-action", "line-record-cancel"])
+        .css_classes([
+            "flat",
+            "circular",
+            "destructive-action",
+            "line-record-cancel",
+        ])
         .build();
     let record_dot = gtk::Label::builder()
         .label("●")
@@ -604,7 +601,7 @@ pub fn build_shell_page() -> ShellWidgets {
 
 pub fn load_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(
+    provider.load_from_string(
         r#"
         .line-shell {
             background: @window_bg_color;
