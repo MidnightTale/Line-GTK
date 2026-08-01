@@ -48,53 +48,6 @@ cargo build --release
 ./target/release/line-gtk
 ```
 
-Or:
-
-```bash
-cargo run --release
-```
-
-On first launch, scan the QR code in the official LINE app as an **additional device**.
-
-Data directory:
-
-```text
-~/.local/share/line-gtk/
-```
-
-Settings file:
-
-```text
-~/.local/share/line-gtk/settings.json
-```
-
----
-
-## Desktop launcher
-
-A desktop entry is installed on startup under `~/.local/share/applications/` (app id `dev.linegtk.LineGtk`). You can also use:
-
-```bash
-cp assets/dev.linegtk.LineGtk.desktop ~/.local/share/applications/
-update-desktop-database ~/.local/share/applications/
-```
-
-Set `LINE_GTK_ROOT` to the repo path if you run the binary outside the project tree.
-
----
-
-## Protocol updates
-
-```bash
-./scripts/update-protocol.sh
-```
-
-The GTK UI talks to `protocol/src/main.ts` over NDJSON. Protocol changes are Deno / linejs bumps, not Wine.
-
-```text
-line-gtk (GTK4)  -- ndjson -->  protocol (linejs)
-```
-
 ---
 
 ## Warning
