@@ -17,31 +17,39 @@ pub fn notification_id(message_id: &str) -> u32 {
 /// - `avatar_path`: small icon (sender / chat avatar)
 /// - `image_path`: large image-path hint (photo / sticker / video thumb)
 /// - Clicking the body sends [`TrayAction::OpenChat`].
+pub struct ChatNotification<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub avatar_path: Option<&'a str>,
+    pub image_path: Option<&'a str>,
+    pub chat_mid: &'a str,
+    pub message_id: &'a str,
+    pub suppress_sound: bool,
+}
+
 pub fn show_chat_notification(
-    title: &str,
-    body: &str,
-    avatar_path: Option<&str>,
-    image_path: Option<&str>,
-    chat_mid: &str,
-    message_id: &str,
+    request: &ChatNotification<'_>,
     tx: async_channel::Sender<TrayAction>,
-    suppress_sound: bool,
 ) -> Result<(), String> {
-    let avatar = avatar_path.filter(|p| !p.is_empty() && Path::new(p).exists());
-    let image = image_path.filter(|p| !p.is_empty() && Path::new(p).exists());
+    let avatar = request
+        .avatar_path
+        .filter(|p| !p.is_empty() && Path::new(p).exists());
+    let image = request
+        .image_path
+        .filter(|p| !p.is_empty() && Path::new(p).exists());
 
     let mut n = Notification::new();
-    n.summary(title)
-        .body(body)
+    n.summary(request.title)
+        .body(request.body)
         .appname("LINE GTK")
-        .id(notification_id(message_id))
+        .id(notification_id(request.message_id))
         .timeout(Timeout::Milliseconds(12_000))
         .hint(Hint::DesktopEntry("dev.linegtk.LineGtk".into()))
         .hint(Hint::Category("im.received".into()))
         .hint(Hint::Transient(false))
         .action("default", "Open");
 
-    if suppress_sound {
+    if request.suppress_sound {
         n.hint(Hint::SuppressSound(true));
     }
 
@@ -56,7 +64,7 @@ pub fn show_chat_notification(
     }
 
     let handle = n.show().map_err(|e| e.to_string())?;
-    let mid = chat_mid.to_string();
+    let mid = request.chat_mid.to_string();
     std::thread::Builder::new()
         .name("line-gtk-notify-action".into())
         .spawn(move || {

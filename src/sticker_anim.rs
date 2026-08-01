@@ -197,11 +197,7 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     let mut canvas = vec![0u8; full_w * full_h * 4];
     let mut frames: Vec<RawFrame> = Vec::new();
 
-    loop {
-        let buf_size = match reader.output_buffer_size() {
-            Some(s) => s,
-            None => break,
-        };
+    while let Some(buf_size) = reader.output_buffer_size() {
         let mut buf = vec![0u8; buf_size];
         let out = match reader.next_frame(&mut buf) {
             Ok(o) => o,

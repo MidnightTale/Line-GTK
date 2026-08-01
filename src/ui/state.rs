@@ -159,7 +159,6 @@ pub(super) enum Pending {
     },
     ListStickers,
     DownloadMedia {
-        chat_mid: String,
         message_id: String,
         action: String,
         content_type: String,

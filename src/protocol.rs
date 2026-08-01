@@ -93,8 +93,6 @@ pub struct MessageInfo {
     pub content_type: String,
     #[serde(rename = "imagePath", default)]
     pub image_path: Option<String>,
-    #[serde(rename = "imageUrl", default)]
-    pub image_url: Option<String>,
     #[serde(rename = "audioPath", default)]
     pub audio_path: Option<String>,
     #[serde(rename = "fileName", default)]
@@ -138,7 +136,6 @@ pub enum ProtocolEvent {
     Messages {
         chat_mid: String,
         messages: Vec<MessageInfo>,
-        cached: bool,
     },
     AvatarReady {
         mid: String,
@@ -149,7 +146,6 @@ pub enum ProtocolEvent {
     },
     ChatUpsert {
         chat: ChatInfo,
-        created: bool,
     },
     ChatPreview {
         mid: String,
@@ -185,7 +181,6 @@ pub enum ProtocolEvent {
     },
     ReadReceipt {
         chat_mid: String,
-        user_mid: String,
         message_id: String,
     },
     CallIncoming {

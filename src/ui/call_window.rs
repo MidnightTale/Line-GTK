@@ -34,7 +34,7 @@ pub fn open_call_window(
 ) -> CallUi {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title(&crate::i18n::t("voice_call"))
+        .title(crate::i18n::t("voice_call"))
         .default_width(380)
         .default_height(560)
         .resizable(false)
@@ -78,7 +78,7 @@ pub fn open_call_window(
         .build();
 
     let status_label = gtk::Label::builder()
-        .label(&crate::i18n::t("call_calling_short"))
+        .label(crate::i18n::t("call_calling_short"))
         .halign(gtk::Align::Center)
         .css_classes(["dim-label", "title-4"])
         .build();

@@ -299,13 +299,12 @@ fn append_friend_row(ui: &FriendsUi, friend: &ChatInfo) {
         .height_request(40)
         .css_classes(["line-avatar", "line-avatar-sm"])
         .build();
-    if let Some(path) = friend.avatar_path.as_deref() {
-        if std::path::Path::new(path).exists() {
-            if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 80, 80, true) {
-                let tex = gtk::gdk::Texture::for_pixbuf(&pixbuf);
-                avatar.set_paintable(Some(&tex));
-            }
-        }
+    if let Some(path) = friend.avatar_path.as_deref()
+        && std::path::Path::new(path).exists()
+        && let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 80, 80, true)
+    {
+        let tex = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+        avatar.set_paintable(Some(&tex));
     }
     avatar_frame.append(&avatar);
     ui.avatars.borrow_mut().insert(friend.mid.clone(), avatar);

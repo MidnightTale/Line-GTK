@@ -3,6 +3,7 @@ mod diagnostics;
 mod downloads;
 mod friends;
 mod login;
+mod notifications;
 mod settings;
 mod shell;
 mod state;
@@ -18,6 +19,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use libadwaita::prelude::*;
 use libadwaita::{Application, ApplicationWindow};
+use notifications::{notify_incoming, refresh_notification_media};
 use state::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -468,7 +470,7 @@ fn refresh_tray_menu(state: &AppState) {
     };
     let muted_until = notifications_muted_until_epoch(state);
     let mut chats = state.chats.borrow().clone();
-    chats.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    chats.sort_by_key(|chat| std::cmp::Reverse(chat.last_activity));
     let recent: Vec<crate::tray::TrayChatItem> = chats
         .into_iter()
         .take(8)
@@ -510,7 +512,7 @@ fn set_global_notif_mute(state: &AppState, secs: u64) {
             &crate::i18n::tf("tray_mute_ok_min", &[("n", &m.to_string())]),
         );
     } else {
-        let h = ((secs + 3599) / 3600).max(1);
+        let h = secs.div_ceil(3600).max(1);
         toast(
             state,
             &crate::i18n::tf("tray_mute_ok_hour", &[("n", &h.to_string())]),
@@ -797,16 +799,16 @@ fn set_avatar_tier(overlay: &gtk::Overlay, compact: bool) {
     } else {
         AVATAR_CHAT_PX
     };
-    if let Some(frame_w) = overlay.child() {
-        if let Ok(frame) = frame_w.downcast::<gtk::Box>() {
-            frame.set_width_request(px);
-            frame.set_height_request(px);
-            if let Some(pic_w) = frame.first_child() {
-                if let Ok(pic) = pic_w.downcast::<gtk::Picture>() {
-                    pic.set_width_request(px);
-                    pic.set_height_request(px);
-                }
-            }
+    if let Some(frame_w) = overlay.child()
+        && let Ok(frame) = frame_w.downcast::<gtk::Box>()
+    {
+        frame.set_width_request(px);
+        frame.set_height_request(px);
+        if let Some(pic_w) = frame.first_child()
+            && let Ok(pic) = pic_w.downcast::<gtk::Picture>()
+        {
+            pic.set_width_request(px);
+            pic.set_height_request(px);
         }
     }
 }
@@ -934,7 +936,6 @@ fn send_current(state: &AppState) {
                     created_time: now_ms(),
                     content_type: "NONE".into(),
                     image_path: None,
-                    image_url: None,
                     audio_path: None,
                     file_name: None,
                     file_path: None,
@@ -1134,21 +1135,21 @@ fn wire_drop_attachments(state: &AppState) {
         if let Ok(list) = value.get::<gdk::FileList>() {
             let mut any = false;
             for file in list.files() {
-                if let Some(path) = file.path() {
-                    if path.is_file() {
-                        send_local_media_path(&s, path);
-                        any = true;
-                    }
+                if let Some(path) = file.path()
+                    && path.is_file()
+                {
+                    send_local_media_path(&s, path);
+                    any = true;
                 }
             }
             return any;
         }
         if let Ok(file) = value.get::<gio::File>() {
-            if let Some(path) = file.path() {
-                if path.is_file() {
-                    send_local_media_path(&s, path);
-                    return true;
-                }
+            if let Some(path) = file.path()
+                && path.is_file()
+            {
+                send_local_media_path(&s, path);
+                return true;
             }
             return false;
         }
@@ -1275,7 +1276,6 @@ fn wire_actions(state: &AppState) {
                             &s2,
                             &crate::i18n::tf("restart_failed_err", &[("error", &e.to_string())]),
                         );
-                        return;
                     }
                     // Fresh sidecar emits Ready → QR login (see ProtocolEvent::Ready).
                 })
@@ -1370,7 +1370,7 @@ fn wire_actions(state: &AppState) {
         finish_voice_record(&s, false);
     });
 
-    wire_record_wave(&state);
+    wire_record_wave(state);
 
     let s = state.clone();
     state.attach_btn.connect_clicked(move |_| {
@@ -1460,10 +1460,8 @@ fn request_friends_list(state: &AppState) {
         .as_ref()
         .map(|ui| ui.friends.borrow().is_empty())
         .unwrap_or(true);
-    if show_loading {
-        if let Some(ui) = state.friends_ui.borrow().as_ref() {
-            friends::set_friends_loading(ui);
-        }
+    if show_loading && let Some(ui) = state.friends_ui.borrow().as_ref() {
+        friends::set_friends_loading(ui);
     }
     match state.sidecar.list_friends() {
         Ok(id) => {
@@ -1647,10 +1645,11 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             sync_discord_rpc(state);
         }
         ProtocolEvent::CallIncoming {
-            call_id: _,
+            call_id,
             from,
-            kind: _,
+            kind,
         } => {
+            tracing::info!(%call_id, %from, %kind, "incoming call");
             if !calls_experimental_enabled(state) {
                 // Locked: ignore ringing UI (still experimental).
                 let _ = state.sidecar.call_decline();
@@ -1665,7 +1664,12 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             );
             notify_call_incoming(state, &name);
         }
-        ProtocolEvent::CallCanceled { from, .. } => {
+        ProtocolEvent::CallCanceled {
+            call_id,
+            from,
+            reason,
+        } => {
+            tracing::info!(%call_id, %from, %reason, "call canceled");
             let name = peer_display_name(state, &from);
             toast(state, &crate::i18n::tf("call_canceled", &[("name", &name)]));
             let was_incoming = state.incoming_call_from.borrow().as_deref() == Some(from.as_str());
@@ -1678,11 +1682,12 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
             }
         }
         ProtocolEvent::CallState {
-            call_id: _,
+            call_id,
             peer,
             state: call_state,
             error,
         } => {
+            tracing::debug!(%call_id, %peer, state = %call_state, ?error, "call state changed");
             handle_call_state(state, &peer, &call_state, error.as_deref());
         }
         ProtocolEvent::Message(msg) => {
@@ -1710,8 +1715,6 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     name: peer_display_name(state, &peer),
                     kind: if peer.starts_with('c') {
                         "group".into()
-                    } else if peer.starts_with('u') {
-                        "dm".into()
                     } else {
                         "dm".into()
                     },
@@ -1772,7 +1775,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 notify_incoming(state, &msg, &peer);
             }
         }
-        ProtocolEvent::ChatUpsert { chat, created: _ } => {
+        ProtocolEvent::ChatUpsert { chat } => {
             let mut chat = chat;
             if !chat.preview.is_empty() {
                 chat.preview = localize_preview(&chat.preview);
@@ -1781,7 +1784,6 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
         }
         ProtocolEvent::ReadReceipt {
             chat_mid,
-            user_mid: _,
             message_id,
         } => {
             apply_peer_read(state, &chat_mid, &message_id);
@@ -1789,11 +1791,7 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
         ProtocolEvent::Chats { chats, cached } => {
             apply_chats(state, chats, cached);
         }
-        ProtocolEvent::Messages {
-            chat_mid,
-            messages,
-            cached: _,
-        } => {
+        ProtocolEvent::Messages { chat_mid, messages } => {
             if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str()) {
                 apply_messages(state, messages);
             }
@@ -1806,16 +1804,16 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 }
                 sync_discord_rpc(state);
             }
-            if let Some(img) = state.chat_avatars.borrow().get(&mid).cloned() {
-                if std::path::Path::new(&avatar_path).exists() {
-                    attach_texture_async(img, avatar_path.clone(), 72);
-                }
+            if let Some(img) = state.chat_avatars.borrow().get(&mid).cloned()
+                && std::path::Path::new(&avatar_path).exists()
+            {
+                attach_texture_async(img, avatar_path.clone(), 72);
             }
             if let Some(ui) = state.friends_ui.borrow().as_ref() {
-                if let Some(img) = ui.avatars.borrow().get(&mid).cloned() {
-                    if std::path::Path::new(&avatar_path).exists() {
-                        attach_texture_async(img, avatar_path.clone(), 80);
-                    }
+                if let Some(img) = ui.avatars.borrow().get(&mid).cloned()
+                    && std::path::Path::new(&avatar_path).exists()
+                {
+                    attach_texture_async(img, avatar_path.clone(), 80);
                 }
                 if let Some(f) = ui.friends.borrow_mut().iter_mut().find(|c| c.mid == mid) {
                     f.avatar_path = Some(avatar_path.clone());
@@ -1916,12 +1914,12 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 return;
             }
             // A later/parallel hydrate may already have the bytes on disk.
-            if let Some(path) = state.media_ready_paths.borrow().get(&message_id).cloned() {
-                if std::path::Path::new(&path).exists() {
-                    state.media_queue.borrow_mut().push_back((message_id, path));
-                    pump_media_queue(state);
-                    return;
-                }
+            if let Some(path) = state.media_ready_paths.borrow().get(&message_id).cloned()
+                && std::path::Path::new(&path).exists()
+            {
+                state.media_queue.borrow_mut().push_back((message_id, path));
+                pump_media_queue(state);
+                return;
             }
             mark_media_failed(state, &message_id);
         }
@@ -2066,15 +2064,15 @@ fn handle_event(state: &AppState, ev: ProtocolEvent) {
                         Some(error.as_deref().unwrap_or("Failed to load messages")),
                     );
                 }
-                if matches!(pending, Some(Pending::ListFriends)) {
-                    if let Some(ui) = state.friends_ui.borrow().as_ref() {
-                        ui.stack.set_visible_child_name("empty");
-                        ui.empty.set_text(
-                            error
-                                .as_deref()
-                                .unwrap_or(&crate::i18n::t("friends_load_failed")),
-                        );
-                    }
+                if matches!(pending, Some(Pending::ListFriends))
+                    && let Some(ui) = state.friends_ui.borrow().as_ref()
+                {
+                    ui.stack.set_visible_child_name("empty");
+                    ui.empty.set_text(
+                        error
+                            .as_deref()
+                            .unwrap_or(&crate::i18n::t("friends_load_failed")),
+                    );
                 }
                 if let Some(Pending::Send { placeholder_id, .. }) = pending.as_ref() {
                     hide_upload_progress(state);
@@ -2235,6 +2233,9 @@ fn on_logged_in(state: &AppState, result: &serde_json::Value) {
                     .as_deref()
                     .or(profile.picture_path.as_deref()),
             );
+            state.profile_label.set_tooltip_text(
+                (!profile.status_message.is_empty()).then_some(profile.status_message.as_str()),
+            );
             state.stack.set_visible_child_name("shell");
             // Soft transitions only after we're past the cold boot.
             if state.config.borrow().animations {
@@ -2385,25 +2386,24 @@ fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
                 cur.avatar_path = Some(path);
             }
         }
-        if let Some(label) = state.chat_previews.borrow().get(&mid) {
-            if !chat.preview.is_empty() {
-                label.set_text(&chat.preview);
-            }
+        if let Some(label) = state.chat_previews.borrow().get(&mid)
+            && !chat.preview.is_empty()
+        {
+            label.set_text(&chat.preview);
         }
         // Refresh visible name on the row: rebuild is heavy; update via child labels if needed.
         // Promote to top so new activity is obvious.
         promote_chat_to_top(state, &mid);
         // Update name label on the row (first heading label in the row).
-        if let Some(pos) = state.chats.borrow().iter().position(|c| c.mid == mid) {
-            if let Some(row) = state.chat_list.row_at_index(pos as i32) {
-                update_chat_row_name(&row, &chat.name);
-                if let Some(path) = chat.avatar_path.as_deref() {
-                    if std::path::Path::new(path).exists() {
-                        if let Some(img) = state.chat_avatars.borrow().get(&mid).cloned() {
-                            attach_texture_async(img, path.to_string(), 72);
-                        }
-                    }
-                }
+        if let Some(pos) = state.chats.borrow().iter().position(|c| c.mid == mid)
+            && let Some(row) = state.chat_list.row_at_index(pos as i32)
+        {
+            update_chat_row_name(&row, &chat.name);
+            if let Some(path) = chat.avatar_path.as_deref()
+                && std::path::Path::new(path).exists()
+                && let Some(img) = state.chat_avatars.borrow().get(&mid).cloned()
+            {
+                attach_texture_async(img, path.to_string(), 72);
             }
         }
         return;
@@ -2472,21 +2472,16 @@ fn update_chat_row_name(row: &gtk::ListBoxRow, name: &str) {
     };
     let mut child = box_.first_child();
     while let Some(w) = child {
-        if w.css_classes().iter().any(|c| c == "line-chat-text") {
-            if let Ok(inner) = w.clone().downcast::<gtk::Box>() {
-                if let Some(top) = inner.first_child() {
-                    if let Ok(top_box) = top.downcast::<gtk::Box>() {
-                        if let Some(name_w) = top_box.first_child() {
-                            if let Ok(label) = name_w.downcast::<gtk::Label>() {
-                                if label.css_classes().iter().any(|c| c == "line-chat-name") {
-                                    label.set_text(name);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if w.css_classes().iter().any(|c| c == "line-chat-text")
+            && let Ok(inner) = w.clone().downcast::<gtk::Box>()
+            && let Some(top) = inner.first_child()
+            && let Ok(top_box) = top.downcast::<gtk::Box>()
+            && let Some(name_w) = top_box.first_child()
+            && let Ok(label) = name_w.downcast::<gtk::Label>()
+            && label.css_classes().iter().any(|c| c == "line-chat-name")
+        {
+            label.set_text(name);
+            return;
         }
         child = w.next_sibling();
     }
@@ -2559,10 +2554,10 @@ fn build_chat_row(
         .height_request(avatar_px)
         .css_classes(["line-avatar"])
         .build();
-    if let Some(path) = chat.avatar_path.as_deref() {
-        if std::path::Path::new(path).exists() {
-            attach_texture_async(avatar.clone(), path.to_string(), (avatar_px * 2) as i32);
-        }
+    if let Some(path) = chat.avatar_path.as_deref()
+        && std::path::Path::new(path).exists()
+    {
+        attach_texture_async(avatar.clone(), path.to_string(), avatar_px * 2);
     }
     avatar_frame.append(&avatar);
 
@@ -2607,7 +2602,7 @@ fn build_chat_row(
         .css_classes(["line-chat-name"])
         .build();
     let time = gtk::Label::builder()
-        .label(&format_activity(chat.last_activity))
+        .label(format_activity(chat.last_activity))
         .css_classes(["dim-label", "caption"])
         .build();
     top.append(&name);
@@ -2764,7 +2759,7 @@ fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
                 .css_classes(["line-day-sep-row"])
                 .build();
             let sep = gtk::Label::builder()
-                .label(&format_day_separator(msg.created_time))
+                .label(format_day_separator(msg.created_time))
                 .halign(gtk::Align::Center)
                 .css_classes(["line-day-sep"])
                 .build();
@@ -2951,7 +2946,7 @@ fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             .map(|upto| msg_id_le(&msg.id, &upto))
             .unwrap_or(false);
         let status = gtk::Label::builder()
-            .label(&format_outgoing_status(read, msg.created_time))
+            .label(format_outgoing_status(read, msg.created_time))
             .halign(gtk::Align::End)
             .tooltip_text(if read {
                 crate::i18n::t("status_read")
@@ -3141,29 +3136,27 @@ fn append_voice_card(state: &AppState, bubble: &gtk::Box, msg: &MessageInfo, has
         .css_classes(["line-voice-dur"])
         .build();
 
-    if has_audio {
-        if let Some(path) = msg.audio_path.clone() {
-            let s = state.clone();
-            let play_btn = play.clone();
-            let wave_btn = wave.clone();
-            let dur_btn = dur.clone();
-            let progress_btn = progress.clone();
-            let msg_id = msg.id.clone();
-            let total_label = dur_txt.clone();
-            play.connect_clicked(move |_| {
-                toggle_voice_playback(
-                    &s,
-                    &msg_id,
-                    &path,
-                    &play_btn,
-                    &wave_btn,
-                    &dur_btn,
-                    progress_btn.clone(),
-                    duration_ms,
-                    &total_label,
-                );
+    if has_audio && let Some(path) = msg.audio_path.clone() {
+        let s = state.clone();
+        let play_btn = play.clone();
+        let wave_btn = wave.clone();
+        let dur_btn = dur.clone();
+        let progress_btn = progress.clone();
+        let msg_id = msg.id.clone();
+        let total_label = dur_txt.clone();
+        play.connect_clicked(move |_| {
+            toggle_voice_playback(VoicePlaybackRequest {
+                state: &s,
+                msg_id: &msg_id,
+                path: &path,
+                play_btn: &play_btn,
+                wave: &wave_btn,
+                duration_label: &dur_btn,
+                progress: progress_btn.clone(),
+                duration_ms,
+                total_label: &total_label,
             });
-        }
+        });
     }
 
     let dl = gtk::Button::builder()
@@ -3185,37 +3178,48 @@ fn append_voice_card(state: &AppState, bubble: &gtk::Box, msg: &MessageInfo, has
     row.append(&dl);
     bubble.append(&row);
 
-    if has_audio {
-        if let Some(path) = msg.audio_path.clone() {
-            let wave2 = wave.clone();
-            let peaks2 = peaks.clone();
-            let (tx, rx) = async_channel::bounded::<Vec<f32>>(1);
-            std::thread::spawn(move || {
-                let extracted = extract_audio_peaks(std::path::Path::new(&path), 36)
-                    .unwrap_or_else(|| placeholder_peaks(36));
-                let _ = tx.send_blocking(extracted);
-            });
-            glib::spawn_future_local(async move {
-                if let Ok(extracted) = rx.recv().await {
-                    *peaks2.borrow_mut() = extracted;
-                    wave2.queue_draw();
-                }
-            });
-        }
+    if has_audio && let Some(path) = msg.audio_path.clone() {
+        let wave2 = wave.clone();
+        let peaks2 = peaks.clone();
+        let (tx, rx) = async_channel::bounded::<Vec<f32>>(1);
+        std::thread::spawn(move || {
+            let extracted = extract_audio_peaks(std::path::Path::new(&path), 36)
+                .unwrap_or_else(|| placeholder_peaks(36));
+            let _ = tx.send_blocking(extracted);
+        });
+        glib::spawn_future_local(async move {
+            if let Ok(extracted) = rx.recv().await {
+                *peaks2.borrow_mut() = extracted;
+                wave2.queue_draw();
+            }
+        });
     }
 }
 
-fn toggle_voice_playback(
-    state: &AppState,
-    msg_id: &str,
-    path: &str,
-    play_btn: &gtk::Button,
-    wave: &gtk::DrawingArea,
-    dur: &gtk::Label,
+struct VoicePlaybackRequest<'a> {
+    state: &'a AppState,
+    msg_id: &'a str,
+    path: &'a str,
+    play_btn: &'a gtk::Button,
+    wave: &'a gtk::DrawingArea,
+    duration_label: &'a gtk::Label,
     progress: Rc<RefCell<f32>>,
     duration_ms: u64,
-    total_label: &str,
-) {
+    total_label: &'a str,
+}
+
+fn toggle_voice_playback(request: VoicePlaybackRequest<'_>) {
+    let VoicePlaybackRequest {
+        state,
+        msg_id,
+        path,
+        play_btn,
+        wave,
+        duration_label,
+        progress,
+        duration_ms,
+        total_label,
+    } = request;
     // Second press on the same bubble stops playback.
     // Drop the borrow before stop_voice_playback (it needs borrow_mut).
     let same_bubble = state
@@ -3252,7 +3256,7 @@ fn toggle_voice_playback(
         msg_id: msg_id.to_string(),
         play_btn: play_btn.clone(),
         wave: wave.clone(),
-        dur: dur.clone(),
+        dur: duration_label.clone(),
         duration_ms: duration_ms.max(500),
         started: std::time::Instant::now(),
         progress: progress.clone(),
@@ -3565,10 +3569,10 @@ fn wire_record_wave(state: &AppState) {
 }
 
 fn queue_draw_voice_waves(widget: &gtk::Widget) {
-    if let Ok(area) = widget.clone().downcast::<gtk::DrawingArea>() {
-        if area.has_css_class("line-voice-wave") || area.has_css_class("line-record-wave") {
-            area.queue_draw();
-        }
+    if let Ok(area) = widget.clone().downcast::<gtk::DrawingArea>()
+        && (area.has_css_class("line-voice-wave") || area.has_css_class("line-record-wave"))
+    {
+        area.queue_draw();
     }
     let mut child = widget.first_child();
     while let Some(w) = child {
@@ -3594,7 +3598,6 @@ fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &str) {
         created_time: 0,
         content_type: "AUDIO".into(),
         image_path: None,
-        image_url: None,
         audio_path: Some(path.to_string()),
         file_name: None,
         file_path: Some(path.to_string()),
@@ -3607,14 +3610,6 @@ fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &str) {
 fn play_audio_file(path: &str, output_sink: &str) -> Result<(), String> {
     spawn_audio_player(path, output_sink, 1.0).map(|mut child| {
         // Detach: notifications / one-shot viewers don't track the process.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    })
-}
-
-fn play_audio_file_gain(path: &str, output_sink: &str, gain: f64) -> Result<(), String> {
-    spawn_audio_player(path, output_sink, gain).map(|mut child| {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
@@ -3722,12 +3717,13 @@ fn full_image_candidate(path: &str) -> Option<String> {
     if is_full_media_path(path) && std::path::Path::new(path).exists() {
         return Some(path.to_string());
     }
-    if !is_thumb_media_path(path) {
-        if std::path::Path::new(path).exists() && !image_looks_low_res(path) {
-            return Some(path.to_string());
-        }
-        // Try sibling .full. next to a polluted preview or thumb.
+    if !is_thumb_media_path(path)
+        && std::path::Path::new(path).exists()
+        && !image_looks_low_res(path)
+    {
+        return Some(path.to_string());
     }
+    // Try sibling .full. next to a polluted preview or thumb.
     let p = std::path::Path::new(path);
     let parent = p.parent()?;
     let name = p.file_name()?.to_str()?;
@@ -3774,10 +3770,9 @@ fn local_media_path(msg: &MessageInfo, for_viewer: bool) -> Option<String> {
         .file_path
         .as_ref()
         .filter(|p| std::path::Path::new(p).exists() && !is_thumb_media_path(p))
+        && !(for_viewer && ct == "IMAGE" && image_looks_low_res(p))
     {
-        if !(for_viewer && ct == "IMAGE" && image_looks_low_res(p)) {
-            return Some(p.clone());
-        }
+        return Some(p.clone());
     }
     if ct == "IMAGE" {
         if for_viewer {
@@ -3801,14 +3796,13 @@ fn local_media_path(msg: &MessageInfo, for_viewer: bool) -> Option<String> {
         {
             return Some(p.clone());
         }
-    } else if !for_viewer {
-        if let Some(p) = msg
+    } else if !for_viewer
+        && let Some(p) = msg
             .image_path
             .as_ref()
             .filter(|p| std::path::Path::new(p).exists())
-        {
-            return Some(p.clone());
-        }
+    {
+        return Some(p.clone());
     }
     None
 }
@@ -3846,7 +3840,6 @@ fn request_media_download(state: &AppState, msg: &MessageInfo, action: &str) {
             state.pending.borrow_mut().insert(
                 id,
                 Pending::DownloadMedia {
-                    chat_mid,
                     message_id: msg.id.clone(),
                     action: action.to_string(),
                     content_type: msg.content_type.clone(),
@@ -4153,10 +4146,8 @@ fn viewer_kind_for(content_type: &str, path: &str, name: &str) -> ViewerKind {
         return ViewerKind::Text;
     }
     // Sniff text files without extension.
-    if ct == "FILE" || ct.is_empty() {
-        if looks_like_text_file(path) {
-            return ViewerKind::Text;
-        }
+    if (ct == "FILE" || ct.is_empty()) && looks_like_text_file(path) {
+        return ViewerKind::Text;
     }
     ViewerKind::Generic
 }
@@ -4433,10 +4424,7 @@ fn append_image_viewer(
         Rc::new(move || {
             let aw = area.width().max(1) as f64;
             let ah = area.height().max(1) as f64;
-            let z = (aw / nat_w as f64)
-                .min(ah / nat_h as f64)
-                .min(1.0)
-                .max(0.05);
+            let z = (aw / nat_w as f64).min(ah / nat_h as f64).clamp(0.05, 1.0);
             *zoom.borrow_mut() = z;
             *offset.borrow_mut() = ((aw - nat_w as f64 * z) * 0.5, (ah - nat_h as f64 * z) * 0.5);
             area.queue_draw();
@@ -4693,11 +4681,11 @@ fn append_image_viewer(
         let fast_paint = fast_paint.clone();
         drag.connect_drag_end(move |_, _x, _y| {
             if *draw_mode.borrow() {
-                if let Some(stroke) = active_stroke.borrow_mut().take() {
-                    if !stroke.points.is_empty() {
-                        strokes.borrow_mut().push(stroke);
-                        refresh();
-                    }
+                if let Some(stroke) = active_stroke.borrow_mut().take()
+                    && !stroke.points.is_empty()
+                {
+                    strokes.borrow_mut().push(stroke);
+                    refresh();
                 }
                 area.set_cursor_from_name(Some("crosshair"));
             } else {
@@ -4712,9 +4700,11 @@ fn append_image_viewer(
     body.append(&area);
 }
 
+type PackedStroke = ((f64, f64, f64, f64), f64, Vec<(f64, f64)>);
+
 fn export_annotated_image(
     pixbuf: &gdk_pixbuf::Pixbuf,
-    strokes: &[((f64, f64, f64, f64), f64, Vec<(f64, f64)>)],
+    strokes: &[PackedStroke],
     data_dir: &std::path::Path,
 ) -> anyhow::Result<PathBuf> {
     let w = pixbuf.width().max(1);
@@ -4803,7 +4793,6 @@ fn send_local_image_file(state: &AppState, path: &std::path::Path) -> bool {
                     created_time: now_ms(),
                     content_type: "IMAGE".into(),
                     image_path: Some(path_str.clone()),
-                    image_url: None,
                     audio_path: None,
                     file_name: Some(file_name),
                     file_path: Some(path_str),
@@ -5217,7 +5206,7 @@ fn open_sticker_picker(state: &AppState) {
     let spin = gtk::Spinner::builder().spinning(true).build();
     spin.set_size_request(28, 28);
     let label = gtk::Label::builder()
-        .label(&crate::i18n::t("loading_stickers"))
+        .label(crate::i18n::t("loading_stickers"))
         .css_classes(["dim-label"])
         .build();
     loading.append(&spin);
@@ -5248,7 +5237,7 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
 
     if packs.is_empty() {
         let empty = gtk::Label::builder()
-            .label(&crate::i18n::t("stickers_empty"))
+            .label(crate::i18n::t("stickers_empty"))
             .css_classes(["dim-label"])
             .margin_top(24)
             .margin_bottom(24)
@@ -5385,10 +5374,10 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
                 .and_then(|v| v.as_str())
                 .filter(|p| !p.is_empty())
                 .map(|s| s.to_string());
-            if idx == 0 {
-                if let Some(path) = path.clone() {
-                    attach_texture_async(pic.clone(), path, 96);
-                }
+            if idx == 0
+                && let Some(path) = path.clone()
+            {
+                attach_texture_async(pic.clone(), path, 96);
             }
             btn.set_child(Some(&pic));
 
@@ -5406,10 +5395,10 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
                 );
             });
             grid.append(&btn);
-            if idx != 0 {
-                if let Some(path) = path {
-                    pending_thumbs.borrow_mut().push((pic, path));
-                }
+            if idx != 0
+                && let Some(path) = path
+            {
+                pending_thumbs.borrow_mut().push((pic, path));
             }
         }
         scroll.set_child(Some(&grid));
@@ -5429,10 +5418,10 @@ fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
                 .css_classes(["line-sticker-tab-icon"])
                 .build();
             pic.set_size_request(28, 28);
-            if let Some(path) = pack.get("iconPath").and_then(|v| v.as_str()) {
-                if !path.is_empty() {
-                    attach_texture_async(pic.clone(), path.to_string(), 48);
-                }
+            if let Some(path) = pack.get("iconPath").and_then(|v| v.as_str())
+                && !path.is_empty()
+            {
+                attach_texture_async(pic.clone(), path.to_string(), 48);
             }
             tab.set_child(Some(&pic));
         }
@@ -5510,7 +5499,6 @@ fn send_sticker_now(
                     created_time: now_ms(),
                     content_type: "STICKER".into(),
                     image_path: image_path.map(|p| p.to_string()),
-                    image_url: None,
                     audio_path: None,
                     file_name: None,
                     file_path: None,
@@ -5621,11 +5609,11 @@ fn try_paste_clipboard_attachment(state: &AppState) -> bool {
                     if let Ok(list) = value.get::<gdk::FileList>() {
                         let mut any = false;
                         for file in list.files() {
-                            if let Some(path) = file.path() {
-                                if path.is_file() {
-                                    send_local_media_path(&s, path);
-                                    any = true;
-                                }
+                            if let Some(path) = file.path()
+                                && path.is_file()
+                            {
+                                send_local_media_path(&s, path);
+                                any = true;
                             }
                         }
                         if !any {
@@ -5682,10 +5670,10 @@ fn paste_clipboard_uri_list(state: &AppState) {
                     continue;
                 }
                 let file = gio::File::for_uri(line);
-                if let Some(path) = file.path() {
-                    if path.is_file() {
-                        send_local_media_path(&s, path);
-                    }
+                if let Some(path) = file.path()
+                    && path.is_file()
+                {
+                    send_local_media_path(&s, path);
                 }
             }
         },
@@ -5846,7 +5834,6 @@ fn send_local_media_path(state: &AppState, path: PathBuf) {
                     created_time: now_ms(),
                     content_type: content_type.into(),
                     image_path,
-                    image_url: None,
                     audio_path,
                     file_name: Some(file_name),
                     file_path,
@@ -6061,7 +6048,6 @@ fn finish_voice_record(state: &AppState, send: bool) {
                     created_time: now_ms(),
                     content_type: "AUDIO".into(),
                     image_path: None,
-                    image_url: None,
                     audio_path: Some(path_str.clone()),
                     file_name: None,
                     file_path: Some(path_str),
@@ -6165,11 +6151,11 @@ fn append_flex_card(
 
 fn handle_flex_action(state: &AppState, chat_mid: &str, message_id: &str, action: &FlexAction) {
     let kind = action.kind.to_ascii_lowercase();
-    if kind == "uri" || kind == "url" {
-        if let Some(uri) = action.uri.as_deref() {
-            open_uri(uri);
-            return;
-        }
+    if (kind == "uri" || kind == "url")
+        && let Some(uri) = action.uri.as_deref()
+    {
+        open_uri(uri);
+        return;
     }
     if kind == "message" {
         let text = action.data.clone().unwrap_or_else(|| action.label.clone());
@@ -6276,11 +6262,9 @@ fn mark_media_failed(state: &AppState, message_id: &str) {
         }
         child = next;
     }
-    if is_video {
-        if let Some(msg) = msg.as_ref() {
-            append_video_placeholder(state, &bubble, msg, true);
-            return;
-        }
+    if is_video && let Some(msg) = msg.as_ref() {
+        append_video_placeholder(state, &bubble, msg, true);
+        return;
     }
     let label = gtk::Label::builder()
         .label(crate::i18n::t("image_unavailable"))
@@ -6424,6 +6408,7 @@ fn apply_frames_to_picture(
         return;
     }
 
+    let max_plays = frames.plays;
     let pixbufs: Vec<(Pixbuf, u32)> = frames
         .frames
         .iter()
@@ -6438,12 +6423,15 @@ fn apply_frames_to_picture(
 
     let frames = std::rc::Rc::new(pixbufs);
     let idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let completed_plays = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let picture = picture.clone();
 
     fn schedule(
         picture: gtk::Picture,
         frames: std::rc::Rc<Vec<(Pixbuf, u32)>>,
         idx: std::rc::Rc<std::cell::Cell<usize>>,
+        completed_plays: std::rc::Rc<std::cell::Cell<u32>>,
+        max_plays: u32,
     ) {
         let delay = frames
             .get(idx.get())
@@ -6458,15 +6446,22 @@ fn apply_frames_to_picture(
                 return;
             }
             let next = (idx.get() + 1) % frames.len();
+            if next == 0 {
+                let completed = completed_plays.get().saturating_add(1);
+                completed_plays.set(completed);
+                if max_plays > 0 && completed >= max_plays {
+                    return;
+                }
+            }
             idx.set(next);
             if let Some((pb, _)) = frames.get(next) {
                 picture.set_paintable(Some(&gdk::Texture::for_pixbuf(pb)));
             }
-            schedule(picture, frames, idx);
+            schedule(picture, frames, idx, completed_plays, max_plays);
         });
     }
 
-    schedule(picture, frames, idx);
+    schedule(picture, frames, idx, completed_plays, max_plays);
 }
 
 fn attach_texture_async(picture: gtk::Picture, path: String, max_px: i32) {
@@ -6482,16 +6477,16 @@ fn attach_texture_async_anim(picture: gtk::Picture, path: String, max_px: i32, a
         match rx.recv().await {
             Ok(Some(frames)) => apply_frames_to_picture(&picture, frames, animate),
             _ => {
-                if let Some(parent) = picture.parent() {
-                    if let Some(box_) = parent.downcast_ref::<gtk::Box>() {
-                        box_.remove(&picture);
-                        let label = gtk::Label::builder()
-                            .label(crate::i18n::t("image_unavailable"))
-                            .xalign(0.0)
-                            .css_classes(["dim-label", "line-media-failed"])
-                            .build();
-                        box_.append(&label);
-                    }
+                if let Some(parent) = picture.parent()
+                    && let Some(box_) = parent.downcast_ref::<gtk::Box>()
+                {
+                    box_.remove(&picture);
+                    let label = gtk::Label::builder()
+                        .label(crate::i18n::t("image_unavailable"))
+                        .xalign(0.0)
+                        .css_classes(["dim-label", "line-media-failed"])
+                        .build();
+                    box_.append(&label);
                 }
             }
         }
@@ -6588,11 +6583,12 @@ fn pump_media_queue(state: &AppState) {
                 }
             } else {
                 bubble2.append(&pic);
-                if !is_sticker && is_image {
-                    if let Some(msg) = msg.as_ref() {
-                        wire_media_open_click(&state2, &pic, msg, "image");
-                        pic.set_tooltip_text(Some(&crate::i18n::t("media_open_image")));
-                    }
+                if !is_sticker
+                    && is_image
+                    && let Some(msg) = msg.as_ref()
+                {
+                    wire_media_open_click(&state2, &pic, msg, "image");
+                    pic.set_tooltip_text(Some(&crate::i18n::t("media_open_image")));
                 }
             }
             if *state2.stick_bottom.borrow() {
@@ -6860,7 +6856,7 @@ fn ensure_new_message_separator(state: &AppState) {
         .build();
     line.set_height_request(1);
     let badge = gtk::Label::builder()
-        .label(&crate::i18n::t("new_messages_badge"))
+        .label(crate::i18n::t("new_messages_badge"))
         .css_classes(["line-new-sep-badge"])
         .valign(gtk::Align::Center)
         .build();
@@ -6991,268 +6987,6 @@ fn bump_unread(state: &AppState, chat_mid: &str) {
     refresh_tray_menu(state);
 }
 
-fn notify_incoming(state: &AppState, msg: &MessageInfo, peer_mid: &str) {
-    if !notifications_allowed(state) {
-        return;
-    }
-    let muted = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == peer_mid)
-        .map(|c| c.muted)
-        .unwrap_or(false);
-    if muted {
-        return;
-    }
-    let (name, avatar_path) = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == peer_mid)
-        .map(|c| (c.name.clone(), c.avatar_path.clone()))
-        .unwrap_or_else(|| (peer_mid.to_string(), None));
-    let body = preview_body_ui(msg);
-    let image_path = msg
-        .image_path
-        .as_deref()
-        .filter(|p| !p.is_empty() && std::path::Path::new(p).exists())
-        .map(str::to_string);
-
-    if !msg.id.is_empty() {
-        let mut pending = state.notif_pending.borrow_mut();
-        if pending.len() > 64 {
-            pending.clear();
-        }
-        pending.insert(
-            msg.id.clone(),
-            PendingNotif {
-                chat_mid: peer_mid.to_string(),
-                title: name.clone(),
-                body: body.clone(),
-                avatar_path: avatar_path.clone(),
-            },
-        );
-    }
-
-    send_desktop_notification(
-        state,
-        &name,
-        &body,
-        avatar_path.as_deref(),
-        image_path.as_deref(),
-        peer_mid,
-        &msg.id,
-        false,
-    );
-
-    if state.config.borrow().notification_sound {
-        play_notification_sound(state);
-    }
-}
-
-fn refresh_notification_media(state: &AppState, message_id: &str, image_path: &str) {
-    if !notifications_allowed(state) {
-        return;
-    }
-    let Some(meta) = state.notif_pending.borrow().get(message_id).cloned() else {
-        return;
-    };
-    let muted = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == meta.chat_mid)
-        .map(|c| c.muted)
-        .unwrap_or(false);
-    if muted {
-        return;
-    }
-    // Don't bump the banner again if the user is focused on this chat.
-    let viewing = state.current_chat.borrow().as_deref() == Some(meta.chat_mid.as_str());
-    if viewing && state.window.is_active() {
-        state.notif_pending.borrow_mut().remove(message_id);
-        return;
-    }
-
-    send_desktop_notification(
-        state,
-        &meta.title,
-        &meta.body,
-        meta.avatar_path.as_deref(),
-        Some(image_path),
-        &meta.chat_mid,
-        message_id,
-        true,
-    );
-}
-
-fn send_desktop_notification(
-    state: &AppState,
-    title: &str,
-    body: &str,
-    avatar_path: Option<&str>,
-    image_path: Option<&str>,
-    chat_mid: &str,
-    message_id: &str,
-    suppress_sound: bool,
-) {
-    match crate::desktop_notify::show_chat_notification(
-        title,
-        body,
-        avatar_path,
-        image_path,
-        chat_mid,
-        message_id,
-        state.tray_tx.clone(),
-        suppress_sound,
-    ) {
-        Ok(()) => {}
-        Err(e) => {
-            tracing::warn!("notify-rust failed ({e}); falling back to gio::Notification");
-            let n = gio::Notification::new(title);
-            n.set_body(Some(body));
-            n.set_priority(gio::NotificationPriority::Normal);
-            n.set_default_action_and_target_value("app.open-chat", Some(&chat_mid.to_variant()));
-            if let Some(path) = avatar_path.filter(|p| std::path::Path::new(p).exists()) {
-                let file = gio::File::for_path(path);
-                n.set_icon(&gio::FileIcon::new(&file));
-            } else if let Some(path) = image_path.filter(|p| std::path::Path::new(p).exists()) {
-                let file = gio::File::for_path(path);
-                n.set_icon(&gio::FileIcon::new(&file));
-            } else {
-                n.set_icon(&gio::ThemedIcon::new("line-gtk"));
-            }
-            let id = if message_id.is_empty() {
-                format!("line-gtk-{}", chat_mid)
-            } else {
-                format!("line-gtk-{message_id}")
-            };
-            state.app.send_notification(Some(&id), &n);
-        }
-    }
-}
-
-fn play_notification_sound(state: &AppState) {
-    let volume = state
-        .config
-        .borrow()
-        .notification_sound_volume
-        .clamp(0.0, 2.0);
-    // Prefer the desktop sound theme (same event GNOME/KDE/etc. use).
-    if play_system_event_sound("message-new-instant", volume)
-        || play_system_event_sound("message", volume)
-        || play_system_event_sound("bell", volume)
-    {
-        return;
-    }
-    // Last resort: short system beep via speaker-test / paplay is better skipped
-    // than inventing a custom LINE tone.
-}
-
-fn play_system_event_sound(event: &str, volume: f64) -> bool {
-    // libcanberra drives the active XDG sound theme when installed.
-    if std::process::Command::new("canberra-gtk-play")
-        .args(["-i", event])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-    {
-        return true;
-    }
-    if std::process::Command::new("canberra-gtk-play")
-        .args(["--id", event])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-    {
-        return true;
-    }
-    let Some(path) = find_xdg_theme_sound(event) else {
-        return false;
-    };
-    play_system_sound_file(&path, volume)
-}
-
-fn xdg_data_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(home) = std::env::var("XDG_DATA_HOME") {
-        if !home.is_empty() {
-            dirs.push(PathBuf::from(home));
-        }
-    } else if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".local/share"));
-    }
-    if let Ok(list) = std::env::var("XDG_DATA_DIRS") {
-        for p in list.split(':').filter(|s| !s.is_empty()) {
-            dirs.push(PathBuf::from(p));
-        }
-    }
-    if dirs.is_empty() {
-        dirs.push(PathBuf::from("/usr/local/share"));
-        dirs.push(PathBuf::from("/usr/share"));
-    }
-    dirs
-}
-
-fn find_xdg_theme_sound(event: &str) -> Option<PathBuf> {
-    const THEMES: &[&str] = &[
-        "freedesktop",
-        "gnome",
-        "oxygen",
-        "Yaru",
-        "deepin",
-        "ubuntu",
-        "elementary",
-    ];
-    const EXTS: &[&str] = &["oga", "ogg", "wav", "flac", "mp3"];
-    for root in xdg_data_dirs() {
-        let sounds = root.join("sounds");
-        for theme in THEMES {
-            for ext in EXTS {
-                for sub in ["stereo", ""] {
-                    let p = if sub.is_empty() {
-                        sounds.join(theme).join(format!("{event}.{ext}"))
-                    } else {
-                        sounds.join(theme).join(sub).join(format!("{event}.{ext}"))
-                    };
-                    if p.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn play_system_sound_file(path: &std::path::Path, volume: f64) -> bool {
-    let path_str = path.to_string_lossy().to_string();
-    // paplay volume: 65536 = 100%
-    let paplay_vol = ((volume * 65536.0).round() as i32).clamp(0, 130_000);
-    if std::process::Command::new("paplay")
-        .args(["--volume", &paplay_vol.to_string(), &path_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-    {
-        return true;
-    }
-    if std::process::Command::new("pw-play")
-        .arg(&path_str)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-    {
-        return true;
-    }
-    false
-}
-
 fn update_mute_btn(state: &AppState, muted: bool) {
     if muted {
         state.mute_btn.set_icon_name("audio-volume-muted-symbolic");
@@ -7302,10 +7036,10 @@ fn apply_peer_read(state: &AppState, chat_mid: &str, message_id: &str) {
         return;
     }
     let prev = state.read_upto.borrow().get(chat_mid).cloned();
-    if let Some(p) = prev.as_deref() {
-        if msg_id_le(message_id, p) {
-            return;
-        }
+    if let Some(p) = prev.as_deref()
+        && msg_id_le(message_id, p)
+    {
+        return;
     }
     state
         .read_upto

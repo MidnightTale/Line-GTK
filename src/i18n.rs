@@ -8,7 +8,6 @@ static LANG: RwLock<Option<I18n>> = RwLock::new(None);
 
 #[derive(Debug, Clone, Default)]
 pub struct I18n {
-    pub code: String,
     map: HashMap<String, String>,
 }
 
@@ -24,14 +23,7 @@ impl I18n {
             // fallback bundled next to exe / eng
             read_map(&lang_path(repo_root, "eng.json")).unwrap_or_default()
         });
-        Self {
-            code: if file.starts_with("thai") {
-                "th".into()
-            } else {
-                "en".into()
-            },
-            map,
-        }
+        Self { map }
     }
 
     pub fn t(&self, key: &str) -> String {
@@ -75,19 +67,19 @@ pub fn set_lang(repo_root: &Path, code: &str) {
 }
 
 pub fn t(key: &str) -> String {
-    if let Ok(g) = LANG.read() {
-        if let Some(i) = g.as_ref() {
-            return i.t(key);
-        }
+    if let Ok(g) = LANG.read()
+        && let Some(i) = g.as_ref()
+    {
+        return i.t(key);
     }
     key.to_string()
 }
 
 pub fn tf(key: &str, pairs: &[(&str, &str)]) -> String {
-    if let Ok(g) = LANG.read() {
-        if let Some(i) = g.as_ref() {
-            return i.tf(key, pairs);
-        }
+    if let Ok(g) = LANG.read()
+        && let Some(i) = g.as_ref()
+    {
+        return i.tf(key, pairs);
     }
     key.to_string()
 }

@@ -197,11 +197,11 @@ impl Sidecar {
         // Invalidate the reader before closing stdout so an intentional restart
         // is not reported as an unexpected crash.
         self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
         if let Ok(mut stdin) = self.stdin.lock() {
             *stdin = None;
@@ -243,10 +243,6 @@ impl Sidecar {
 
     pub fn login_qr(&self) -> Result<u64> {
         self.request("login_qr", None)
-    }
-
-    pub fn login_token(&self) -> Result<u64> {
-        self.request("login_token", None)
     }
 
     pub fn list_chats(&self) -> Result<u64> {
@@ -583,16 +579,7 @@ fn read_loop<R: std::io::Read>(
                                 .cloned()
                                 .and_then(|v| serde_json::from_value(v).ok())
                                 .unwrap_or_default();
-                            let cached = resp
-                                .extra
-                                .get("cached")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            ProtocolEvent::Messages {
-                                chat_mid,
-                                messages,
-                                cached,
-                            }
+                            ProtocolEvent::Messages { chat_mid, messages }
                         }
                         "avatar_ready" => ProtocolEvent::AvatarReady {
                             mid: resp
@@ -624,14 +611,7 @@ fn read_loop<R: std::io::Read>(
                                 serde_json::from_value::<crate::protocol::ChatInfo>(v).ok()
                             });
                             match chat {
-                                Some(chat) => ProtocolEvent::ChatUpsert {
-                                    chat,
-                                    created: resp
-                                        .extra
-                                        .get("created")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false),
-                                },
+                                Some(chat) => ProtocolEvent::ChatUpsert { chat },
                                 None => continue,
                             }
                         }
@@ -767,12 +747,6 @@ fn read_loop<R: std::io::Read>(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
-                            user_mid: resp
-                                .extra
-                                .get("userMid")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string(),
                             message_id: resp
                                 .extra
                                 .get("messageId")
@@ -797,7 +771,7 @@ fn read_loop<R: std::io::Read>(
                                 .extra
                                 .get("kind")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or_else(|| "AUDIO")
+                                .unwrap_or("AUDIO")
                                 .to_string(),
                         },
                         "call_canceled" => ProtocolEvent::CallCanceled {
