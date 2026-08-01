@@ -16,7 +16,7 @@ optdepends=(
 conflicts=('line-gtk-git')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/MidnightTale/Line-GTK/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('ef31d819185ed2b8d8e1a055f27ddf0bff3caec0cc8b0bf8fd30ce07da3264dc')
 
 prepare() {
   cd "Line-GTK-$pkgver"
