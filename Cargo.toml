@@ -1,0 +1,31 @@
+[package]
+name = "line-gtk"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["MidnightTale"]
+repository = "https://github.com/MidnightTale/line-gtk"
+homepage = "https://github.com/MidnightTale/line-gtk"
+description = "Unofficial native LINE client for Linux (GTK4 / Libadwaita)"
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+dirs = "6.0.0"
+gdk-pixbuf = "0.22.0"
+glib = "0.22"
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_14"] }
+cairo = { package = "cairo-rs", version = "0.22", features = ["png"] }
+image = { version = "0.25.10", features = ["png", "jpeg", "gif", "webp"] }
+png = "0.18"
+ksni = { version = "0.3.6", features = ["blocking"] }
+libadwaita = { version = "0.9.2", features = ["v1_5"] }
+qrcode = "0.14.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "blocking"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+discord-rich-presence = "1.1"

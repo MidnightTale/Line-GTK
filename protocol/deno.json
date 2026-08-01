@@ -1,0 +1,13 @@
+{
+  "tasks": {
+    "sidecar": "deno run -A src/main.ts",
+    "dev": "deno run -A --watch src/main.ts"
+  },
+  "imports": {
+    "@evex/linejs": "jsr:@evex/linejs@^3.2.1",
+    "@evex/linejs-types": "jsr:@evex/linejs-types@^3.2.1",
+    "@std/assert": "jsr:@std/assert@1",
+    "@std/path": "jsr:@std/path@1",
+    "opusscript": "npm:opusscript@0.1.1"
+  }
+}

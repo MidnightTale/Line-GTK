@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="line-gtk">
+  <!-- Transparent pad; bubble matches classic LINE silhouette, text says gtk -->
+  <path fill="#06C755" d="
+    M96 72
+    h320
+    c39.765 0 72 32.235 72 72
+    v176
+    c0 39.765-32.235 72-72 72
+    H248
+    l-72 88
+    v-88
+    H96
+    c-39.765 0-72-32.235-72-72
+    V144
+    c0-39.765 32.235-72 72-72
+    z"/>
+  <text
+    x="256"
+    y="268"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    font-family="Arial Black, Arial, Helvetica, sans-serif"
+    font-size="148"
+    font-weight="900"
+    letter-spacing="2"
+    fill="#ffffff">gtk</text>
+</svg>
