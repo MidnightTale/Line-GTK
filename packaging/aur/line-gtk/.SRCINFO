@@ -18,6 +18,6 @@ pkgbase = line-gtk
 	conflicts = line-gtk-git
 	options = !lto
 	source = line-gtk-0.1.0.tar.gz::https://github.com/MidnightTale/Line-GTK/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = ef31d819185ed2b8d8e1a055f27ddf0bff3caec0cc8b0bf8fd30ce07da3264dc
+	sha256sums = 8dcc3b67296336c1a823c19beaa0008eb96d92c608961bbf5bb33e79eec0379b
 
 pkgname = line-gtk
