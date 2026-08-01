@@ -1,7 +1,7 @@
 Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protocol sidecar ([linejs](https://github.com/evex-dev/linejs)).
 
 
-![main](./screenshot_20260801_214523-region.png)
+![main](./assets/761546283_1013837091419784_4898538377611644175_n.jpg)
 
 ---
 
