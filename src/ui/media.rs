@@ -1810,9 +1810,25 @@ pub(super) fn attach_texture_async_anim(
     max_px: i32,
     animate: bool,
 ) {
+    let fixed_width = picture.width_request();
+    let fixed_height = picture.height_request();
+    let has_fixed_canvas = fixed_width > 0 && fixed_height > 0;
+    let cover = picture.content_fit() == gtk::ContentFit::Cover;
+    if has_fixed_canvas {
+        picture.set_hexpand(false);
+        picture.set_vexpand(false);
+        picture.set_halign(gtk::Align::Center);
+        picture.set_valign(gtk::Align::Center);
+        picture.set_overflow(gtk::Overflow::Hidden);
+    }
     let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&path, max_px, animate));
+        let frames = if has_fixed_canvas {
+            crate::sticker_anim::load_fitted(&path, fixed_width, fixed_height, cover, animate)
+        } else {
+            crate::sticker_anim::load_scaled(&path, max_px, animate)
+        };
+        let _ = tx.send_blocking(frames);
     });
     glib::spawn_future_local(async move {
         match rx.recv().await {

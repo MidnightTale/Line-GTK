@@ -95,6 +95,41 @@ pub fn load_scaled(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames>
     with_decode_slot(|| load_scaled_inner(path, max_px, animate))
 }
 
+/// Decode into an exact logical canvas. `cover` center-crops photos; contain
+/// keeps the full image on a transparent canvas (stickers/icons). Returning
+/// fixed-size frames prevents GtkPicture from re-negotiating the row size from
+/// the source image's intrinsic dimensions after the async decode completes.
+pub fn load_fitted(
+    path: &str,
+    width_px: i32,
+    height_px: i32,
+    cover: bool,
+    animate: bool,
+) -> Option<AnimFrames> {
+    with_decode_slot(|| {
+        let width_px = width_px.max(1);
+        let height_px = height_px.max(1);
+        let decode_max = Pixbuf::file_info(path)
+            .map(|(_, source_w, source_h)| {
+                let source_w = source_w.max(1) as f64;
+                let source_h = source_h.max(1) as f64;
+                let sx = width_px as f64 / source_w;
+                let sy = height_px as f64 / source_h;
+                let scale = if cover { sx.max(sy) } else { sx.min(sy) };
+                ((source_w * scale).max(source_h * scale)).ceil() as i32
+            })
+            .unwrap_or_else(|| width_px.max(height_px) * 2)
+            .max(width_px.max(height_px));
+        let mut decoded = load_scaled_inner(path, decode_max, animate)?;
+        decoded.frames = decoded
+            .frames
+            .into_iter()
+            .filter_map(|frame| fit_frame(frame, width_px, height_px, cover))
+            .collect();
+        (!decoded.frames.is_empty()).then_some(decoded)
+    })
+}
+
 fn load_scaled_inner(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() < 32 {
@@ -148,23 +183,47 @@ fn decode_static(path: &str, max_px: i32) -> Option<AnimFrames> {
 /// Decode a profile image into an exact, center-cropped RGBA square. Only the
 /// Send-safe raw bytes leave the worker thread; GTK objects stay on GTK's thread.
 pub fn load_square(path: &str, size_px: i32) -> Option<RawFrame> {
-    with_decode_slot(|| {
-        let size_px = size_px.max(1);
-        let source = Pixbuf::from_file(path).ok()?;
-        let side = source.width().min(source.height());
-        if side <= 0 {
-            return None;
-        }
-        let x = (source.width() - side) / 2;
-        let y = (source.height() - side) / 2;
-        let square = source.new_subpixbuf(x, y, side, side);
-        let scaled = square.scale_simple(size_px, size_px, gdk_pixbuf::InterpType::Bilinear)?;
-        Some(RawFrame {
-            rgba: pixbuf_to_rgba(&scaled)?,
-            width: size_px,
-            height: size_px,
-            delay_ms: 0,
-        })
+    load_fitted(path, size_px, size_px, true, false)?
+        .frames
+        .into_iter()
+        .next()
+}
+
+fn fit_frame(frame: RawFrame, width_px: i32, height_px: i32, cover: bool) -> Option<RawFrame> {
+    let source_w = frame.width.max(1) as u32;
+    let source_h = frame.height.max(1) as u32;
+    let target_w = width_px.max(1) as u32;
+    let target_h = height_px.max(1) as u32;
+    let source = image::RgbaImage::from_raw(source_w, source_h, frame.rgba)?;
+    let sx = target_w as f64 / source_w as f64;
+    let sy = target_h as f64 / source_h as f64;
+    let scale = if cover { sx.max(sy) } else { sx.min(sy) };
+    let resized_w = ((source_w as f64 * scale).round() as u32).max(1);
+    let resized_h = ((source_h as f64 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(
+        &source,
+        resized_w,
+        resized_h,
+        image::imageops::FilterType::Triangle,
+    );
+    let rgba = if cover {
+        let x = resized_w.saturating_sub(target_w) / 2;
+        let y = resized_h.saturating_sub(target_h) / 2;
+        image::imageops::crop_imm(&resized, x, y, target_w, target_h)
+            .to_image()
+            .into_raw()
+    } else {
+        let mut canvas = image::RgbaImage::new(target_w, target_h);
+        let x = target_w.saturating_sub(resized_w) / 2;
+        let y = target_h.saturating_sub(resized_h) / 2;
+        image::imageops::overlay(&mut canvas, &resized, i64::from(x), i64::from(y));
+        canvas.into_raw()
+    };
+    Some(RawFrame {
+        rgba,
+        width: target_w as i32,
+        height: target_h as i32,
+        delay_ms: frame.delay_ms,
     })
 }
 
@@ -387,5 +446,45 @@ fn expand_to_rgba(
             Some(rgba)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn striped_frame() -> RawFrame {
+        let mut rgba = Vec::new();
+        for _ in 0..2 {
+            for value in [10, 20, 30, 40] {
+                rgba.extend_from_slice(&[value, 0, 0, 255]);
+            }
+        }
+        RawFrame {
+            rgba,
+            width: 4,
+            height: 2,
+            delay_ms: 75,
+        }
+    }
+
+    #[test]
+    fn cover_produces_exact_center_cropped_canvas() {
+        let frame = fit_frame(striped_frame(), 2, 2, true).unwrap();
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.rgba.len(), 2 * 2 * 4);
+        assert_eq!(frame.rgba[0], 20);
+        assert_eq!(frame.rgba[4], 30);
+        assert_eq!(frame.delay_ms, 75);
+    }
+
+    #[test]
+    fn contain_produces_exact_transparent_letterbox_canvas() {
+        let frame = fit_frame(striped_frame(), 4, 4, false).unwrap();
+        assert_eq!((frame.width, frame.height), (4, 4));
+        assert_eq!(frame.rgba.len(), 4 * 4 * 4);
+        assert_eq!(frame.rgba[3], 0);
+        assert_eq!(frame.rgba[(4 * 4) + 3], 255);
+        assert_eq!(frame.rgba[(3 * 4 * 4) + 3], 0);
     }
 }
