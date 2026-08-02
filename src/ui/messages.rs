@@ -53,9 +53,15 @@ pub(super) fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     }
 
     let chat_mid = state.current_chat.borrow().clone();
+    let render_gen = *state.message_render_gen.borrow();
     let state_c = state.clone();
     let batch = Rc::new(RefCell::new(messages));
     glib::idle_add_local(move || {
+        if state_c.current_chat.borrow().as_ref() != chat_mid.as_ref()
+            || *state_c.message_render_gen.borrow() != render_gen
+        {
+            return glib::ControlFlow::Break;
+        }
         let mut left = batch.borrow_mut();
         let take = left.len().min(14);
         if take == 0 {
@@ -181,7 +187,8 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
     let waiting_visual = (msg.content_type.eq_ignore_ascii_case("image")
         || msg.content_type.eq_ignore_ascii_case("sticker")
         || msg.content_type.eq_ignore_ascii_case("video"))
-        && !has_image;
+        && !has_image
+        && !msg.media_failed;
     let is_audio = msg.content_type.eq_ignore_ascii_case("audio");
     let is_file = msg.content_type.eq_ignore_ascii_case("file");
     let is_video = msg.content_type.eq_ignore_ascii_case("video");
@@ -254,6 +261,19 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             } else {
                 bubble.append(&pic);
             }
+        }
+    } else if msg.media_failed && (is_image || is_video || is_sticker) {
+        if is_video {
+            append_video_placeholder(state, &bubble, msg, true);
+        } else {
+            bubble.append(
+                &gtk::Label::builder()
+                    .label(crate::i18n::t("media_download_failed"))
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["dim-label", "line-media-failed"])
+                    .build(),
+            );
         }
     } else if waiting_visual {
         if is_video {
@@ -368,18 +388,25 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         bubble_line.append(&time);
         sender_col.append(&bubble_line);
 
-        let avatar_btn = gtk::Button::builder()
+        // Keep the sender avatar in its own non-expanding slot. GtkButton's
+        // width/height requests are minimums, so an intrinsically large image
+        // could make the whole button grow on media-message rows.
+        let avatar_slot = gtk::Overlay::builder()
             .width_request(38)
             .height_request(38)
+            .hexpand(false)
+            .vexpand(false)
+            .halign(gtk::Align::Start)
             .valign(gtk::Align::Start)
             .tooltip_text(if msg.sender_name.is_empty() {
                 msg.from.clone()
             } else {
                 msg.sender_name.clone()
             })
-            .css_classes(["flat", "circular", "line-msg-avatar-btn"])
+            .css_classes(["line-msg-avatar-slot"])
             .build();
-        avatar_btn.set_overflow(gtk::Overflow::Hidden);
+        avatar_slot.set_overflow(gtk::Overflow::Hidden);
+        avatar_slot.set_cursor_from_name(Some("pointer"));
         if let Some(path) = msg
             .sender_avatar_path
             .as_deref()
@@ -390,27 +417,37 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
                 .can_shrink(true)
                 .width_request(34)
                 .height_request(34)
+                .hexpand(false)
+                .vexpand(false)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
                 .css_classes(["line-msg-avatar"])
                 .build();
             avatar.set_overflow(gtk::Overflow::Hidden);
             attach_avatar_texture_async(avatar.clone(), path.to_string(), 34);
-            avatar_btn.set_child(Some(&avatar));
+            avatar_slot.set_child(Some(&avatar));
         } else {
-            avatar_btn.set_child(Some(
+            avatar_slot.set_child(Some(
                 &gtk::Image::builder()
                     .icon_name("avatar-default-symbolic")
                     .pixel_size(24)
+                    .hexpand(false)
+                    .vexpand(false)
+                    .halign(gtk::Align::Center)
+                    .valign(gtk::Align::Center)
                     .build(),
             ));
         }
         {
             let state = state.clone();
             let profile = msg.clone();
-            avatar_btn.connect_clicked(move |_| {
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
                 open_sender_profile(&state, &profile);
             });
+            avatar_slot.add_controller(click);
         }
-        outer.append(&avatar_btn);
+        outer.append(&avatar_slot);
         outer.append(&sender_col);
         outer.append(&gtk::Box::builder().hexpand(true).build());
     }
@@ -893,12 +930,18 @@ pub(super) fn append_voice_card(
     let play = gtk::Button::builder()
         .icon_name(if has_audio {
             "media-playback-start-symbolic"
+        } else if msg.media_failed {
+            "dialog-error-symbolic"
         } else {
             "content-loading-symbolic"
         })
         .sensitive(has_audio)
         .css_classes(["circular", "line-voice-play"])
-        .tooltip_text(crate::i18n::t("play_voice"))
+        .tooltip_text(if msg.media_failed {
+            crate::i18n::t("media_download_failed")
+        } else {
+            crate::i18n::t("play_voice")
+        })
         .build();
 
     let peaks = Rc::new(RefCell::new(placeholder_peaks(36)));
@@ -940,6 +983,8 @@ pub(super) fn append_voice_card(
         format_voice_duration(duration_ms)
     } else if has_audio {
         "--:--".into()
+    } else if msg.media_failed {
+        crate::i18n::t("media_download_failed")
     } else {
         crate::i18n::t("loading_voice")
     };
@@ -1445,9 +1490,10 @@ pub(super) fn spawn_audio_player(
     };
     let gain = gain.clamp(0.0, 2.5);
     let mpv_vol = (gain * 100.0).round().clamp(0.0, 250.0);
+    let mut failures = Vec::new();
 
     let mut mpv = std::process::Command::new("mpv");
-    mpv.args(["--no-video", "--really-quiet"]);
+    mpv.args(["--no-config", "--no-video", "--really-quiet"]);
     mpv.arg(format!("--volume={mpv_vol}"));
     if let Some(ref s) = sink {
         mpv.arg(format!("--audio-device=pulse/{s}"));
@@ -1455,8 +1501,12 @@ pub(super) fn spawn_audio_player(
     mpv.arg(path);
     mpv.stdout(std::process::Stdio::null());
     mpv.stderr(std::process::Stdio::null());
-    if let Ok(child) = mpv.spawn() {
-        return Ok(child);
+    match mpv.spawn() {
+        Ok(child) => match verify_audio_child(child, "mpv") {
+            Ok(child) => return Ok(child),
+            Err(error) => failures.push(error),
+        },
+        Err(error) => failures.push(format!("mpv: {error}")),
     }
 
     let mut ff = std::process::Command::new("ffplay");
@@ -1465,13 +1515,19 @@ pub(super) fn spawn_audio_player(
         ff.args(["-af", &format!("volume={gain}")]);
     }
     if let Some(ref s) = sink {
-        ff.args(["-audiodevice", s]);
+        // ffplay uses SDL; PULSE_SINK is understood when its Pulse/PipeWire
+        // backend is active, while `-audiodevice` is not a portable ffplay flag.
+        ff.env("PULSE_SINK", s);
     }
     ff.arg(path);
     ff.stdout(std::process::Stdio::null());
     ff.stderr(std::process::Stdio::null());
-    if let Ok(child) = ff.spawn() {
-        return Ok(child);
+    match ff.spawn() {
+        Ok(child) => match verify_audio_child(child, "ffplay") {
+            Ok(child) => return Ok(child),
+            Err(error) => failures.push(error),
+        },
+        Err(error) => failures.push(format!("ffplay: {error}")),
     }
 
     if (gain - 1.0).abs() < 0.01 {
@@ -1482,12 +1538,39 @@ pub(super) fn spawn_audio_player(
         paplay.arg(path);
         paplay.stdout(std::process::Stdio::null());
         paplay.stderr(std::process::Stdio::null());
-        if let Ok(child) = paplay.spawn() {
-            return Ok(child);
+        match paplay.spawn() {
+            Ok(child) => match verify_audio_child(child, "paplay") {
+                Ok(child) => return Ok(child),
+                Err(error) => failures.push(error),
+            },
+            Err(error) => failures.push(format!("paplay: {error}")),
         }
     }
 
-    Err("no audio player (mpv/ffplay)".into())
+    Err(if failures.is_empty() {
+        "no audio player (mpv/ffplay/paplay)".into()
+    } else {
+        failures.join("; ")
+    })
+}
+
+fn verify_audio_child(
+    mut child: std::process::Child,
+    player: &str,
+) -> Result<std::process::Child, String> {
+    // spawn() only confirms that the executable was found. Broken shared
+    // libraries or an invalid audio backend make it exit immediately; detect
+    // that and continue to the next player instead of showing fake playback.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    match child.try_wait() {
+        Ok(None) => Ok(child),
+        Ok(Some(status)) => Err(format!("{player} exited immediately ({status})")),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("{player}: {error}"))
+        }
+    }
 }
 
 pub(super) fn filter_chats(state: &AppState, query: &str) {
@@ -1650,6 +1733,8 @@ pub(super) fn append_link_chips(_state: &AppState, bubble: &gtk::Box, text: &str
 }
 
 pub(super) fn clear_messages(state: &AppState) {
+    let next_render_gen = state.message_render_gen.borrow().wrapping_add(1);
+    *state.message_render_gen.borrow_mut() = next_render_gen;
     stop_voice_playback(state);
     state.message_list.clear();
     state.media_slots.borrow_mut().clear();

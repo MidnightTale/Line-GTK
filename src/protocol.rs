@@ -123,6 +123,8 @@ pub struct MessageInfo {
     pub file_path: Option<String>,
     #[serde(rename = "durationMs", default)]
     pub duration_ms: Option<i64>,
+    #[serde(rename = "mediaFailed", default)]
+    pub media_failed: bool,
     #[serde(default)]
     pub flex: Option<FlexInfo>,
     #[serde(default)]

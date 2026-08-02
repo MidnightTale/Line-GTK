@@ -814,7 +814,10 @@ export function createCommandService(runtime: CommandRuntime) {
       }
     }
     await publishMessageHistory(chatMid, entry, "complete");
-    void hydrateMedia(entry.messages.slice(-200), chatMid);
+    void hydrateMedia(
+      await forUiMessages(entry.messages.slice(-200)),
+      chatMid,
+    );
   }
 
   async function syncSquareHistory(
@@ -857,7 +860,10 @@ export function createCommandService(runtime: CommandRuntime) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     await publishMessageHistory(chatMid, entry, "complete");
-    void hydrateMedia(entry.messages.slice(-200), chatMid);
+    void hydrateMedia(
+      await forUiMessages(entry.messages.slice(-200)),
+      chatMid,
+    );
   }
 
   async function doFetchMessages(
@@ -895,8 +901,9 @@ export function createCommandService(runtime: CommandRuntime) {
         await saveDiskMessages(chatMid, entry);
       }
 
+      const uiMessages = await forUiMessages(entry.messages);
       ok(id, {
-        messages: await forUiMessages(entry.messages),
+        messages: uiMessages,
         cached: !force,
         historyComplete: !!entry.historyComplete,
       });
@@ -905,7 +912,7 @@ export function createCommandService(runtime: CommandRuntime) {
         chatMid,
         state: entry.messages.length ? "ready" : "empty",
       });
-      void hydrateMedia(entry.messages.slice(-200), chatMid);
+      void hydrateMedia(uiMessages.slice(-200), chatMid);
 
       const sync = squareChatIndex.has(chatMid) || chatMid.startsWith("m")
         ? () => syncSquareHistory(chatMid, entry!)

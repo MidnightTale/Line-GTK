@@ -30,9 +30,9 @@ pub(super) fn image_looks_low_res(path: &str) -> bool {
     if is_thumb_media_path(path) {
         return true;
     }
-    match gdk_pixbuf::Pixbuf::from_file(path) {
-        Ok(pb) => pb.width() <= 512 && pb.height() <= 512,
-        Err(_) => false,
+    match gdk_pixbuf::Pixbuf::file_info(path) {
+        Some((_, width, height)) => width <= 512 && height <= 512,
+        None => false,
     }
 }
 
@@ -275,6 +275,243 @@ pub(super) fn wire_media_open_click(
     wire_media_open_click_widget(state, pic.upcast_ref::<gtk::Widget>(), msg);
 }
 
+#[derive(Clone)]
+struct ViewerMediaItem {
+    path: String,
+    content_type: String,
+    name: String,
+}
+
+fn normalized_media_path(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+fn image_gallery_items(
+    state: &AppState,
+    current: ViewerMediaItem,
+) -> (Vec<ViewerMediaItem>, usize) {
+    let mut messages: Vec<MessageInfo> = state
+        .media_msgs
+        .borrow()
+        .values()
+        .filter(|message| message.content_type.eq_ignore_ascii_case("image"))
+        .cloned()
+        .collect();
+    messages.sort_by_key(|message| message.created_time);
+
+    let mut items = Vec::<ViewerMediaItem>::new();
+    let mut positions = HashMap::<PathBuf, usize>::new();
+    let mut current_index = None;
+    let current_path = normalized_media_path(&current.path);
+    for message in messages {
+        let Some(path) = local_media_path(&message, true) else {
+            continue;
+        };
+        let normalized = normalized_media_path(&path);
+        if let Some(index) = positions.get(&normalized).copied() {
+            if normalized == current_path {
+                current_index = Some(index);
+            }
+            continue;
+        }
+        let index = items.len();
+        positions.insert(normalized.clone(), index);
+        if normalized == current_path {
+            current_index = Some(index);
+        }
+        let name = suggest_media_name(&message);
+        items.push(ViewerMediaItem {
+            path,
+            content_type: message.content_type,
+            name,
+        });
+    }
+
+    let index = current_index.unwrap_or_else(|| {
+        let index = items.len();
+        items.push(current);
+        index
+    });
+    (items, index)
+}
+
+fn adjacent_image_index(current: usize, length: usize, delta: isize) -> Option<usize> {
+    let next = current.checked_add_signed(delta)?;
+    (next < length).then_some(next)
+}
+
+fn clear_viewer_box(box_: &gtk::Box) {
+    while let Some(child) = box_.first_child() {
+        box_.remove(&child);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_image_gallery_item(
+    state: &AppState,
+    win: &gtk::Window,
+    tools: &gtk::Box,
+    body: &gtk::Box,
+    title: &gtk::Label,
+    previous: &gtk::Button,
+    next: &gtk::Button,
+    items: &[ViewerMediaItem],
+    index: usize,
+    current_item: &Rc<RefCell<ViewerMediaItem>>,
+) {
+    let Some(item) = items.get(index).cloned() else {
+        return;
+    };
+    clear_viewer_box(tools);
+    clear_viewer_box(body);
+    if items.len() > 1 {
+        title.set_label(&format!("{} · {}/{}", item.name, index + 1, items.len()));
+    } else {
+        title.set_label(&item.name);
+    }
+    previous.set_sensitive(index > 0);
+    next.set_sensitive(index + 1 < items.len());
+    *current_item.borrow_mut() = item.clone();
+    append_image_viewer(state, tools, body, &item.path, win);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_image_gallery(
+    state: &AppState,
+    win: &gtk::Window,
+    tools: &gtk::Box,
+    body: &gtk::Box,
+    title: &gtk::Label,
+    previous: &gtk::Button,
+    next: &gtk::Button,
+    current_item: Rc<RefCell<ViewerMediaItem>>,
+) {
+    let (items, initial_index) = image_gallery_items(state, current_item.borrow().clone());
+    let items = Rc::new(items);
+    let index = Rc::new(std::cell::Cell::new(initial_index));
+    let show_navigation = items.len() > 1;
+    previous.set_visible(show_navigation);
+    next.set_visible(show_navigation);
+    render_image_gallery_item(
+        state,
+        win,
+        tools,
+        body,
+        title,
+        previous,
+        next,
+        &items,
+        initial_index,
+        &current_item,
+    );
+
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let tools = tools.clone();
+        let body = body.clone();
+        let title = title.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let items = items.clone();
+        let index = index.clone();
+        let current_item = current_item.clone();
+        previous.clone().connect_clicked(move |_| {
+            let Some(target) = adjacent_image_index(index.get(), items.len(), -1) else {
+                return;
+            };
+            index.set(target);
+            render_image_gallery_item(
+                &state,
+                &win,
+                &tools,
+                &body,
+                &title,
+                &previous,
+                &next,
+                &items,
+                target,
+                &current_item,
+            );
+        });
+    }
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let tools = tools.clone();
+        let body = body.clone();
+        let title = title.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let items = items.clone();
+        let index = index.clone();
+        let current_item = current_item.clone();
+        next.clone().connect_clicked(move |_| {
+            let Some(target) = adjacent_image_index(index.get(), items.len(), 1) else {
+                return;
+            };
+            index.set(target);
+            render_image_gallery_item(
+                &state,
+                &win,
+                &tools,
+                &body,
+                &title,
+                &previous,
+                &next,
+                &items,
+                target,
+                &current_item,
+            );
+        });
+    }
+
+    let controller = gtk::EventControllerKey::new();
+    {
+        let state = state.clone();
+        let win = win.clone();
+        let tools = tools.clone();
+        let body = body.clone();
+        let title = title.clone();
+        let previous = previous.clone();
+        let next = next.clone();
+        let items = items.clone();
+        let index = index.clone();
+        controller.connect_key_pressed(move |_, key, _, modifiers| {
+            if modifiers.intersects(
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SUPER_MASK,
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            let delta = match key {
+                gdk::Key::Left | gdk::Key::KP_Left => -1,
+                gdk::Key::Right | gdk::Key::KP_Right => 1,
+                _ => return glib::Propagation::Proceed,
+            };
+            let Some(target) = adjacent_image_index(index.get(), items.len(), delta) else {
+                return glib::Propagation::Stop;
+            };
+            index.set(target);
+            render_image_gallery_item(
+                &state,
+                &win,
+                &tools,
+                &body,
+                &title,
+                &previous,
+                &next,
+                &items,
+                target,
+                &current_item,
+            );
+            glib::Propagation::Stop
+        });
+    }
+    win.add_controller(controller);
+}
+
 pub(super) fn open_media_viewer(
     state: &AppState,
     path: &str,
@@ -320,6 +557,22 @@ pub(super) fn open_media_viewer(
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["heading"])
         .build();
+    let previous = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text(crate::i18n::t("media_previous_image"))
+        .css_classes(["flat", "circular"])
+        .visible(false)
+        .build();
+    let next = gtk::Button::builder()
+        .icon_name("go-next-symbolic")
+        .tooltip_text(crate::i18n::t("media_next_image"))
+        .css_classes(["flat", "circular"])
+        .visible(false)
+        .build();
+    let image_tools = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
 
     let open_ext = gtk::Button::builder()
         .icon_name("document-open-symbolic")
@@ -336,7 +589,10 @@ pub(super) fn open_media_viewer(
         .tooltip_text(crate::i18n::t("media_close"))
         .css_classes(["flat", "circular"])
         .build();
+    bar.append(&previous);
+    bar.append(&next);
     bar.append(&title);
+    bar.append(&image_tools);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -347,12 +603,26 @@ pub(super) fn open_media_viewer(
         .css_classes(["line-media-viewer-body"])
         .build();
 
+    let current_item = Rc::new(RefCell::new(ViewerMediaItem {
+        path: path.to_string(),
+        content_type: content_type.to_string(),
+        name: suggest_name.to_string(),
+    }));
     match kind {
         ViewerKind::Video => {
             append_gpu_video_viewer(&body, path);
         }
         ViewerKind::Image => {
-            append_image_viewer(state, &bar, &body, path, &win);
+            install_image_gallery(
+                state,
+                &win,
+                &image_tools,
+                &body,
+                &title,
+                &previous,
+                &next,
+                current_item.clone(),
+            );
         }
         ViewerKind::Pdf => {
             append_pdf_viewer(&body, path, suggest_name);
@@ -380,18 +650,17 @@ pub(super) fn open_media_viewer(
         close.connect_clicked(move |_| w.close());
     }
     {
-        let path = path.to_string();
+        let current_item = current_item.clone();
         open_ext.connect_clicked(move |_| {
-            open_path_externally(&path);
+            open_path_externally(&current_item.borrow().path);
         });
     }
     {
         let s = state.clone();
-        let path = path.to_string();
-        let name = suggest_name.to_string();
-        let ct = content_type.to_string();
+        let current_item = current_item.clone();
         dl.connect_clicked(move |_| {
-            save_media_as(&s, &path, &name, &ct);
+            let item = current_item.borrow().clone();
+            save_media_as(&s, &item.path, &item.name, &item.content_type);
         });
     }
 
@@ -1960,4 +2229,18 @@ pub(super) fn pump_media_queue(state: &AppState) {
             pump_media_queue(&state3);
         });
     });
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::adjacent_image_index;
+
+    #[test]
+    fn image_navigation_stops_at_gallery_edges() {
+        assert_eq!(adjacent_image_index(1, 3, -1), Some(0));
+        assert_eq!(adjacent_image_index(1, 3, 1), Some(2));
+        assert_eq!(adjacent_image_index(0, 3, -1), None);
+        assert_eq!(adjacent_image_index(2, 3, 1), None);
+        assert_eq!(adjacent_image_index(0, 0, 1), None);
+    }
 }

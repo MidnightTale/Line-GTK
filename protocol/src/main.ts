@@ -1501,11 +1501,27 @@ async function hydrateMedia(
 
   const first = pending.slice(0, MEDIA_FIRST_BATCH);
   const rest = pending.slice(MEDIA_FIRST_BATCH);
+  let retryStateDirty = false;
 
   const failOne = (id: string) => {
     if (!stdoutAlive || workGen !== gen) return;
     if (!epochOk()) return;
+    const retryAfter = Date.now() + 6 * 60 * 60 * 1000;
+    const cached = msgCache.get(chatMid);
+    const row = cached?.messages.find((message) => String(message.id) === id);
+    if (row) {
+      row.mediaRetryAfter = retryAfter;
+      row.needsMedia = false;
+      retryStateDirty = true;
+    }
     emitEvent("media_failed", { chatMid, messageId: id });
+  };
+
+  const persistRetryState = async () => {
+    if (!retryStateDirty) return;
+    retryStateDirty = false;
+    const cached = msgCache.get(chatMid);
+    if (cached) await saveDiskMessages(chatMid, cached);
   };
 
   const work = async (m: Json) => {
@@ -1581,6 +1597,7 @@ async function hydrateMedia(
             if (row) {
               row.audioPath = audioPath;
               row.needsMedia = false;
+              delete row.mediaRetryAfter;
             }
           }
           emitEvent("media_ready", {
@@ -1689,6 +1706,7 @@ async function hydrateMedia(
           if (row) {
             row.imagePath = m.imagePath;
             row.needsMedia = false;
+            delete row.mediaRetryAfter;
             if (m.filePath) row.filePath = m.filePath;
           }
         }
@@ -1724,9 +1742,13 @@ async function hydrateMedia(
   };
 
   await mapPool(first, MEDIA_CONCURRENCY, (m) => work(m));
-  if (!epochOk()) return;
+  if (!epochOk()) {
+    await persistRetryState();
+    return;
+  }
   await sleep(120);
   await mapPool(rest, MEDIA_CONCURRENCY, (m) => work(m));
+  await persistRetryState();
 }
 
 async function hydratePreviews(chats: ChatRow[]) {

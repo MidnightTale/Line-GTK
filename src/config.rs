@@ -1,9 +1,28 @@
 use gtk::CssProvider;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatBackgroundConfig {
+    /// default | mint | ocean | dusk | graphite | custom
+    pub preset: String,
+    /// App-private cached image used only when preset == custom.
+    pub image_path: String,
+}
+
+impl Default for ChatBackgroundConfig {
+    fn default() -> Self {
+        Self {
+            preset: "default".into(),
+            image_path: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -27,6 +46,8 @@ pub struct AppConfig {
     pub last_chat_mid: String,
     /// Chats pinned to the top in this native client (also covers OpenChat).
     pub pinned_chats: Vec<String>,
+    /// Per-room wallpaper preferences, including OpenChat rooms.
+    pub chat_backgrounds: BTreeMap<String, ChatBackgroundConfig>,
     /// PulseAudio / PipeWire source name, or empty / "default".
     pub audio_input: String,
     /// PulseAudio / PipeWire sink name, or empty / "default".
@@ -79,6 +100,7 @@ impl Default for AppConfig {
             auto_mark_read: true,
             last_chat_mid: String::new(),
             pinned_chats: Vec::new(),
+            chat_backgrounds: BTreeMap::new(),
             audio_input: String::new(),
             audio_output: String::new(),
             call_mic_volume: 1.0,
@@ -176,6 +198,19 @@ impl AppConfig {
         self.pinned_chats.retain(|mid| !mid.trim().is_empty());
         self.pinned_chats.sort();
         self.pinned_chats.dedup();
+        self.chat_backgrounds
+            .retain(|mid, _| !mid.trim().is_empty());
+        for background in self.chat_backgrounds.values_mut() {
+            if !matches!(
+                background.preset.as_str(),
+                "default" | "mint" | "ocean" | "dusk" | "graphite" | "custom"
+            ) {
+                background.preset = "default".into();
+            }
+            if background.preset != "custom" {
+                background.image_path.clear();
+            }
+        }
     }
 
     /// Discord Application ID from settings, env, or the built-in default.
@@ -274,6 +309,20 @@ mod tests {
             notifications_muted_until: -1,
             ..AppConfig::default()
         };
+        cfg.chat_backgrounds.insert(
+            "room-invalid".into(),
+            ChatBackgroundConfig {
+                preset: "neon".into(),
+                image_path: "/tmp/should-be-cleared.png".into(),
+            },
+        );
+        cfg.chat_backgrounds.insert(
+            "room-custom".into(),
+            ChatBackgroundConfig {
+                preset: "custom".into(),
+                image_path: "/tmp/wallpaper.png".into(),
+            },
+        );
         cfg.normalize();
         assert_eq!(cfg.theme, "system");
         assert_eq!(cfg.language, "en");
@@ -283,6 +332,13 @@ mod tests {
         assert_eq!(cfg.call_mic_volume, 0.0);
         assert_eq!(cfg.sidebar_width, 520);
         assert_eq!(cfg.notifications_muted_until, 0);
+        let invalid = &cfg.chat_backgrounds["room-invalid"];
+        assert_eq!(invalid.preset, "default");
+        assert!(invalid.image_path.is_empty());
+        assert_eq!(
+            cfg.chat_backgrounds["room-custom"].image_path,
+            "/tmp/wallpaper.png"
+        );
     }
 
     #[test]

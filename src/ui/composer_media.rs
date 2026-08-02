@@ -689,15 +689,18 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
 
     let clipboard = state.composer.clipboard();
     let formats = clipboard.formats();
-    let has_files = formats.contains_type(gdk::FileList::static_type())
-        || formats.contain_mime_type("text/uri-list");
+    let has_file_list = formats.contains_type(gdk::FileList::static_type());
+    let has_uri_list = formats.contain_mime_type("text/uri-list");
     let has_image = formats.contains_type(gdk::Texture::static_type())
-        || formats.contain_mime_type("image/png")
-        || formats.contain_mime_type("image/jpeg")
-        || formats.contain_mime_type("image/bmp")
-        || formats.contain_mime_type("image/tiff");
+        || formats
+            .mime_types()
+            .iter()
+            .any(|mime| mime.as_str().starts_with("image/"));
 
-    if has_files {
+    // A browser often advertises both text/uri-list and image/png when copying
+    // a picture. Only prefer the file path route for a real GdkFileList;
+    // otherwise the URI is usually a remote web URL and silently yields no file.
+    if has_file_list {
         let s = state.clone();
         clipboard.read_value_async(
             gdk::FileList::static_type(),
@@ -715,36 +718,60 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
                             }
                         }
                         if paths.is_empty() {
-                            paste_clipboard_uri_list(&s);
+                            if has_image {
+                                paste_clipboard_image(&s);
+                            } else if has_uri_list {
+                                paste_clipboard_uri_list(&s);
+                            }
                         } else {
                             open_media_review(&s, paths);
                         }
                     } else {
+                        if has_image {
+                            paste_clipboard_image(&s);
+                        } else if has_uri_list {
+                            paste_clipboard_uri_list(&s);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if has_image {
+                        paste_clipboard_image(&s);
+                    } else if has_uri_list {
                         paste_clipboard_uri_list(&s);
                     }
                 }
-                Err(_) => paste_clipboard_uri_list(&s),
             },
         );
         return true;
     }
 
     if has_image {
-        let s = state.clone();
-        clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
-            Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
-                Ok(path) => open_media_review(&s, vec![path]),
-                Err(e) => toast(
-                    &s,
-                    &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
-                ),
-            },
-            _ => paste_clipboard_image_bytes(&s),
-        });
+        paste_clipboard_image(state);
+        return true;
+    }
+
+    if has_uri_list {
+        paste_clipboard_uri_list(state);
         return true;
     }
 
     false
+}
+
+fn paste_clipboard_image(state: &AppState) {
+    let clipboard = state.composer.clipboard();
+    let s = state.clone();
+    clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
+        Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
+            Ok(path) => open_media_review(&s, vec![path]),
+            Err(e) => toast(
+                &s,
+                &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+            ),
+        },
+        _ => paste_clipboard_image_bytes(&s),
+    });
 }
 
 pub(super) fn paste_clipboard_uri_list(state: &AppState) {
@@ -788,7 +815,16 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
     let clipboard = state.composer.clipboard();
     let s = state.clone();
     clipboard.read_async(
-        &["image/png", "image/jpeg", "image/bmp", "image/tiff"],
+        &[
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "image/avif",
+            "image/bmp",
+            "image/x-MS-bmp",
+            "image/tiff",
+        ],
         glib::Priority::DEFAULT,
         None::<&gio::Cancellable>,
         move |res| {
@@ -803,6 +839,12 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
             }
             let ext = if mime.as_str().contains("jpeg") {
                 "jpg"
+            } else if mime.as_str().contains("webp") {
+                "webp"
+            } else if mime.as_str().contains("gif") {
+                "gif"
+            } else if mime.as_str().contains("avif") {
+                "avif"
             } else if mime.as_str().contains("bmp") {
                 "bmp"
             } else if mime.as_str().contains("tiff") {

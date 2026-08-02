@@ -1,5 +1,72 @@
 use super::*;
 
+fn remember_message_snapshot(state: &AppState, chat_mid: &str, messages: &[MessageInfo]) {
+    state
+        .message_cache
+        .borrow_mut()
+        .insert(chat_mid.to_string(), messages.to_vec());
+}
+
+/// Merge one live row into the in-process cache. Returns true when this exact
+/// message id was already present (polling can deliver the same operation more
+/// than once during reconnect/recovery).
+fn remember_live_message(state: &AppState, chat_mid: &str, message: &MessageInfo) -> bool {
+    let mut cache = state.message_cache.borrow_mut();
+    let messages = cache.entry(chat_mid.to_string()).or_default();
+    if !message.id.is_empty()
+        && let Some(previous) = messages.iter_mut().find(|row| row.id == message.id)
+    {
+        let image_path = message
+            .image_path
+            .clone()
+            .or_else(|| previous.image_path.clone());
+        let audio_path = message
+            .audio_path
+            .clone()
+            .or_else(|| previous.audio_path.clone());
+        let file_path = message
+            .file_path
+            .clone()
+            .or_else(|| previous.file_path.clone());
+        *previous = MessageInfo {
+            image_path,
+            audio_path,
+            file_path,
+            ..message.clone()
+        };
+        return true;
+    }
+    messages.push(message.clone());
+    messages.sort_by_key(|row| row.created_time);
+    false
+}
+
+fn remember_media_paths(
+    state: &AppState,
+    chat_mid: &str,
+    message_id: &str,
+    image_path: &str,
+    audio_path: Option<&str>,
+    file_path: Option<&str>,
+) {
+    let mut cache = state.message_cache.borrow_mut();
+    let Some(message) = cache
+        .get_mut(chat_mid)
+        .and_then(|messages| messages.iter_mut().find(|row| row.id == message_id))
+    else {
+        return;
+    };
+    if !image_path.is_empty() {
+        message.image_path = Some(image_path.to_string());
+    }
+    if let Some(path) = audio_path {
+        message.audio_path = Some(path.to_string());
+    }
+    if let Some(path) = file_path {
+        message.file_path = Some(path.to_string());
+    }
+}
+
 pub(super) fn pump_events(state: AppState) {
     let rx = state.sidecar.events.clone();
     glib::spawn_future_local(async move {
@@ -147,6 +214,10 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             } else {
                 msg.from.clone()
             };
+            if remember_live_message(state, &peer, &msg) {
+                tracing::debug!(message_id = %msg.id, chat_mid = %peer, "ignored duplicate live message");
+                return;
+            }
             let mut preview = format!(
                 "{}: {}",
                 if msg.mine {
@@ -248,6 +319,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             apply_chats(state, chats, cached);
         }
         ProtocolEvent::Messages { chat_mid, messages } => {
+            remember_message_snapshot(state, &chat_mid, &messages);
             if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str()) {
                 apply_messages(state, messages);
             }
@@ -333,6 +405,14 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             audio_path,
             file_path,
         } => {
+            remember_media_paths(
+                state,
+                &chat_mid,
+                &message_id,
+                &image_path,
+                audio_path.as_deref(),
+                file_path.as_deref(),
+            );
             // Always remember hydrated paths so list rebuilds / late bubbles can attach.
             if !image_path.is_empty() && std::path::Path::new(&image_path).exists() {
                 state
@@ -629,15 +709,16 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     }
                 }
                 Some(Pending::FetchMessages { chat_mid }) => {
-                    if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str()) {
-                        let messages: Vec<MessageInfo> = result
-                            .get("messages")
-                            .cloned()
-                            .and_then(|v| serde_json::from_value(v).ok())
-                            .unwrap_or_default();
-                        if !same_message_list(state, &chat_mid, &messages) {
-                            apply_messages(state, messages);
-                        }
+                    let messages: Vec<MessageInfo> = result
+                        .get("messages")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    remember_message_snapshot(state, &chat_mid, &messages);
+                    if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str())
+                        && !same_message_list(state, &chat_mid, &messages)
+                    {
+                        apply_messages(state, messages);
                     }
                 }
                 Some(Pending::Send {
@@ -651,6 +732,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     if let Ok(msg) = serde_json::from_value::<MessageInfo>(
                         result.get("message").cloned().unwrap_or_default(),
                     ) {
+                        remember_live_message(state, &chat_mid, &msg);
                         if state.msg_stack.visible_child_name().as_deref() != Some("list") {
                             set_msg_state(state, "list", None);
                         }

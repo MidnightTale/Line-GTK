@@ -1,3 +1,4 @@
+mod backgrounds;
 mod call_window;
 mod calls;
 mod chats;
@@ -19,6 +20,7 @@ use crate::config::{AppConfig, apply_animations, apply_font, apply_theme};
 use crate::protocol::{ChatInfo, FlexAction, MessageInfo, Profile, ProtocolEvent};
 use crate::sidecar::Sidecar;
 use anyhow::Result;
+use backgrounds::*;
 use calls::*;
 use chats::*;
 use composer_media::*;
@@ -154,6 +156,8 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         media_msgs: Rc::new(RefCell::new(HashMap::new())),
         receipt_slots: Rc::new(RefCell::new(HashMap::new())),
         msg_created: Rc::new(RefCell::new(HashMap::new())),
+        message_cache: Rc::new(RefCell::new(HashMap::new())),
+        message_render_gen: Rc::new(RefCell::new(0)),
         last_msg_day: Rc::new(RefCell::new(None)),
         seen_msg_ids: Rc::new(RefCell::new(HashSet::new())),
         last_incoming_id: Rc::new(RefCell::new(None)),
@@ -196,6 +200,10 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         mute_btn: shell.mute_btn,
         pin_btn: shell.pin_btn,
         album_btn: shell.album_btn,
+        background_btn: shell.background_btn,
+        background_popover: shell.background_popover,
+        message_background_layer: shell.message_background_layer,
+        message_background_picture: shell.message_background_picture,
         composer_stack: shell.composer_stack,
         record_cancel_btn: shell.record_cancel_btn,
         record_send_btn: shell.record_send_btn,
@@ -226,7 +234,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         self_avatar_path: Rc::new(RefCell::new(None)),
         self_picture_url: Rc::new(RefCell::new(None)),
         msg_list_fp: Rc::new(RefCell::new(None)),
-        notif_pending: Rc::new(RefCell::new(HashMap::new())),
+        notified_msg_ids: Rc::new(RefCell::new(HashSet::new())),
         media_ready_paths: Rc::new(RefCell::new(HashMap::new())),
     };
 
@@ -1052,6 +1060,9 @@ fn apply_ui_language(state: &AppState) {
     state
         .album_btn
         .set_tooltip_text(Some(&crate::i18n::t("chat_album")));
+    state
+        .background_btn
+        .set_tooltip_text(Some(&crate::i18n::t("chat_background")));
     let pinned = state
         .current_chat
         .borrow()
@@ -1237,7 +1248,9 @@ fn wire_actions(state: &AppState) {
             glib::Propagation::Proceed
         }
     });
-    state.composer.add_controller(paste);
+    // Capture at the window so pasting an image works even when the pointer or
+    // focus is in the message view. Plain text still propagates to the entry.
+    state.window.add_controller(paste);
 
     wire_drop_attachments(state);
 
@@ -1443,6 +1456,7 @@ fn wire_actions(state: &AppState) {
     state.album_btn.connect_clicked(move |_| {
         open_chat_album(&s);
     });
+    wire_chat_background_actions(state);
 }
 
 fn open_friends_popup(state: &AppState) {
@@ -1567,10 +1581,19 @@ fn open_chat(state: &AppState, chat: &ChatInfo) {
     state
         .album_btn
         .set_tooltip_text(Some(&crate::i18n::t("chat_album")));
+    state.background_btn.set_sensitive(true);
+    apply_chat_background(state, &chat.mid);
     state.media_queue.borrow_mut().clear();
-    set_msg_state(state, "loading", None);
-    clear_messages(state);
-    *state.msg_list_fp.borrow_mut() = None;
+    let memory_hit = state.message_cache.borrow().get(&chat.mid).cloned();
+    if let Some(messages) = memory_hit {
+        // Show the in-process cache now; the sidecar refresh below merges any
+        // newer server rows and keeps the durable JSON cache authoritative.
+        apply_messages(state, messages);
+    } else {
+        set_msg_state(state, "loading", None);
+        clear_messages(state);
+        *state.msg_list_fp.borrow_mut() = None;
+    }
     match state.sidecar.fetch_messages(&chat.mid, 200) {
         Ok(id) => {
             state.pending.borrow_mut().insert(

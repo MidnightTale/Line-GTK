@@ -41,6 +41,16 @@ export function createListener(runtime: ListenerRuntime) {
     upsertChatFromContact,
     emitEvent,
   } = runtime;
+  const seenLiveMessageIds = new Set<string>();
+
+  function isDuplicateLiveMessage(message: Json): boolean {
+    const id = String(message.id ?? "");
+    if (!id) return false;
+    if (seenLiveMessageIds.has(id)) return true;
+    if (seenLiveMessageIds.size >= 4096) seenLiveMessageIds.clear();
+    seenLiveMessageIds.add(id);
+    return false;
+  }
 
   function startListen() {
     const client = runtime.getClient();
@@ -52,6 +62,7 @@ export function createListener(runtime: ListenerRuntime) {
       try {
         const tm = msg as TalkMessage;
         const message = await summarizeTalkMessage(tm, { withMedia: false });
+        if (isDuplicateLiveMessage(message)) return;
         const peer = talkChatMid(message);
         if (!peer) return;
         message.chatMid = peer;
@@ -108,6 +119,7 @@ export function createListener(runtime: ListenerRuntime) {
         const message = await summarizeSquareMessage(msg, {
           withMedia: false,
         });
+        if (isDuplicateLiveMessage(message)) return;
         const chatMid = String(message.chatMid ?? message.to ?? "");
         if (!chatMid) return;
         void runtime.cacheMessage(chatMid, message).catch((error) =>

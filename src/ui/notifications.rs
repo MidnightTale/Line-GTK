@@ -1,4 +1,4 @@
-use super::{AppState, PendingNotif, notifications_allowed, preview_body_ui};
+use super::{AppState, notifications_allowed, preview_body_ui};
 use crate::desktop_notify::ChatNotification;
 use crate::protocol::MessageInfo;
 use gtk::gio;
@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 
 pub(super) fn notify_incoming(state: &AppState, msg: &MessageInfo, peer_mid: &str) {
     if !notifications_allowed(state) {
+        return;
+    }
+    // Polling/recovery can surface the same operation repeatedly. Keep the
+    // notification id as a one-shot guard instead of asking the desktop daemon
+    // to replace/re-pop the same banner several times.
+    if !msg.id.is_empty() && state.notified_msg_ids.borrow().contains(&msg.id) {
         return;
     }
     let muted = state
@@ -34,19 +40,11 @@ pub(super) fn notify_incoming(state: &AppState, msg: &MessageInfo, peer_mid: &st
         .map(str::to_string);
 
     if !msg.id.is_empty() {
-        let mut pending = state.notif_pending.borrow_mut();
-        if pending.len() > 64 {
-            pending.clear();
+        let mut notified = state.notified_msg_ids.borrow_mut();
+        if notified.len() >= 1024 {
+            notified.clear();
         }
-        pending.insert(
-            msg.id.clone(),
-            PendingNotif {
-                chat_mid: peer_mid.to_string(),
-                title: name.clone(),
-                body: body.clone(),
-                avatar_path: avatar_path.clone(),
-            },
-        );
+        notified.insert(msg.id.clone());
     }
 
     send_desktop_notification(
@@ -67,41 +65,10 @@ pub(super) fn notify_incoming(state: &AppState, msg: &MessageInfo, peer_mid: &st
     }
 }
 
-pub(super) fn refresh_notification_media(state: &AppState, message_id: &str, image_path: &str) {
-    if !notifications_allowed(state) {
-        return;
-    }
-    let Some(meta) = state.notif_pending.borrow().get(message_id).cloned() else {
-        return;
-    };
-    let muted = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == meta.chat_mid)
-        .map(|c| c.muted)
-        .unwrap_or(false);
-    if muted {
-        return;
-    }
-    let viewing = state.current_chat.borrow().as_deref() == Some(meta.chat_mid.as_str());
-    if viewing && state.window.is_active() {
-        state.notif_pending.borrow_mut().remove(message_id);
-        return;
-    }
-
-    send_desktop_notification(
-        state,
-        ChatNotification {
-            title: &meta.title,
-            body: &meta.body,
-            avatar_path: meta.avatar_path.as_deref(),
-            image_path: Some(image_path),
-            chat_mid: &meta.chat_mid,
-            message_id,
-            suppress_sound: true,
-        },
-    );
+pub(super) fn refresh_notification_media(_state: &AppState, _message_id: &str, _image_path: &str) {
+    // Intentionally do not resend when a photo/sticker finishes downloading.
+    // Several notification servers present a replacement as a fresh banner,
+    // which made one LINE message appear two or three times.
 }
 
 fn send_desktop_notification(state: &AppState, request: ChatNotification<'_>) {

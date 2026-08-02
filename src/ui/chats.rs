@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bool) {
+    // Removing a selected row makes GtkListBox try to focus a row that has
+    // already been detached. Clear selection before the rebuild.
+    state.chat_list.unselect_all();
     clear_list(&state.chat_list);
     state.chat_avatars.borrow_mut().clear();
     state.chat_previews.borrow_mut().clear();
@@ -23,6 +26,7 @@ pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bo
 
     for chat in &chats {
         let (row, avatar, preview, badge) = build_chat_row(chat, *state.sidebar_compact.borrow());
+        wire_chat_row_context_menu(state, &row, chat);
         state
             .chat_avatars
             .borrow_mut()
@@ -69,8 +73,6 @@ pub(super) fn select_sidebar_chat(state: &AppState, mid: Option<&str>) {
     };
     if let Some(row) = state.chat_list.row_at_index(pos as i32) {
         state.chat_list.select_row(Some(&row));
-        // Ensure the selected row is scrolled into view.
-        row.grab_focus();
     }
 }
 
@@ -130,6 +132,7 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
     }
 
     let (row, avatar, preview, badge) = build_chat_row(&chat, *state.sidebar_compact.borrow());
+    wire_chat_row_context_menu(state, &row, &chat);
     state.chat_avatars.borrow_mut().insert(mid.clone(), avatar);
     state
         .chat_previews
@@ -392,6 +395,82 @@ pub(super) fn build_chat_row(
     (row, avatar, preview, badge)
 }
 
+fn wire_chat_row_context_menu(state: &AppState, row: &gtk::ListBoxRow, chat: &ChatInfo) {
+    let popover = gtk::Popover::builder()
+        .autohide(true)
+        .has_arrow(false)
+        .position(gtk::PositionType::Right)
+        .build();
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .css_classes(["line-chat-context-menu"])
+        .build();
+    let pin = gtk::Button::builder()
+        .halign(gtk::Align::Fill)
+        .css_classes(["flat", "line-chat-context-action"])
+        .build();
+    let pin_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    pin_content.append(
+        &gtk::Image::builder()
+            .icon_name(if chat.pinned {
+                "starred-symbolic"
+            } else {
+                "non-starred-symbolic"
+            })
+            .build(),
+    );
+    pin_content.append(
+        &gtk::Label::builder()
+            .label(crate::i18n::t(if chat.pinned {
+                "unpin_chat"
+            } else {
+                "pin_chat"
+            }))
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    pin.set_child(Some(&pin_content));
+    menu.append(&pin);
+    popover.set_child(Some(&menu));
+    popover.set_parent(row);
+
+    {
+        let state = state.clone();
+        let mid = chat.mid.clone();
+        let popover = popover.clone();
+        pin.connect_clicked(move |_| {
+            popover.popdown();
+            toggle_chat_pin_mid(&state, &mid);
+        });
+    }
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    let popover_click = popover.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        popover_click.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover_click.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    row.add_controller(click);
+
+    let popover_cleanup = popover.clone();
+    row.connect_unrealize(move |_| {
+        if popover_cleanup.parent().is_some() {
+            popover_cleanup.unparent();
+        }
+    });
+}
+
 pub(super) fn format_activity(ts: i64) -> String {
     if ts <= 0 {
         return String::new();
@@ -543,6 +622,10 @@ pub(super) fn toggle_chat_pin(state: &AppState) {
     let Some(mid) = state.current_chat.borrow().clone() else {
         return;
     };
+    toggle_chat_pin_mid(state, &mid);
+}
+
+pub(super) fn toggle_chat_pin_mid(state: &AppState, mid: &str) {
     let next = !state
         .chats
         .borrow()
@@ -552,9 +635,9 @@ pub(super) fn toggle_chat_pin(state: &AppState) {
         .unwrap_or(false);
     {
         let mut config = state.config.borrow_mut();
-        config.pinned_chats.retain(|item| item != &mid);
+        config.pinned_chats.retain(|item| item != mid);
         if next {
-            config.pinned_chats.push(mid.clone());
+            config.pinned_chats.push(mid.to_string());
         }
         config.save(&state.data_dir);
     }
@@ -563,7 +646,9 @@ pub(super) fn toggle_chat_pin(state: &AppState) {
         chat.pinned = next;
     }
     apply_chats(state, chats, false);
-    update_pin_btn(state, next);
+    if state.current_chat.borrow().as_deref() == Some(mid) {
+        update_pin_btn(state, next);
+    }
 }
 
 pub(super) fn open_chat_album(state: &AppState) {
