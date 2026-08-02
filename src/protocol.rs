@@ -51,6 +51,8 @@ pub struct ChatInfo {
     pub preview: String,
     #[serde(rename = "muted", default)]
     pub muted: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,7 +77,17 @@ pub struct FlexInfo {
     pub actions: Vec<FlexAction>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MessageReactionInfo {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub mine: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct MessageInfo {
     #[serde(default)]
     pub id: String,
@@ -87,6 +99,16 @@ pub struct MessageInfo {
     pub to: String,
     #[serde(default)]
     pub mine: bool,
+    #[serde(rename = "chatMid", default)]
+    pub chat_mid: String,
+    #[serde(rename = "senderName", default)]
+    pub sender_name: String,
+    #[serde(rename = "senderAvatarPath", default)]
+    pub sender_avatar_path: Option<String>,
+    #[serde(rename = "senderStatusMessage", default)]
+    pub sender_status_message: String,
+    #[serde(rename = "senderKind", default)]
+    pub sender_kind: String,
     #[serde(rename = "createdTime", default)]
     pub created_time: i64,
     #[serde(rename = "contentType", default)]
@@ -103,6 +125,8 @@ pub struct MessageInfo {
     pub duration_ms: Option<i64>,
     #[serde(default)]
     pub flex: Option<FlexInfo>,
+    #[serde(default)]
+    pub reactions: Vec<MessageReactionInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +152,7 @@ pub enum ProtocolEvent {
         pin: String,
     },
     Listening,
-    Message(MessageInfo),
+    Message(Box<MessageInfo>),
     Chats {
         chats: Vec<ChatInfo>,
         cached: bool,
@@ -136,6 +160,9 @@ pub enum ProtocolEvent {
     Messages {
         chat_mid: String,
         messages: Vec<MessageInfo>,
+    },
+    StickersUpdated {
+        result: Value,
     },
     AvatarReady {
         mid: String,
@@ -198,6 +225,11 @@ pub enum ProtocolEvent {
         peer: String,
         state: String,
         error: Option<String>,
+        video_capable: bool,
+    },
+    ScreenShareState {
+        state: String,
+        error: Option<String>,
     },
     Response {
         id: u64,
@@ -230,6 +262,7 @@ mod tests {
         assert_eq!(message.text, "hello");
         assert_eq!(message.created_time, 0);
         assert!(!message.mine);
+        assert!(message.sender_name.is_empty());
         assert!(message.image_path.is_none());
     }
 

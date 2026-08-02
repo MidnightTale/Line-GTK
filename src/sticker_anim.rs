@@ -145,6 +145,29 @@ fn decode_static(path: &str, max_px: i32) -> Option<AnimFrames> {
     })
 }
 
+/// Decode a profile image into an exact, center-cropped RGBA square. Only the
+/// Send-safe raw bytes leave the worker thread; GTK objects stay on GTK's thread.
+pub fn load_square(path: &str, size_px: i32) -> Option<RawFrame> {
+    with_decode_slot(|| {
+        let size_px = size_px.max(1);
+        let source = Pixbuf::from_file(path).ok()?;
+        let side = source.width().min(source.height());
+        if side <= 0 {
+            return None;
+        }
+        let x = (source.width() - side) / 2;
+        let y = (source.height() - side) / 2;
+        let square = source.new_subpixbuf(x, y, side, side);
+        let scaled = square.scale_simple(size_px, size_px, gdk_pixbuf::InterpType::Bilinear)?;
+        Some(RawFrame {
+            rgba: pixbuf_to_rgba(&scaled)?,
+            width: size_px,
+            height: size_px,
+            delay_ms: 0,
+        })
+    })
+}
+
 fn pixbuf_to_rgba(pb: &Pixbuf) -> Option<Vec<u8>> {
     let w = pb.width() as usize;
     let h = pb.height() as usize;

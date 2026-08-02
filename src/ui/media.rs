@@ -1131,6 +1131,7 @@ pub(super) fn send_local_image_file(state: &AppState, path: &std::path::Path) ->
                     file_path: Some(path_str),
                     duration_ms: None,
                     flex: None,
+                    ..Default::default()
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));
@@ -1777,6 +1778,30 @@ pub(super) fn apply_frames_to_picture(
 
 pub(super) fn attach_texture_async(picture: gtk::Picture, path: String, max_px: i32) {
     attach_texture_async_anim(picture, path, max_px, false);
+}
+
+/// Load a center-cropped square at its exact logical size. GtkPicture otherwise
+/// keeps the source texture's natural dimensions, so differently sized profile
+/// files can make nominally identical avatar rows allocate at different sizes.
+pub(super) fn attach_avatar_texture_async(picture: gtk::Picture, path: String, size_px: i32) {
+    let size_px = size_px.max(1);
+    picture.set_width_request(size_px);
+    picture.set_height_request(size_px);
+    picture.set_hexpand(false);
+    picture.set_vexpand(false);
+    picture.set_overflow(gtk::Overflow::Hidden);
+
+    let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::RawFrame>>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(crate::sticker_anim::load_square(&path, size_px));
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(Some(frame)) = rx.recv().await
+            && let Some(pixbuf) = raw_frame_to_pixbuf(&frame)
+        {
+            picture.set_paintable(Some(&gdk::Texture::for_pixbuf(&pixbuf)));
+        }
+    });
 }
 
 pub(super) fn attach_texture_async_anim(

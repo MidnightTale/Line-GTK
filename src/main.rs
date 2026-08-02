@@ -11,6 +11,7 @@ mod ui;
 use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 fn main() -> Result<()> {
     let data_dir = dirs::data_dir()
@@ -24,7 +25,7 @@ fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(log_writer)
+        .with_writer(std::io::stderr.and(log_writer))
         .with_ansi(false)
         .init();
 

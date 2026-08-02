@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub auto_mark_read: bool,
     /// Last opened chat mid (restored on launch).
     pub last_chat_mid: String,
+    /// Chats pinned to the top in this native client (also covers OpenChat).
+    pub pinned_chats: Vec<String>,
     /// PulseAudio / PipeWire source name, or empty / "default".
     pub audio_input: String,
     /// PulseAudio / PipeWire sink name, or empty / "default".
@@ -35,7 +37,7 @@ pub struct AppConfig {
     pub call_spk_volume: f64,
     /// Chat list sidebar width in px (remembered across launches).
     pub sidebar_width: i32,
-    /// Unlock experimental voice calls (unstable; off by default).
+    /// Unlock voice calls. The LINE transport remains unofficial/experimental.
     pub experimental_calls: bool,
     /// Keep a StatusNotifierItem tray icon while running.
     pub tray_enabled: bool,
@@ -76,12 +78,13 @@ impl Default for AppConfig {
             notification_sound_volume: 1.0,
             auto_mark_read: true,
             last_chat_mid: String::new(),
+            pinned_chats: Vec::new(),
             audio_input: String::new(),
             audio_output: String::new(),
             call_mic_volume: 1.0,
             call_spk_volume: 1.0,
             sidebar_width: 320,
-            experimental_calls: false,
+            experimental_calls: true,
             tray_enabled: true,
             close_to_tray: true,
             discord_rpc: false,
@@ -170,6 +173,9 @@ impl AppConfig {
         self.call_spk_volume = finite_or(self.call_spk_volume, 1.0).clamp(0.0, 2.5);
         self.sidebar_width = self.sidebar_width.clamp(80, 520);
         self.notifications_muted_until = self.notifications_muted_until.max(0);
+        self.pinned_chats.retain(|mid| !mid.trim().is_empty());
+        self.pinned_chats.sort();
+        self.pinned_chats.dedup();
     }
 
     /// Discord Application ID from settings, env, or the built-in default.

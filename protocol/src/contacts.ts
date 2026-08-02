@@ -11,6 +11,16 @@ export function profileUrl(picturePath?: string | null): string | null {
   }${picturePath}`;
 }
 
+/** Convert an OpenChat OBS image hash into its public CDN object URL. */
+export function squareObsUrl(obsHash?: string | null): string | null {
+  const value = obsHash?.trim();
+  if (!value) return null;
+  if (value.startsWith("http")) return value;
+  // Appending a profile-style resize suffix makes current Square OBS objects
+  // return HTTP 400. The hash itself is the complete public object path.
+  return `https://obs.line-scdn.net/${value}`;
+}
+
 export function picturePathOf(
   profile: Record<string, unknown> | null | undefined,
 ): string | null {

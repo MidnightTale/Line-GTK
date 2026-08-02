@@ -105,6 +105,8 @@ pub(super) struct AppState {
     pub sticker_popover: gtk::Popover,
     pub call_btn: gtk::Button,
     pub mute_btn: gtk::Button,
+    pub pin_btn: gtk::Button,
+    pub album_btn: gtk::Button,
     pub composer_stack: gtk::Stack,
     pub record_cancel_btn: gtk::Button,
     pub record_send_btn: gtk::Button,
@@ -124,6 +126,8 @@ pub(super) struct AppState {
     pub call_ui: Rc<RefCell<Option<call_window::CallUi>>>,
     pub call_mic_muted: Rc<RefCell<bool>>,
     pub call_deafened: Rc<RefCell<bool>>,
+    pub call_video_capable: Rc<RefCell<bool>>,
+    pub call_screen_sharing: Rc<RefCell<bool>>,
     pub tray: Rc<RefCell<Option<crate::tray::TrayController>>>,
     pub tray_tx: async_channel::Sender<crate::tray::TrayAction>,
     pub discord: crate::discord_rpc::DiscordRpc,
@@ -146,6 +150,24 @@ pub(super) struct PendingNotif {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct ProfileChatTarget {
+    pub mid: String,
+    pub name: String,
+    pub avatar_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProfilePendingUi {
+    pub target: Rc<RefCell<ProfileChatTarget>>,
+    pub avatar: gtk::Picture,
+    pub name_label: gtk::Label,
+    pub bio_label: gtk::Label,
+    pub status: gtk::Label,
+    pub add_btn: gtk::Button,
+    pub chat_btn: gtk::Button,
+}
+
+#[derive(Debug, Clone)]
 pub(super) enum Pending {
     Login,
     ListChats,
@@ -164,4 +186,10 @@ pub(super) enum Pending {
         content_type: String,
         suggest_name: String,
     },
+    ProfileLookup(ProfilePendingUi),
+    ProfileAddFriend(ProfilePendingUi),
+    ReactMessage,
+    UnsendMessage,
+    CallScreenStart,
+    CallScreenStop,
 }

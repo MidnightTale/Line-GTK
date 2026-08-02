@@ -242,6 +242,13 @@ export interface PlanetSetupOfferMaterial {
 	mediaSecret: Uint8Array;
 }
 
+export interface PlanetSetupOfferOptions {
+	/** Advertise the native VIDEO RTP path instead of the audio-only default. */
+	videoEnabled?: boolean;
+	videoBitrateKbps?: number;
+	videoFps?: number;
+}
+
 function packPortPair(primary: number, secondary: number): Uint8Array {
 	const b: Buf = { bytes: [] };
 	emitUint32(b, 1, primary);
@@ -332,6 +339,7 @@ function packDataOffer(codec: Uint8Array, path: Uint8Array): Uint8Array {
  */
 export function packNativeSetupOffer(
 	material: PlanetSetupOfferMaterial,
+	opts: PlanetSetupOfferOptions = {},
 ): Uint8Array {
 	if (material.mediaPubKey.length !== 33) {
 		throw new Error("packNativeSetupOffer: mediaPubKey must be 33 bytes");
@@ -355,9 +363,9 @@ export function packNativeSetupOffer(
 	const video = packAudioVideoOffer(
 		"V",
 		packOfferCodec("V", {
-			enabled: 0,
-			bitrate: 800,
-			fps: 24,
+			enabled: opts.videoEnabled ? 1 : 0,
+			bitrate: Math.max(100, Math.round(opts.videoBitrateKbps ?? 800)),
+			fps: Math.max(1, Math.round(opts.videoFps ?? 24)),
 			profile: 2,
 			kind: 2,
 		}),

@@ -1,3 +1,4 @@
+use super::media::attach_avatar_texture_async;
 use crate::i18n;
 use crate::protocol::ChatInfo;
 use crate::sidecar::Sidecar;
@@ -293,18 +294,18 @@ fn append_friend_row(ui: &FriendsUi, friend: &ChatInfo) {
         .valign(gtk::Align::Center)
         .css_classes(["line-avatar-frame", "line-avatar-sm"])
         .build();
+    avatar_frame.set_overflow(gtk::Overflow::Hidden);
     let avatar = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .width_request(40)
         .height_request(40)
         .css_classes(["line-avatar", "line-avatar-sm"])
         .build();
+    avatar.set_overflow(gtk::Overflow::Hidden);
     if let Some(path) = friend.avatar_path.as_deref()
         && std::path::Path::new(path).exists()
-        && let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_scale(path, 80, 80, true)
     {
-        let tex = gtk::gdk::Texture::for_pixbuf(&pixbuf);
-        avatar.set_paintable(Some(&tex));
+        attach_avatar_texture_async(avatar.clone(), path.to_string(), 40);
     }
     avatar_frame.append(&avatar);
     ui.avatars.borrow_mut().insert(friend.mid.clone(), avatar);

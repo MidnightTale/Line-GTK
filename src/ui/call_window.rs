@@ -13,6 +13,7 @@ pub struct CallUi {
     pub timer_label: gtk::Label,
     pub mute_btn: gtk::ToggleButton,
     pub deafen_btn: gtk::ToggleButton,
+    pub screen_btn: gtk::ToggleButton,
     pub hangup_btn: gtk::Button,
     pub answer_btn: gtk::Button,
     pub decline_btn: gtk::Button,
@@ -166,6 +167,14 @@ pub fn open_call_window(
         .build();
     deafen_btn.set_size_request(52, 52);
 
+    let screen_btn = gtk::ToggleButton::builder()
+        .icon_name("video-display-symbolic")
+        .tooltip_text(crate::i18n::t("call_share_screen"))
+        .css_classes(["circular", "line-call-ctl"])
+        .sensitive(false)
+        .build();
+    screen_btn.set_size_request(52, 52);
+
     let hangup_btn = gtk::Button::builder()
         .icon_name("call-stop-symbolic")
         .tooltip_text(crate::i18n::t("call_hangup"))
@@ -174,6 +183,7 @@ pub fn open_call_window(
     hangup_btn.set_size_request(64, 64);
 
     out_box.append(&mute_btn);
+    out_box.append(&screen_btn);
     out_box.append(&hangup_btn);
     out_box.append(&deafen_btn);
 
@@ -220,6 +230,7 @@ pub fn open_call_window(
         timer_label,
         mute_btn,
         deafen_btn,
+        screen_btn,
         hangup_btn,
         answer_btn,
         decline_btn,
@@ -310,6 +321,33 @@ pub fn update_deafen_visual(ui: &CallUi, deafened: bool) {
         ui.deafen_btn.set_icon_name("audio-volume-high-symbolic");
         ui.deafen_btn
             .set_tooltip_text(Some(&crate::i18n::t("call_deafen")));
+    }
+}
+
+pub fn set_screen_capable(ui: &CallUi, capable: bool) {
+    ui.screen_btn.set_sensitive(capable);
+    if !capable {
+        ui.screen_btn.set_active(false);
+        ui.screen_btn
+            .set_tooltip_text(Some(&crate::i18n::t("call_share_unavailable")));
+    } else {
+        ui.screen_btn
+            .set_tooltip_text(Some(&crate::i18n::t("call_share_screen")));
+    }
+}
+
+pub fn update_screen_visual(ui: &CallUi, sharing: bool) {
+    if ui.screen_btn.is_active() != sharing {
+        ui.screen_btn.set_active(sharing);
+    }
+    if sharing {
+        ui.screen_btn.set_icon_name("media-playback-stop-symbolic");
+        ui.screen_btn
+            .set_tooltip_text(Some(&crate::i18n::t("call_stop_sharing")));
+    } else {
+        ui.screen_btn.set_icon_name("video-display-symbolic");
+        ui.screen_btn
+            .set_tooltip_text(Some(&crate::i18n::t("call_share_screen")));
     }
 }
 

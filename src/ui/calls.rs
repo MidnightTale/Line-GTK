@@ -21,7 +21,7 @@ pub(super) fn refresh_call_controls(state: &AppState) {
                 .borrow()
                 .iter()
                 .find(|c| &c.mid == mid)
-                .map(|c| c.mid.starts_with('u') && c.kind != "bot")
+                .map(|c| c.mid.starts_with('u') && c.kind != "bot" && c.kind != "keep")
         })
         .unwrap_or(false);
     state.call_btn.set_sensitive(can_call);
@@ -72,6 +72,7 @@ pub(super) fn start_voice_call(state: &AppState) {
         &state.config.borrow().audio_output,
         state.config.borrow().call_mic_volume,
         state.config.borrow().call_spk_volume,
+        true,
     ) {
         Ok(_) => {
             *state.active_call_peer.borrow_mut() = Some(mid.clone());
@@ -188,6 +189,41 @@ pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMo
         }
         {
             let s = state.clone();
+            ui.screen_btn.connect_toggled(move |btn| {
+                let sharing = btn.is_active();
+                if *s.call_screen_sharing.borrow() == sharing {
+                    return;
+                }
+                *s.call_screen_sharing.borrow_mut() = sharing;
+                let result = if sharing {
+                    s.sidecar.call_screen_start()
+                } else {
+                    s.sidecar.call_screen_stop()
+                };
+                match result {
+                    Ok(id) => {
+                        let pending = if sharing {
+                            Pending::CallScreenStart
+                        } else {
+                            Pending::CallScreenStop
+                        };
+                        s.pending.borrow_mut().insert(id, pending);
+                    }
+                    Err(error) => {
+                        *s.call_screen_sharing.borrow_mut() = false;
+                        if let Some(ui) = s.call_ui.borrow().as_ref() {
+                            call_window::update_screen_visual(ui, false);
+                        }
+                        toast(
+                            &s,
+                            &crate::i18n::tf("call_share_failed", &[("error", &error.to_string())]),
+                        );
+                    }
+                }
+            });
+        }
+        {
+            let s = state.clone();
             ui.mic_vol.connect_value_changed(move |scale| {
                 let g = scale.value();
                 s.config.borrow_mut().call_mic_volume = g;
@@ -220,6 +256,9 @@ pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMo
         }
         *state.call_mic_muted.borrow_mut() = false;
         *state.call_deafened.borrow_mut() = false;
+        *state.call_video_capable.borrow_mut() = false;
+        *state.call_screen_sharing.borrow_mut() = false;
+        call_window::set_screen_capable(&ui, false);
         *state.call_ui.borrow_mut() = Some(ui);
     }
 
@@ -238,6 +277,8 @@ pub(super) fn close_active_call_ui(state: &AppState) {
     *state.active_call_peer.borrow_mut() = None;
     *state.call_mic_muted.borrow_mut() = false;
     *state.call_deafened.borrow_mut() = false;
+    *state.call_video_capable.borrow_mut() = false;
+    *state.call_screen_sharing.borrow_mut() = false;
     if let Some(ui) = state.call_ui.borrow_mut().take() {
         call_window::close_call_window(&ui);
     }
@@ -248,6 +289,7 @@ pub(super) fn handle_call_state(
     peer: &str,
     call_state: &str,
     error: Option<&str>,
+    video_capable: bool,
 ) {
     if !calls_experimental_enabled(state)
         && matches!(
@@ -271,11 +313,15 @@ pub(super) fn handle_call_state(
         }
         "connected" => {
             *state.active_call_peer.borrow_mut() = Some(peer.to_string());
+            *state.call_video_capable.borrow_mut() = video_capable;
             ensure_call_window(
                 state,
                 &name,
                 CallMode::Connected(&crate::i18n::tf("call_connected", &[("name", &name)])),
             );
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                call_window::set_screen_capable(ui, video_capable);
+            }
         }
         "ended" => {
             close_active_call_ui(state);
@@ -290,6 +336,55 @@ pub(super) fn handle_call_state(
             } else {
                 toast(state, &crate::i18n::tf("call_failed", &[("error", err)]));
             }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn handle_screen_share_state(state: &AppState, screen_state: &str, error: Option<&str>) {
+    match screen_state {
+        "selecting" => {
+            *state.call_screen_sharing.borrow_mut() = true;
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                ui.status_label
+                    .set_text(&crate::i18n::t("call_share_selecting"));
+                call_window::update_screen_visual(ui, true);
+            }
+        }
+        "starting" => {
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                ui.status_label
+                    .set_text(&crate::i18n::t("call_share_starting"));
+            }
+        }
+        "active" => {
+            *state.call_screen_sharing.borrow_mut() = true;
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                ui.status_label
+                    .set_text(&crate::i18n::t("call_share_active"));
+                call_window::update_screen_visual(ui, true);
+            }
+        }
+        "stopped" => {
+            *state.call_screen_sharing.borrow_mut() = false;
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                ui.status_label
+                    .set_text(&crate::i18n::t("call_connected_short"));
+                call_window::update_screen_visual(ui, false);
+            }
+        }
+        "failed" => {
+            *state.call_screen_sharing.borrow_mut() = false;
+            if let Some(ui) = state.call_ui.borrow().as_ref() {
+                call_window::update_screen_visual(ui, false);
+            }
+            toast(
+                state,
+                &crate::i18n::tf(
+                    "call_share_failed",
+                    &[("error", error.unwrap_or("screen share failed"))],
+                ),
+            );
         }
         _ => {}
     }

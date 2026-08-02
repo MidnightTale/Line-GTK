@@ -3,14 +3,24 @@
  * NDJSON over stdin/stdout. Heavy I/O is cached + async so GTK stays snappy.
  */
 
-import { Client, loginWithAuthToken, TalkMessage } from "@evex/linejs";
+import {
+  Client,
+  loginWithAuthToken,
+  SquareMessage,
+  TalkMessage,
+} from "@evex/linejs";
 import { FileStorage } from "@evex/linejs/storage";
 import { fromFileUrl, join } from "@std/path";
 import { atomicWriteJson, ensurePrivateDir } from "./storage.ts";
 import { AuthStore, LineDevice } from "./auth.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
-import { picturePathOf, profileUrl } from "./contacts.ts";
-import { coerceI64, normalizeRaw } from "./messages.ts";
+import { picturePathOf, profileUrl, squareObsUrl } from "./contacts.ts";
+import {
+  coerceI64,
+  normalizeRaw,
+  sticonResources,
+  talkChatMid,
+} from "./messages.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
 import { createMediaCache } from "./media_cache.ts";
@@ -31,6 +41,7 @@ type ChatRow = {
   unread: number;
   preview: string;
   muted?: boolean;
+  pinned?: boolean;
 };
 
 const dataDir = Deno.env.get("LINE_GTK_DATA") ??
@@ -53,6 +64,7 @@ const LINE_VERSION = Deno.env.get("LINE_VERSION")?.trim() || "26.6.2";
 const chatCachePath = join(cacheDir, "chats.json");
 const contactCachePath = join(cacheDir, "contacts.json");
 const msgDiskDir = join(cacheDir, "messages");
+const MESSAGE_CACHE_SCHEMA = 3;
 await ensurePrivateDir(msgDiskDir);
 
 let cacheRetention = (Deno.env.get("LINE_GTK_CACHE_RETENTION") || "smart")
@@ -221,11 +233,12 @@ const stickers = createStickerService({
   cacheUrl,
   existingImage,
   sentMessagePayload,
-  invalidateMessages: (chatMid) => msgCache.delete(chatMid),
+  invalidateMessages: markMessageCacheStale,
   invalidateChats: () => {
     chatCache = null;
   },
   touchChatPreviewFromMessage,
+  emitEvent,
   ok,
   fail,
 });
@@ -248,7 +261,7 @@ const outgoingMedia = createOutgoingMedia({
   isMineFrom,
   normType,
   getCachedMessages: (chatMid) => msgCache.get(chatMid)?.messages,
-  invalidateMessages: (chatMid) => msgCache.delete(chatMid),
+  invalidateMessages: markMessageCacheStale,
   invalidateChats: () => {
     chatCache = null;
   },
@@ -260,11 +273,37 @@ const outgoingMedia = createOutgoingMedia({
 });
 
 let chatCache: { at: number; chats: ChatRow[] } | null = null;
-const msgCache = new Map<string, { at: number; messages: Json[] }>();
+type MessageHistoryCursor = {
+  messageId: string;
+  deliveredTime: string;
+};
+type MessageCacheEntry = {
+  at: number;
+  messages: Json[];
+  historyComplete?: boolean;
+  oldestCursor?: MessageHistoryCursor;
+  squareSyncToken?: string;
+};
+const msgCache = new Map<string, MessageCacheEntry>();
 const inFlight = new Map<string, Promise<unknown>>();
 const contactIndex = new Map<
   string,
-  { name: string; picturePath: string | null; kind: string; muted: boolean }
+  {
+    name: string;
+    picturePath: string | null;
+    statusMessage: string;
+    kind: string;
+    muted: boolean;
+  }
+>();
+const squareChatIndex = new Set<string>();
+const squareMemberIndex = new Map<
+  string,
+  {
+    name: string;
+    picturePath: string | null;
+    statusMessage: string;
+  }
 >();
 const mediaEpoch = new Map<string, number>();
 type BoxCursor = {
@@ -279,8 +318,9 @@ const listener = createListener({
   setListening: (next) => {
     listening = next;
   },
-  invalidateMessages: (chatMid) => msgCache.delete(chatMid),
+  cacheMessage: cacheLiveMessage,
   summarizeTalkMessage,
+  summarizeSquareMessage,
   storeBoxCursor,
   upsertChatFromMessage,
   hydrateLiveMedia,
@@ -303,6 +343,7 @@ const commands = createCommandService({
   },
   msgCache,
   contactIndex,
+  squareChatIndex,
   boxCursor,
   avatarDir,
   chatCachePath,
@@ -324,6 +365,7 @@ const commands = createCommandService({
   forUiMessages,
   hydrateMedia,
   summarizeTalkMessage,
+  summarizeSquareMessage,
   summarizeRawMessage: (raw, opts) =>
     summarizeRawMessage(
       raw as Parameters<typeof summarizeRawMessage>[0],
@@ -410,6 +452,20 @@ function normType(t: unknown): string {
   return String(t ?? "NONE").toUpperCase();
 }
 
+function sticonSticker(meta: Record<string, string>): {
+  stickerId: string;
+  packageId: string;
+  rawSticonId: string;
+} | null {
+  const first = sticonResources(meta)[0];
+  if (!first) return null;
+  return {
+    stickerId: `sticon:${first.sticonId}`,
+    packageId: first.productId,
+    rawSticonId: first.sticonId,
+  };
+}
+
 async function fromRawTalkSafe(raw: unknown): Promise<TalkMessage> {
   const normalized = normalizeRaw(raw as Record<string, unknown>);
   return await TalkMessage.fromRawTalk(
@@ -417,6 +473,9 @@ async function fromRawTalkSafe(raw: unknown): Promise<TalkMessage> {
     client!,
   );
 }
+
+let lastE2eeFallbackLog = 0;
+let e2eeFallbackSuppressed = 0;
 
 function patchE2eeGuards() {
   if (!client) return;
@@ -431,7 +490,16 @@ function patchE2eeGuards() {
     try {
       return await orig(msg);
     } catch (e) {
-      console.error("[e2ee decrypt fallback]", e);
+      e2eeFallbackSuppressed++;
+      const now = Date.now();
+      if (now - lastE2eeFallbackLog > 5_000) {
+        console.error("[e2ee decrypt fallback]", {
+          error: e instanceof Error ? e.message : String(e),
+          suppressed: Math.max(0, e2eeFallbackSuppressed - 1),
+        });
+        lastE2eeFallbackLog = now;
+        e2eeFallbackSuppressed = 0;
+      }
       return msg;
     }
   };
@@ -540,6 +608,66 @@ function isMineFrom(from: unknown): boolean {
   return !!mid && !!f && f === mid;
 }
 
+const reactionKinds = [
+  "ALL",
+  "UNDO",
+  "NICE",
+  "LOVE",
+  "FUN",
+  "AMAZING",
+  "SAD",
+  "OMG",
+];
+
+function reactionKind(value: unknown): string {
+  if (typeof value === "string") {
+    const upper = value.toUpperCase();
+    if (reactionKinds.includes(upper)) return upper;
+    if (/^\d+$/.test(value)) return reactionKinds[Number(value)] ?? "";
+  }
+  if (typeof value === "number") return reactionKinds[value] ?? "";
+  return "";
+}
+
+function summarizeTalkReactions(value: unknown): Json[] {
+  if (!Array.isArray(value)) return [];
+  const counts = new Map<string, { count: number; mine: boolean }>();
+  for (const row of value as Array<Record<string, unknown>>) {
+    const type = reactionKind(
+      (row.reactionType as Record<string, unknown> | undefined)
+        ?.predefinedReactionType,
+    );
+    if (!type || type === "ALL" || type === "UNDO") continue;
+    const previous = counts.get(type) ?? { count: 0, mine: false };
+    previous.count++;
+    previous.mine ||= String(row.fromUserMid ?? "") === myMid();
+    counts.set(type, previous);
+  }
+  return [...counts].map(([kind, summary]) => ({ kind, ...summary }));
+}
+
+function summarizeSquareReactions(value: unknown): Json[] {
+  const status = value as
+    | {
+      countByReactionType?: Record<string, unknown>;
+      myReaction?: { type?: unknown };
+    }
+    | null
+    | undefined;
+  if (!status?.countByReactionType) return [];
+  const mine = reactionKind(status.myReaction?.type);
+  const rows: Json[] = [];
+  for (
+    const [rawType, rawCount] of Object.entries(status.countByReactionType)
+  ) {
+    const kind = reactionKind(rawType);
+    const count = Number(rawCount ?? 0);
+    if (!kind || kind === "ALL" || kind === "UNDO" || count <= 0) continue;
+    rows.push({ kind, count, mine: mine === kind });
+  }
+  return rows;
+}
+
 async function myProfilePayload(profile: {
   mid: string;
   displayName?: string;
@@ -571,6 +699,60 @@ async function myProfilePayload(profile: {
   };
 }
 
+function contactStatusName(status: unknown): string {
+  if (typeof status === "string") return status;
+  return ({
+    0: "UNSPECIFIED",
+    1: "FRIEND",
+    2: "FRIEND_BLOCKED",
+    3: "RECOMMEND",
+    4: "RECOMMEND_BLOCKED",
+    5: "DELETED",
+    6: "DELETED_BLOCKED",
+  } as Record<number, string>)[Number(status)] ?? "UNSPECIFIED";
+}
+
+async function contactRelationPayload(mid: string) {
+  if (!client) throw new Error("not_logged_in");
+  if (!mid.startsWith("u")) throw new Error("profile_not_line_user");
+
+  const contact = await client.base.talk.getContact({ mid });
+  const status = contactStatusName(contact.status);
+  const isFriend = status === "FRIEND" || status === "FRIEND_BLOCKED";
+  const blocked = status === "FRIEND_BLOCKED" ||
+    status === "RECOMMEND_BLOCKED" || status === "DELETED_BLOCKED";
+  const picturePath = contact.picturePath || null;
+  let avatarPath: string | null = null;
+  try {
+    avatarPath = await avatarPathFor(mid, picturePath);
+  } catch (error) {
+    console.error("[profile relation avatar]", error);
+  }
+
+  contactIndex.set(mid, {
+    name: contact.displayName || mid,
+    picturePath,
+    statusMessage: contact.statusMessage ?? "",
+    kind: /BOT/i.test(String(contact.type ?? "")) ? "bot" : "dm",
+    muted: !!(contact as { notificationDisabled?: boolean })
+      .notificationDisabled,
+  });
+  await saveDiskContacts();
+
+  return {
+    mid,
+    displayName: contact.displayName || mid,
+    statusMessage: contact.statusMessage ?? "",
+    picturePath,
+    avatarPath,
+    status,
+    isFriend,
+    blocked,
+    canAdd: !isFriend && !blocked,
+    canChat: isFriend,
+  };
+}
+
 async function loadDiskContacts() {
   if (contactIndex.size > 0) return;
   try {
@@ -581,6 +763,7 @@ async function loadDiskContacts() {
         raw.contacts as Record<string, {
           name: string;
           picturePath: string | null;
+          statusMessage?: string;
           kind?: string;
           muted?: boolean;
         }>,
@@ -589,6 +772,7 @@ async function loadDiskContacts() {
       contactIndex.set(mid, {
         name: c.name,
         picturePath: c.picturePath ?? null,
+        statusMessage: c.statusMessage ?? "",
         kind: c.kind || "dm",
         muted: !!c.muted,
       });
@@ -601,7 +785,13 @@ async function loadDiskContacts() {
 async function saveDiskContacts() {
   const contacts: Record<
     string,
-    { name: string; picturePath: string | null; kind: string; muted: boolean }
+    {
+      name: string;
+      picturePath: string | null;
+      statusMessage: string;
+      kind: string;
+      muted: boolean;
+    }
   > = {};
   for (const [mid, c] of contactIndex) contacts[mid] = c;
   try {
@@ -611,27 +801,168 @@ async function saveDiskContacts() {
   }
 }
 
-async function loadDiskMessages(chatMid: string): Promise<Json[] | null> {
+async function loadDiskMessages(
+  chatMid: string,
+): Promise<MessageCacheEntry | null> {
   try {
-    await refreshCachePolicy();
     const raw = JSON.parse(
       await Deno.readTextFile(join(msgDiskDir, `${chatMid}.json`)),
     );
-    if (Date.now() - Number(raw.at || 0) > cachePolicy().diskMsg) return null;
-    if (Array.isArray(raw.messages)) return raw.messages as Json[];
+    const schema = Number(raw.schema ?? 0);
+    if (
+      (schema === 0 || schema === 2 || schema === MESSAGE_CACHE_SCHEMA) &&
+      Array.isArray(raw.messages)
+    ) {
+      const messages = raw.messages as Json[];
+      const oldest = messages[0];
+      return {
+        at: Number(raw.at || 0),
+        messages,
+        historyComplete: schema === MESSAGE_CACHE_SCHEMA &&
+          !!raw.historyComplete,
+        oldestCursor: raw.oldestCursor ?? (oldest
+          ? {
+            messageId: String(oldest.id ?? ""),
+            deliveredTime: String(oldest.createdTime ?? "0"),
+          }
+          : undefined),
+        squareSyncToken: typeof raw.squareSyncToken === "string"
+          ? raw.squareSyncToken
+          : undefined,
+      };
+    }
   } catch { /* miss */ }
   return null;
 }
 
-async function saveDiskMessages(chatMid: string, messages: Json[]) {
-  try {
+const messageWriteQueues = new Map<string, Promise<void>>();
+const liveMessageSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+async function saveDiskMessages(chatMid: string, entry: MessageCacheEntry) {
+  const snapshot: MessageCacheEntry = {
+    ...entry,
+    messages: entry.messages.map((message) => ({ ...message })),
+  };
+  const previous = messageWriteQueues.get(chatMid) ?? Promise.resolve();
+  const write = previous.catch(() => {}).then(async () => {
     await atomicWriteJson(join(msgDiskDir, `${chatMid}.json`), {
-      at: Date.now(),
-      messages,
+      schema: MESSAGE_CACHE_SCHEMA,
+      at: snapshot.at,
+      historyComplete: !!snapshot.historyComplete,
+      oldestCursor: snapshot.oldestCursor ?? null,
+      squareSyncToken: snapshot.squareSyncToken ?? null,
+      messages: snapshot.messages,
     });
+  });
+  messageWriteQueues.set(chatMid, write);
+  try {
+    await write;
   } catch (error) {
     console.error("[messages-cache]", chatMid, error);
+  } finally {
+    if (messageWriteQueues.get(chatMid) === write) {
+      messageWriteQueues.delete(chatMid);
+    }
   }
+}
+
+async function cacheLiveMessage(chatMid: string, message: Json) {
+  let entry = msgCache.get(chatMid);
+  if (!entry) entry = await loadDiskMessages(chatMid) ?? undefined;
+  entry ??= { at: Date.now(), messages: [], historyComplete: false };
+  const id = String(message.id ?? "");
+  const index = id
+    ? entry.messages.findIndex((row) => String(row.id ?? "") === id)
+    : -1;
+  if (index >= 0) {
+    entry.messages[index] = { ...entry.messages[index], ...message };
+  } else {
+    entry.messages.push(message);
+  }
+  entry.messages.sort((a, b) =>
+    Number(a.createdTime ?? 0) - Number(b.createdTime ?? 0)
+  );
+  entry.at = Date.now();
+  msgCache.set(chatMid, entry);
+  const pending = liveMessageSaveTimers.get(chatMid);
+  if (pending !== undefined) clearTimeout(pending);
+  liveMessageSaveTimers.set(
+    chatMid,
+    setTimeout(() => {
+      liveMessageSaveTimers.delete(chatMid);
+      const latest = msgCache.get(chatMid);
+      if (latest) void saveDiskMessages(chatMid, latest);
+    }, 350),
+  );
+}
+
+function markMessageCacheStale(chatMid: string) {
+  const entry = msgCache.get(chatMid);
+  if (entry) entry.at = 0;
+}
+
+async function messageCacheEntry(chatMid: string): Promise<MessageCacheEntry> {
+  let entry = msgCache.get(chatMid);
+  if (!entry) entry = await loadDiskMessages(chatMid) ?? undefined;
+  entry ??= { at: Date.now(), messages: [], historyComplete: false };
+  return entry;
+}
+
+async function publishMessageMutation(
+  chatMid: string,
+  entry: MessageCacheEntry,
+) {
+  entry.at = Date.now();
+  msgCache.set(chatMid, entry);
+  await saveDiskMessages(chatMid, entry);
+  emitEvent("messages", {
+    chatMid,
+    messages: await forUiMessages(entry.messages),
+    cached: false,
+    historyComplete: !!entry.historyComplete,
+  });
+}
+
+async function cacheOwnReaction(
+  chatMid: string,
+  messageId: string,
+  reaction: string,
+) {
+  const entry = await messageCacheEntry(chatMid);
+  const message = entry.messages.find((row) =>
+    String(row.id ?? "") === messageId
+  );
+  if (!message) return;
+  const rows = Array.isArray(message.reactions)
+    ? (message.reactions as Json[]).map((row) => ({ ...row }))
+    : [];
+  for (let index = rows.length - 1; index >= 0; index--) {
+    if (!rows[index]?.mine) continue;
+    rows[index]!.count = Math.max(0, Number(rows[index]!.count ?? 0) - 1);
+    rows[index]!.mine = false;
+    if (Number(rows[index]!.count) === 0) rows.splice(index, 1);
+  }
+  if (reaction !== "UNDO") {
+    const current = rows.find((row) => String(row.kind ?? "") === reaction);
+    if (current) {
+      current.count = Number(current.count ?? 0) + 1;
+      current.mine = true;
+    } else {
+      rows.push({ kind: reaction, count: 1, mine: true });
+    }
+  }
+  message.reactions = rows;
+  await publishMessageMutation(chatMid, entry);
+}
+
+async function removeCachedMessage(chatMid: string, messageId: string) {
+  const entry = await messageCacheEntry(chatMid);
+  entry.messages = entry.messages.filter((row) =>
+    String(row.id ?? "") !== messageId
+  );
+  await publishMessageMutation(chatMid, entry);
+  const latest = entry.messages.at(-1);
+  if (latest) touchChatPreviewFromMessage(latest);
 }
 
 let contactsAt = 0;
@@ -671,6 +1002,7 @@ async function refreshContactIndex(force = false) {
         contactIndex.set(mid, {
           name: c.displayName || mid,
           picturePath: c.picturePath ?? null,
+          statusMessage: c.statusMessage ?? "",
           kind,
           muted: !!(c as { notificationDisabled?: boolean })
             .notificationDisabled,
@@ -685,6 +1017,7 @@ async function refreshContactIndex(force = false) {
           contactIndex.set(mid, {
             name: c.displayName || mid,
             picturePath: c.picturePath ?? null,
+            statusMessage: c.statusMessage ?? "",
             kind: /BOT/i.test(type) ? "bot" : "dm",
             muted: !!(c as { notificationDisabled?: boolean })
               .notificationDisabled,
@@ -699,6 +1032,146 @@ async function refreshContactIndex(force = false) {
   await saveDiskContacts();
 }
 
+async function senderProfilePayload(mid: string): Promise<Json> {
+  if (!mid) {
+    return {
+      senderName: "",
+      senderAvatarPath: null,
+      senderStatusMessage: "",
+      senderKind: "line",
+    };
+  }
+  const info = await resolveContactInfo(mid);
+  let avatarPath: string | null = null;
+  try {
+    avatarPath = await avatarPathFor(mid, info.picturePath);
+  } catch (e) {
+    console.error("[sender avatar]", mid, e);
+  }
+  return {
+    senderName: info.name,
+    senderAvatarPath: avatarPath,
+    senderStatusMessage: info.statusMessage,
+    senderKind: "line",
+  };
+}
+
+async function resolveSquareMemberInfo(mid: string): Promise<{
+  name: string;
+  picturePath: string | null;
+  statusMessage: string;
+}> {
+  const cached = squareMemberIndex.get(mid);
+  if (cached) return cached;
+  const fallback = {
+    name: mid,
+    picturePath: null,
+    statusMessage: "",
+  };
+  if (!client || !mid) return fallback;
+  try {
+    const response = await client.base.square.getSquareMember({
+      squareMemberMid: mid,
+    });
+    const member = response.squareMember;
+    const info = {
+      name: member.displayName || mid,
+      picturePath: squareObsUrl(member.profileImageObsHash),
+      statusMessage: member.selfIntroduction || "",
+    };
+    squareMemberIndex.set(mid, info);
+    return info;
+  } catch (e) {
+    console.error("[openchat member]", mid, e);
+    return fallback;
+  }
+}
+
+async function summarizeSquareMessage(
+  sm: SquareMessage,
+  _opts: { withMedia?: boolean } = {},
+): Promise<Json> {
+  const raw = sm.raw;
+  const message = raw.message;
+  const id = String(message.id ?? "");
+  const from = String(message.from ?? "");
+  const chatMid = String(message.to ?? "");
+  let contentType = normType(message.contentType);
+  const meta = (message.contentMetadata ?? {}) as Record<string, string>;
+  const member = await resolveSquareMemberInfo(from);
+  let avatarPath: string | null = null;
+  try {
+    avatarPath = await avatarPathFor(from, member.picturePath);
+  } catch (e) {
+    console.error("[openchat avatar]", from, e);
+  }
+  let mine = false;
+  try {
+    mine = await sm.isMyMessage();
+  } catch { /* keep false */ }
+  let text = sm.text || meta.ALT_TEXT || meta.STKTXT || "";
+  let imagePath: string | null = null;
+  let imageUrl: string | null = null;
+  let stickerId = meta.STKID || "";
+  let stickerPackageId = meta.STKPKGID || "";
+  let rawSticonId = "";
+  const sticon = contentType === "NONE" ? sticonSticker(meta) : null;
+  if (sticon) {
+    contentType = "STICKER";
+    stickerId = sticon.stickerId;
+    stickerPackageId = sticon.packageId;
+    rawSticonId = sticon.rawSticonId;
+    text = "[Sticker]";
+  }
+  if (contentType === "STICKER" && stickerId) {
+    text = text || "[Sticker]";
+    if (rawSticonId) {
+      imageUrl = stickers.sticonUrl(stickerPackageId, rawSticonId);
+      imagePath = await stickers.ensureSticon(stickerPackageId, rawSticonId);
+    } else {
+      imageUrl = stickers.animationUrl(stickerId);
+      imagePath = await stickers.ensureImage(stickerId);
+    }
+  } else if (contentType === "IMAGE") {
+    text = text || "[Image]";
+    imageUrl = client?.base.obs.getMessageDataUrl(id, true, true) ?? null;
+  } else if (contentType === "VIDEO") {
+    text = text || "[Video]";
+  } else if (contentType === "AUDIO") {
+    text = text || "Voice message";
+  } else if (!text && contentType !== "NONE") {
+    text = `[${contentType}]`;
+  }
+  return {
+    id,
+    text,
+    from,
+    to: chatMid,
+    chatMid,
+    mine,
+    createdTime: Number(message.createdTime ?? 0),
+    contentType,
+    imagePath,
+    imageUrl,
+    audioPath: null,
+    fileName: meta.FILE_NAME || meta.FILENAME || null,
+    filePath: null,
+    stickerId: stickerId || null,
+    stickerPackageId: stickerPackageId || null,
+    flex: contentType === "FLEX" ? extractFlex(meta) : null,
+    durationMs: meta.DURATION ? Number(meta.DURATION) : null,
+    needsMedia: contentType === "STICKER" ? !imagePath : false,
+    senderName: member.name,
+    senderAvatarPath: avatarPath,
+    senderStatusMessage: member.statusMessage,
+    senderKind: "openchat",
+    reactions: summarizeSquareReactions(
+      (raw as unknown as { messageReactionStatus?: unknown })
+        .messageReactionStatus,
+    ),
+  };
+}
+
 async function summarizeTalkMessage(
   tm: TalkMessage,
   opts: { withMedia?: boolean } = {},
@@ -711,15 +1184,28 @@ async function summarizeTalkMessage(
     createdTime?: number | string | bigint;
     contentType?: string | number;
     contentMetadata?: Record<string, string>;
+    reactions?: unknown;
   };
-  const contentType = normType(raw.contentType);
+  let contentType = normType(raw.contentType);
   const meta = raw.contentMetadata ?? {};
   let text = tm.text || meta.ALT_TEXT || meta.STKTXT || "";
   let imagePath: string | null = null;
   let imageUrl: string | null = meta.PREVIEW_URL || meta.DOWNLOAD_URL || null;
   const id = String(raw.id ?? "");
-  const stkId = meta.STKID || "";
-  const stkPkg = meta.STKPKGID || "";
+  const reactions = summarizeTalkReactions(raw.reactions);
+  let stkId = meta.STKID || "";
+  let stkPkg = meta.STKPKGID || "";
+  let rawSticonId = "";
+  const sticon = contentType === "NONE" ? sticonSticker(meta) : null;
+  if (sticon) {
+    contentType = "STICKER";
+    stkId = sticon.stickerId;
+    stkPkg = sticon.packageId;
+    rawSticonId = sticon.rawSticonId;
+    text = "[Sticker]";
+    imageUrl = stickers.sticonUrl(stkPkg, rawSticonId);
+  }
+  const sender = await senderProfilePayload(String(raw.from ?? ""));
 
   if (contentType === "AUDIO") {
     text = text || "Voice message";
@@ -770,6 +1256,7 @@ async function summarizeTalkMessage(
     }
     const flex = null;
     return {
+      ...sender,
       id,
       text: duration
         ? `Voice message (${Math.round(Number(duration) / 1000)}s)`
@@ -777,6 +1264,11 @@ async function summarizeTalkMessage(
       from: raw.from ?? "",
       to: raw.to ?? "",
       mine: isMineFrom(raw.from),
+      chatMid: talkChatMid({
+        from: raw.from,
+        to: raw.to,
+        mine: isMineFrom(raw.from),
+      }),
       createdTime: Number(raw.createdTime ?? 0),
       contentType,
       imagePath: null,
@@ -788,6 +1280,7 @@ async function summarizeTalkMessage(
       flex,
       durationMs: duration ? Number(duration) : null,
       needsMedia: !audioPath,
+      reactions,
     };
   }
 
@@ -872,9 +1365,16 @@ async function summarizeTalkMessage(
   } else if (contentType === "STICKER") {
     text = text || "[Sticker]";
     if (stkId) {
-      imageUrl = stickers.animationUrl(stkId);
-      if (withMedia) {
-        imagePath = await stickers.ensureImage(stkId);
+      if (rawSticonId) {
+        imageUrl = stickers.sticonUrl(stkPkg, rawSticonId);
+        if (withMedia) {
+          imagePath = await stickers.ensureSticon(stkPkg, rawSticonId);
+        }
+      } else {
+        imageUrl = stickers.animationUrl(stkId);
+        if (withMedia) {
+          imagePath = await stickers.ensureImage(stkId);
+        }
       }
     }
   } else if (contentType === "FLEX") {
@@ -886,11 +1386,17 @@ async function summarizeTalkMessage(
   const flex = contentType === "FLEX" ? extractFlex(meta) : null;
 
   return {
+    ...sender,
     id,
     text,
     from: raw.from ?? "",
     to: raw.to ?? "",
     mine: isMineFrom(raw.from),
+    chatMid: talkChatMid({
+      from: raw.from,
+      to: raw.to,
+      mine: isMineFrom(raw.from),
+    }),
     createdTime: Number(raw.createdTime ?? 0),
     contentType,
     imagePath,
@@ -908,6 +1414,7 @@ async function summarizeTalkMessage(
       : contentType === "AUDIO"
       ? true
       : false,
+    reactions,
   };
 }
 
@@ -922,8 +1429,19 @@ async function summarizeRawMessage(
     console.error("[summarizeRawMessage]", e);
     const r = normalizeRaw(raw as unknown as Record<string, unknown>);
     const meta = (r.contentMetadata ?? {}) as Record<string, string>;
-    const contentType = normType(r.contentType);
+    let contentType = normType(r.contentType);
+    let stickerId = meta.STKID || "";
+    let stickerPackageId = meta.STKPKGID || "";
+    let imageUrl: string | null = meta.PREVIEW_URL || meta.DOWNLOAD_URL || null;
+    const sticon = contentType === "NONE" ? sticonSticker(meta) : null;
+    if (sticon) {
+      contentType = "STICKER";
+      stickerId = sticon.stickerId;
+      stickerPackageId = sticon.packageId;
+      imageUrl = stickers.sticonUrl(stickerPackageId, sticon.rawSticonId);
+    }
     let text = String(r.text ?? meta.ALT_TEXT ?? meta.STKTXT ?? "");
+    if (sticon) text = "[Sticker]";
     if (!text) {
       if (contentType === "AUDIO") text = "Voice message";
       else if (contentType === "IMAGE") text = "[Image]";
@@ -934,24 +1452,31 @@ async function summarizeRawMessage(
       else if (contentType !== "NONE") text = `[${contentType}]`;
     }
     return {
+      ...(await senderProfilePayload(String(r.from ?? ""))),
       id: String(r.id ?? ""),
       text,
       from: String(r.from ?? ""),
       to: String(r.to ?? ""),
       mine: isMineFrom(r.from),
+      chatMid: talkChatMid({
+        from: r.from,
+        to: r.to,
+        mine: isMineFrom(r.from),
+      }),
       createdTime: Number(r.createdTime ?? 0),
       contentType,
       imagePath: null,
-      imageUrl: meta.PREVIEW_URL || meta.DOWNLOAD_URL || null,
+      imageUrl,
       audioPath: null,
       fileName: meta.FILE_NAME || meta.FILENAME || null,
       filePath: null,
-      stickerId: meta.STKID || null,
-      stickerPackageId: meta.STKPKGID || null,
+      stickerId: stickerId || null,
+      stickerPackageId: stickerPackageId || null,
       flex: contentType === "FLEX" ? extractFlex(meta) : null,
       durationMs: meta.DURATION ? Number(meta.DURATION) : null,
       needsMedia: contentType === "IMAGE" || contentType === "VIDEO" ||
         contentType === "STICKER" || contentType === "AUDIO",
+      reactions: summarizeTalkReactions(r.reactions),
     };
   }
 }
@@ -998,7 +1523,15 @@ async function hydrateMedia(
           return;
         }
         if (!epochOk()) return;
-        path = await stickers.ensureImage(stkId);
+        if (stkId.startsWith("sticon:")) {
+          const productId = String(m.stickerPackageId || "");
+          path = await stickers.ensureSticon(
+            productId,
+            stkId.slice("sticon:".length),
+          );
+        } else {
+          path = await stickers.ensureImage(stkId);
+        }
         if (path) {
           emitEvent("media_ready", { chatMid, messageId: id, imagePath: path });
         } else {
@@ -1361,15 +1894,27 @@ function touchChatPreviewFromMessage(message: Json) {
 async function resolveContactInfo(mid: string): Promise<{
   name: string;
   picturePath: string | null;
+  statusMessage: string;
   kind: string;
   muted: boolean;
 }> {
+  if (mid === myMid() && client?.base.profile) {
+    const profile = client.base.profile;
+    return {
+      name: profile.displayName || mid,
+      picturePath: profile.picturePath ?? null,
+      statusMessage: profile.statusMessage ?? "",
+      kind: "self",
+      muted: false,
+    };
+  }
   const cached = contactIndex.get(mid);
   if (cached?.name && cached.name !== mid) return cached;
   if (!client) {
     return cached ?? {
       name: mid,
       picturePath: null,
+      statusMessage: "",
       kind: mid.startsWith("c") ? "group" : "dm",
       muted: false,
     };
@@ -1380,6 +1925,7 @@ async function resolveContactInfo(mid: string): Promise<{
     const info = {
       name: c.displayName || mid,
       picturePath: c.picturePath ?? null,
+      statusMessage: c.statusMessage ?? "",
       kind: /BOT/i.test(type) ? "bot" : mid.startsWith("c") ? "group" : "dm",
       muted: !!(c as { notificationDisabled?: boolean }).notificationDisabled,
     };
@@ -1390,6 +1936,7 @@ async function resolveContactInfo(mid: string): Promise<{
     return cached ?? {
       name: mid,
       picturePath: null,
+      statusMessage: "",
       kind: mid.startsWith("c") ? "group" : "dm",
       muted: false,
     };
@@ -1397,7 +1944,9 @@ async function resolveContactInfo(mid: string): Promise<{
 }
 
 async function upsertChatFromMessage(message: Json) {
-  const peer = message.mine ? String(message.to) : String(message.from);
+  const peer = String(
+    message.chatMid ?? (message.mine ? message.to : message.from),
+  );
   if (!peer) return;
   const preview = previewLine(message);
   const activity = Number(message.createdTime ?? 0);
@@ -1619,6 +2168,11 @@ function sentMessagePayload(
     from: myMid(),
     to: chatMid,
     mine: true,
+    chatMid,
+    senderName: client?.base.profile?.displayName ?? "",
+    senderAvatarPath: null,
+    senderStatusMessage: client?.base.profile?.statusMessage ?? "",
+    senderKind: "line",
     createdTime: Number(sent?.createdTime ?? Date.now()),
     contentType: normType(sent?.contentType ?? "NONE"),
     imagePath: null,
@@ -1629,6 +2183,7 @@ function sentMessagePayload(
     flex: null,
     durationMs: null,
     needsMedia: false,
+    reactions: [],
   };
 }
 
@@ -1666,6 +2221,76 @@ async function handle(req: Json) {
           String(params.text ?? ""),
         );
         break;
+      case "react_message": {
+        if (!client) {
+          fail(id, "not_logged_in");
+          break;
+        }
+        const chatMid = String(params.chatMid ?? "");
+        const messageId = String(params.messageId ?? "");
+        const reaction = reactionKind(params.reaction);
+        if (!chatMid || !messageId || !reaction || reaction === "ALL") {
+          fail(id, "invalid_reaction");
+          break;
+        }
+        if (squareChatIndex.has(chatMid) || chatMid.startsWith("m")) {
+          const react = client.base.square.reactToMessage as unknown as (
+            options: {
+              request: {
+                reqSeq: number;
+                reactionType: string;
+                messageId: string;
+                squareChatMid: string;
+              };
+            },
+          ) => Promise<unknown>;
+          await react.call(client.base.square, {
+            request: {
+              reqSeq: 0,
+              reactionType: reaction,
+              messageId,
+              squareChatMid: chatMid,
+            },
+          });
+        } else {
+          const react = client.base.talk.react as unknown as (
+            options: { id: bigint; reaction: string },
+          ) => Promise<unknown>;
+          await react.call(client.base.talk, {
+            id: BigInt(messageId),
+            reaction,
+          });
+        }
+        await cacheOwnReaction(chatMid, messageId, reaction);
+        ok(id, { reacted: true, chatMid, messageId, reaction });
+        break;
+      }
+      case "unsend_message": {
+        if (!client) {
+          fail(id, "not_logged_in");
+          break;
+        }
+        const chatMid = String(params.chatMid ?? "");
+        const messageId = String(params.messageId ?? "");
+        if (!chatMid || !messageId) {
+          fail(id, "missing_message_id");
+          break;
+        }
+        if (squareChatIndex.has(chatMid) || chatMid.startsWith("m")) {
+          const unsend = client.base.square.unsendMessage as unknown as (
+            options: { squareChatMid: string; messageId: string },
+          ) => Promise<unknown>;
+          await unsend.call(client.base.square, {
+            squareChatMid: chatMid,
+            messageId,
+          });
+        } else {
+          await client.base.talk.unsendMessage({ messageId });
+        }
+        await removeCachedMessage(chatMid, messageId);
+        ok(id, { unsent: true, chatMid, messageId });
+        break;
+      }
       case "send_audio":
         await outgoingMedia.sendAudio(
           id,
@@ -1717,7 +2342,11 @@ async function handle(req: Json) {
             : undefined,
         );
         calls.setCallGains(params.micGain, params.spkGain);
-        await calls.doCallStart(id, String(params.mid ?? params.chatMid ?? ""));
+        await calls.doCallStart(
+          id,
+          String(params.mid ?? params.chatMid ?? ""),
+          params.videoCapable === true,
+        );
         break;
       case "call_answer":
         calls.setCallAudioDevices(
@@ -1737,6 +2366,14 @@ async function handle(req: Json) {
         break;
       case "call_set_audio": {
         ok(id, calls.updateCallAudio(params));
+        break;
+      }
+      case "call_screen_start": {
+        calls.doCallScreenStart(id);
+        break;
+      }
+      case "call_screen_stop": {
+        calls.doCallScreenStop(id);
         break;
       }
       case "send_postback": {
@@ -1772,7 +2409,7 @@ async function handle(req: Json) {
                 e2ee: true,
               });
             }
-            msgCache.delete(chatMid);
+            markMessageCacheStale(chatMid);
             ok(id, { sent: true, fallback: "message" });
           } catch {
             fail(id, e instanceof Error ? e.message : String(e));
@@ -1857,6 +2494,7 @@ async function handle(req: Json) {
           contactIndex.set(String(mid), {
             name: contact.displayName || userid,
             picturePath: contact.picturePath ?? null,
+            statusMessage: "",
             kind: "dm",
             muted: false,
           });
@@ -1865,6 +2503,37 @@ async function handle(req: Json) {
             mid,
             displayName: contact.displayName ?? userid,
           });
+        } catch (e) {
+          fail(id, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "profile_relation": {
+        try {
+          ok(id, await contactRelationPayload(String(params.mid ?? "")));
+        } catch (e) {
+          fail(id, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "add_friend_mid": {
+        if (!client) {
+          fail(id, "not_logged_in");
+          break;
+        }
+        const mid = String(params.mid ?? "");
+        if (!mid.startsWith("u")) {
+          fail(id, "profile_not_line_user");
+          break;
+        }
+        if (mid === myMid()) {
+          fail(id, "cannot_add_self");
+          break;
+        }
+        try {
+          await client.base.relation.addFriendByMid({ mid });
+          const relation = await contactRelationPayload(mid);
+          ok(id, { ...relation, isFriend: true, canAdd: false, canChat: true });
         } catch (e) {
           fail(id, e instanceof Error ? e.message : String(e));
         }
@@ -1894,6 +2563,7 @@ async function handle(req: Json) {
             contactIndex.set(mid, {
               name: mid,
               picturePath: null,
+              statusMessage: "",
               kind: "dm",
               muted,
             });
@@ -1920,6 +2590,8 @@ async function handle(req: Json) {
         listening = false;
         chatCache = null;
         msgCache.clear();
+        squareChatIndex.clear();
+        squareMemberIndex.clear();
         ok(id, {});
         break;
       default:

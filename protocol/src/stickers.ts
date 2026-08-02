@@ -24,6 +24,7 @@ export type StickerRuntime = {
   invalidateMessages: (chatMid: string) => void;
   invalidateChats: () => void;
   touchChatPreviewFromMessage: (message: Json) => void;
+  emitEvent: (event: string, payload?: Json) => void;
   ok: (id: number | string | null, result?: unknown) => void;
   fail: (id: number | string | null, error: string) => void;
 };
@@ -40,6 +41,7 @@ export function createStickerService(runtime: StickerRuntime) {
     invalidateMessages,
     invalidateChats,
     touchChatPreviewFromMessage,
+    emitEvent,
     ok,
     fail,
   } = runtime;
@@ -61,6 +63,28 @@ export function createStickerService(runtime: StickerRuntime) {
     ];
   }
 
+  function sticonUrl(productId: string, sticonId: string): string {
+    return `https://stickershop.line-scdn.net/sticonshop/v1/sticon/${
+      encodeURIComponent(productId)
+    }/android/${encodeURIComponent(sticonId)}.png`;
+  }
+
+  async function ensureSticonImage(
+    productId: string,
+    sticonId: string,
+  ): Promise<string | null> {
+    if (!productId || !sticonId) return null;
+    const safeProduct = productId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const safeSticon = sticonId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const dest = join(
+      stickerDir,
+      `sticon-${safeProduct}-${safeSticon}.png`,
+    );
+    const existing = await existingImage(dest);
+    if (existing) return existing;
+    return await cacheUrl(sticonUrl(productId, sticonId), dest);
+  }
+
   type StickerEntry = {
     stickerId: string;
     packageId: string;
@@ -68,8 +92,23 @@ export function createStickerService(runtime: StickerRuntime) {
     at: number;
   };
 
+  type StickerPackCatalog = {
+    id: string;
+    name: string;
+    version: string;
+    stickers: StickerEntry[];
+  };
+
+  type StickerCatalog = {
+    at: number;
+    packs: StickerPackCatalog[];
+  };
+
   const stickerIndexPath = join(dataDir, "stickers-index.json");
+  const stickerCatalogPath = join(dataDir, "stickers-catalog.json");
   let stickerIndex: StickerEntry[] = [];
+  let stickerCatalog: StickerCatalog | null = null;
+  let catalogRefresh: Promise<void> | null = null;
 
   async function loadStickerIndex() {
     try {
@@ -87,6 +126,39 @@ export function createStickerService(runtime: StickerRuntime) {
     } catch {
       stickerIndex = [];
     }
+    try {
+      const raw = JSON.parse(await Deno.readTextFile(stickerCatalogPath));
+      if (Array.isArray(raw?.packs)) {
+        stickerCatalog = {
+          at: Number(raw.at ?? 0),
+          packs: raw.packs.filter((pack: StickerPackCatalog) =>
+            pack?.id && Array.isArray(pack.stickers)
+          ),
+        };
+      }
+    } catch {
+      stickerCatalog = null;
+    }
+  }
+
+  async function mapPool<T, R>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T, index: number) => Promise<R>,
+  ): Promise<R[]> {
+    const out = new Array<R>(items.length);
+    let cursor = 0;
+    const runners = Array.from(
+      { length: Math.min(concurrency, items.length) },
+      async () => {
+        while (cursor < items.length) {
+          const index = cursor++;
+          out[index] = await worker(items[index]!, index);
+        }
+      },
+    );
+    await Promise.all(runners);
+    return out;
   }
 
   async function saveStickerIndex() {
@@ -173,7 +245,6 @@ export function createStickerService(runtime: StickerRuntime) {
 
   async function stickersForOwnedPackage(
     pkg: OwnedPackage,
-    limit = 40,
   ): Promise<{
     name: string;
     version: string;
@@ -208,7 +279,6 @@ export function createStickerService(runtime: StickerRuntime) {
       }
       const version = String(meta.version ?? pkg.version ?? "1");
       const stickers = (Array.isArray(meta.stickers) ? meta.stickers : [])
-        .slice(0, limit)
         .map((s) => ({
           stickerId: String(s.id ?? ""),
           packageId: pkg.id,
@@ -231,8 +301,16 @@ export function createStickerService(runtime: StickerRuntime) {
     ];
   }
 
+  function packIconPath(packageId: string): string {
+    return join(stickerDir, `pack-${packageId}.png`);
+  }
+
+  function stickerStaticPath(stickerId: string): string {
+    return join(stickerDir, `${stickerId}.png`);
+  }
+
   async function ensurePackIcon(packageId: string): Promise<string | null> {
-    const dest = join(stickerDir, `pack-${packageId}.png`);
+    const dest = packIconPath(packageId);
     const existing = await existingImage(dest);
     if (existing) return existing;
     for (const url of packIconUrls(packageId)) {
@@ -276,7 +354,7 @@ export function createStickerService(runtime: StickerRuntime) {
   async function ensureStickerStatic(
     stickerId: string,
   ): Promise<string | null> {
-    const dest = join(stickerDir, `${stickerId}.png`);
+    const dest = stickerStaticPath(stickerId);
     const existing = await existingImage(dest);
     if (existing) return existing;
     for (const url of stickerUrls(stickerId)) {
@@ -293,93 +371,177 @@ export function createStickerService(runtime: StickerRuntime) {
     return await ensureStickerStatic(stickerId);
   }
 
-  async function doListStickers(id: number | string | null) {
-    const client = runtime.getClient();
-    if (!client) {
-      fail(id, "not_logged_in");
-      return;
+  async function saveStickerCatalog() {
+    if (!stickerCatalog) return;
+    try {
+      await atomicWriteTextFile(
+        stickerCatalogPath,
+        JSON.stringify(stickerCatalog),
+      );
+    } catch (error) {
+      console.error("[sticker catalog]", error);
     }
+  }
 
-    const ownedPkgs = await fetchOwnedPackages();
-    const ownedPkgIds = new Set(ownedPkgs.map((p) => p.id));
-    const versionByPkg = new Map(ownedPkgs.map((p) => [p.id, p.version]));
+  async function refreshStickerCatalog(force = false): Promise<boolean> {
+    await refreshCachePolicy();
+    if (
+      !force && stickerCatalog &&
+      Date.now() - stickerCatalog.at < cachePolicy().ownedPack
+    ) return false;
+    if (catalogRefresh) {
+      await catalogRefresh;
+      return true;
+    }
+    catalogRefresh = (async () => {
+      const owned = await fetchOwnedPackages();
+      const details = await mapPool(
+        owned,
+        8,
+        (pkg) => stickersForOwnedPackage(pkg),
+      );
+      stickerCatalog = {
+        at: Date.now(),
+        packs: details.map((detail, index) => ({
+          id: owned[index]!.id,
+          name: detail.name || owned[index]!.name || owned[index]!.id,
+          version: detail.version,
+          stickers: detail.stickers,
+        })).filter((pack) => pack.stickers.length > 0),
+      };
+      await saveStickerCatalog();
+    })().finally(() => {
+      catalogRefresh = null;
+    });
+    await catalogRefresh;
+    return true;
+  }
 
-    // Recents tab (owned only).
-    const recentEntries: StickerEntry[] = [];
+  async function stickerCatalogPayload(): Promise<Json> {
+    const catalog = stickerCatalog ?? { at: 0, packs: [] };
+    const ownedIds = new Set(catalog.packs.map((pack) => pack.id));
+    const versionByPack = new Map(
+      catalog.packs.map((pack) => [pack.id, pack.version]),
+    );
+    const recent: StickerEntry[] = [];
     const recentSeen = new Set<string>();
-    for (const s of stickerIndex) {
-      if (!ownedPkgIds.has(s.packageId)) continue;
-      const key = `${s.packageId}:${s.stickerId}`;
+    for (const sticker of stickerIndex) {
+      if (!ownedIds.has(sticker.packageId)) continue;
+      const key = `${sticker.packageId}:${sticker.stickerId}`;
       if (recentSeen.has(key)) continue;
       recentSeen.add(key);
-      recentEntries.push({
-        ...s,
-        version: s.version || versionByPkg.get(s.packageId),
+      recent.push({
+        ...sticker,
+        version: sticker.version || versionByPack.get(sticker.packageId),
       });
-      if (recentEntries.length >= 24) break;
+      if (recent.length >= 24) break;
     }
 
-    const packs: Json[] = [];
+    const packs = await mapPool(catalog.packs, 12, async (pack) => {
+      const stickers = await mapPool(pack.stickers, 32, async (sticker) => ({
+        stickerId: sticker.stickerId,
+        packageId: sticker.packageId,
+        version: sticker.version ?? pack.version,
+        imagePath: await existingImage(stickerStaticPath(sticker.stickerId)),
+      }));
+      const iconPath = await existingImage(packIconPath(pack.id)) ??
+        stickers.find((sticker) => sticker.imagePath)?.imagePath ?? null;
+      return {
+        id: pack.id,
+        name: pack.name,
+        version: pack.version,
+        iconPath,
+        recent: false,
+        stickers,
+      };
+    });
 
-    if (recentEntries.length) {
-      const stickers: Json[] = [];
-      for (const s of recentEntries) {
-        stickers.push({
-          stickerId: s.stickerId,
-          packageId: s.packageId,
-          version: s.version ?? null,
-          imagePath: await ensureStickerStatic(s.stickerId),
-        });
-      }
-      packs.push({
+    if (recent.length) {
+      const stickers = await mapPool(recent, 24, async (sticker) => ({
+        stickerId: sticker.stickerId,
+        packageId: sticker.packageId,
+        version: sticker.version ?? "",
+        imagePath: await existingImage(stickerStaticPath(sticker.stickerId)),
+      }));
+      packs.unshift({
         id: "__recent__",
         name: "Recent",
-        version: null,
+        version: "",
         iconPath: stickers[0]?.imagePath ?? null,
         recent: true,
         stickers,
       });
     }
 
-    // Owned packs with full grids + pack icons.
-    for (const pkg of ownedPkgs.slice(0, 12)) {
-      const detail = await stickersForOwnedPackage(pkg, 48);
-      if (!detail.stickers.length) continue;
-      const stickers: Json[] = [];
-      for (const s of detail.stickers) {
-        stickers.push({
-          stickerId: s.stickerId,
-          packageId: s.packageId,
-          version: s.version ?? detail.version,
-          imagePath: await ensureStickerStatic(s.stickerId),
-        });
-      }
-      let iconPath = await ensurePackIcon(pkg.id);
-      if (!iconPath) {
-        const first = stickers[0]?.imagePath;
-        iconPath = typeof first === "string" && first ? first : null;
-      }
-      packs.push({
-        id: pkg.id,
-        name: detail.name || pkg.name || pkg.id,
-        version: detail.version,
-        iconPath,
-        recent: false,
-        stickers,
-      });
-    }
-
-    ok(id, {
+    return {
       packs,
-      // Keep flat list for older UI paths (unused once chooser migrates).
-      stickers: packs.flatMap((p) =>
-        ((p.stickers as Json[]) ?? []).map((s) => ({
-          ...s,
-          recent: p.id === "__recent__",
+      stickers: packs.flatMap((pack) =>
+        pack.stickers.map((sticker) => ({
+          ...sticker,
+          recent: pack.id === "__recent__",
         }))
       ),
-      ownedPackages: ownedPkgs.length,
+      ownedPackages: catalog.packs.length,
+      cached: true,
+    };
+  }
+
+  let thumbnailWarm: Promise<void> | null = null;
+  function warmStickerThumbnails() {
+    if (!stickerCatalog || thumbnailWarm) return;
+    const catalog = stickerCatalog;
+    thumbnailWarm = (async () => {
+      const priorityIds = [
+        ...stickerIndex.slice(0, 24).map((sticker) => sticker.stickerId),
+        ...(catalog.packs[0]?.stickers ?? []).map((sticker) =>
+          sticker.stickerId
+        ),
+      ];
+      const allIds = catalog.packs.flatMap((pack) =>
+        pack.stickers.map((sticker) => sticker.stickerId)
+      );
+      const seen = new Set<string>();
+      const priority = priorityIds.filter((id) =>
+        id && !seen.has(id) && seen.add(id)
+      );
+      const rest = allIds.filter((id) => id && !seen.has(id) && seen.add(id));
+
+      await Promise.all([
+        mapPool(catalog.packs, 12, (pack) => ensurePackIcon(pack.id)),
+        mapPool(priority, 24, (stickerId) => ensureStickerStatic(stickerId)),
+      ]);
+      emitEvent("stickers_updated", await stickerCatalogPayload());
+      await mapPool(rest, 24, (stickerId) => ensureStickerStatic(stickerId));
+      emitEvent("stickers_updated", await stickerCatalogPayload());
+    })().catch((error) => {
+      console.error("[sticker thumbnail warm]", error);
+    }).finally(() => {
+      thumbnailWarm = null;
     });
+  }
+
+  async function doListStickers(id: number | string | null) {
+    const client = runtime.getClient();
+    if (!client) {
+      fail(id, "not_logged_in");
+      return;
+    }
+    try {
+      if (!stickerCatalog?.packs.length) {
+        await refreshStickerCatalog(true);
+      }
+      ok(id, await stickerCatalogPayload());
+      warmStickerThumbnails();
+      if (stickerCatalog) {
+        void refreshStickerCatalog(false).then(async (updated) => {
+          if (!updated) return;
+          emitEvent("stickers_updated", await stickerCatalogPayload());
+          warmStickerThumbnails();
+        });
+      }
+    } catch (error) {
+      fail(id, error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function doSendSticker(
@@ -474,6 +636,8 @@ export function createStickerService(runtime: StickerRuntime) {
     ensureStatic: ensureStickerStatic,
     ensureImage: ensureStickerImage,
     animationUrl: (stickerId: string) => stickerAnimationUrls(stickerId)[0],
+    ensureSticon: ensureSticonImage,
+    sticonUrl,
     list: doListStickers,
     send: doSendSticker,
     resetOwnedCache: () => {

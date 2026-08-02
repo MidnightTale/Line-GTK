@@ -44,6 +44,8 @@ pub struct ShellWidgets {
     pub sticker_btn: gtk::Button,
     pub call_btn: gtk::Button,
     pub mute_btn: gtk::Button,
+    pub pin_btn: gtk::Button,
+    pub album_btn: gtk::Button,
     pub jump_banner: gtk::Revealer,
     pub jump_banner_btn: gtk::Button,
     pub jump_banner_label: gtk::Label,
@@ -91,6 +93,7 @@ pub fn build_shell_page() -> ShellWidgets {
         .visible(false)
         .css_classes(["line-title-avatar"])
         .build();
+    profile_avatar.set_overflow(gtk::Overflow::Hidden);
     let profile_label = gtk::Label::builder()
         .label("LINE GTK")
         .css_classes(["heading", "line-title-name"])
@@ -297,7 +300,21 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["flat", "circular"])
         .sensitive(false)
         .build();
+    let pin_btn = gtk::Button::builder()
+        .icon_name("non-starred-symbolic")
+        .tooltip_text("Pin chat")
+        .css_classes(["flat", "circular"])
+        .sensitive(false)
+        .build();
+    let album_btn = gtk::Button::builder()
+        .icon_name("folder-pictures-symbolic")
+        .tooltip_text("Chat album")
+        .css_classes(["flat", "circular"])
+        .sensitive(false)
+        .build();
     chat_bar.append(&title_col);
+    chat_bar.append(&album_btn);
+    chat_bar.append(&pin_btn);
     chat_bar.append(&mute_btn);
     chat_bar.append(&call_btn);
 
@@ -587,6 +604,8 @@ pub fn build_shell_page() -> ShellWidgets {
         sticker_btn,
         call_btn,
         mute_btn,
+        pin_btn,
+        album_btn,
         jump_banner,
         jump_banner_btn,
         jump_banner_label,
@@ -691,7 +710,6 @@ pub fn load_css() {
         }
         .line-title-avatar {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 26px;
             min-height: 26px;
             background: alpha(@borders, 0.35);
@@ -701,7 +719,6 @@ pub fn load_css() {
         }
         .line-avatar-frame {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 48px;
             min-height: 48px;
             background: alpha(@borders, 0.35);
@@ -728,7 +745,6 @@ pub fn load_css() {
         }
         .line-call-avatar {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 96px;
             min-height: 96px;
             background: alpha(@accent_bg_color, 0.35);
@@ -810,6 +826,44 @@ pub fn load_css() {
         }
         .line-media-viewer-root {
             background: @window_bg_color;
+        }
+        .line-media-review-window,
+        .line-media-review {
+            background: @window_bg_color;
+        }
+        .line-media-review-grid {
+            padding: 16px;
+            background: @view_bg_color;
+        }
+        .line-media-review-card {
+            padding: 8px;
+            border-radius: 12px;
+            background: alpha(@card_bg_color, 0.96);
+            border: 1px solid alpha(@borders, 0.45);
+        }
+        .line-media-review-preview {
+            border-radius: 9px;
+            background: alpha(@borders, 0.20);
+        }
+        .line-media-review-thumb {
+            border-radius: 9px;
+        }
+        .line-media-review-file-icon {
+            padding: 32px;
+        }
+        .line-media-review-remove {
+            min-width: 30px;
+            min-height: 30px;
+            margin: 6px;
+            color: @window_bg_color;
+            background: alpha(@window_fg_color, 0.76);
+            box-shadow: 0 1px 3px alpha(@window_fg_color, 0.28);
+        }
+        .line-media-review-remove:hover {
+            background: alpha(@window_fg_color, 0.92);
+        }
+        .line-media-review-footer {
+            border-top: 1px solid alpha(@borders, 0.38);
         }
         .line-media-viewer-bar {
             background: alpha(@headerbar_bg_color, 0.96);
@@ -899,7 +953,18 @@ pub fn load_css() {
             min-height: 42px;
         }
         .line-chat-name { font-weight: 650; }
+        .line-chat-pinned { color: @accent_color; opacity: 0.9; }
         .line-chat-preview { opacity: 0.72; font-size: 0.85em; }
+        .line-album-thumb-btn {
+            padding: 0;
+            border-radius: 14px;
+        }
+        .line-album-thumb {
+            min-width: 160px;
+            min-height: 160px;
+            border-radius: 14px;
+            background: alpha(@borders, 0.22);
+        }
         .line-bubble-image {
             border-radius: 12px;
             max-width: min(420px, 72%);
@@ -987,6 +1052,63 @@ pub fn load_css() {
             margin-bottom: 4px;
             margin-left: 4px;
             margin-right: 4px;
+        }
+        .line-message-reactions {
+            margin-top: 2px;
+        }
+        .line-message-reaction-chip {
+            min-height: 24px;
+            padding: 1px 7px;
+            border-radius: 999px;
+            font-size: 0.78em;
+            background: alpha(@card_bg_color, 0.78);
+            border: 1px solid alpha(@borders, 0.42);
+        }
+        .line-message-reaction-mine {
+            color: @accent_color;
+            background: alpha(@accent_bg_color, 0.18);
+            border-color: alpha(@accent_bg_color, 0.48);
+        }
+        .line-message-reaction-choice {
+            min-width: 38px;
+            min-height: 38px;
+            padding: 2px;
+            font-size: 1.2em;
+        }
+        .line-message-reaction-choice:hover {
+            background: alpha(@accent_bg_color, 0.16);
+        }
+        .line-message-unsend {
+            color: @destructive_color;
+        }
+        .line-msg-sender-name {
+            font-size: 0.78em;
+            font-weight: 650;
+            opacity: 0.78;
+            margin-left: 6px;
+        }
+        .line-msg-avatar-btn {
+            min-width: 38px;
+            min-height: 38px;
+            padding: 2px;
+            margin-top: 18px;
+        }
+        .line-msg-avatar,
+        .line-sender-profile-avatar {
+            border-radius: 999px;
+            background: alpha(@borders, 0.25);
+        }
+        .line-msg-avatar-btn:hover {
+            background: alpha(@accent_bg_color, 0.16);
+        }
+        .line-sender-profile {
+            min-width: 280px;
+        }
+        .line-sender-profile-name {
+            font-weight: 750;
+        }
+        .line-sender-profile-status {
+            padding: 4px 12px;
         }
         .line-day-sep-row {
             margin-top: 12px;
