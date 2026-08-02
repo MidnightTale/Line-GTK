@@ -65,6 +65,12 @@ pub(super) struct AppState {
     pub media_msgs: Rc<RefCell<HashMap<String, MessageInfo>>>,
     pub receipt_slots: Rc<RefCell<HashMap<String, gtk::Label>>>,
     pub msg_created: Rc<RefCell<HashMap<String, i64>>>,
+    /// Fully hydrated message rows retained while the app is running. The
+    /// protocol sidecar remains the durable disk cache; this layer makes
+    /// switching back to an already-opened chat immediate.
+    pub message_cache: Rc<RefCell<HashMap<String, Vec<MessageInfo>>>>,
+    /// Cancels idle render jobs when a thread is rebuilt or another chat opens.
+    pub message_render_gen: Rc<RefCell<u64>>,
     pub last_msg_day: Rc<RefCell<Option<String>>>,
     pub seen_msg_ids: Rc<RefCell<HashSet<String>>>,
     pub last_incoming_id: Rc<RefCell<Option<String>>>,
@@ -105,6 +111,12 @@ pub(super) struct AppState {
     pub sticker_popover: gtk::Popover,
     pub call_btn: gtk::Button,
     pub mute_btn: gtk::Button,
+    pub pin_btn: gtk::Button,
+    pub album_btn: gtk::Button,
+    pub background_btn: gtk::Button,
+    pub background_popover: gtk::Popover,
+    pub message_background_layer: gtk::Box,
+    pub message_background_picture: gtk::Picture,
     pub composer_stack: gtk::Stack,
     pub record_cancel_btn: gtk::Button,
     pub record_send_btn: gtk::Button,
@@ -124,6 +136,8 @@ pub(super) struct AppState {
     pub call_ui: Rc<RefCell<Option<call_window::CallUi>>>,
     pub call_mic_muted: Rc<RefCell<bool>>,
     pub call_deafened: Rc<RefCell<bool>>,
+    pub call_video_capable: Rc<RefCell<bool>>,
+    pub call_screen_sharing: Rc<RefCell<bool>>,
     pub tray: Rc<RefCell<Option<crate::tray::TrayController>>>,
     pub tray_tx: async_channel::Sender<crate::tray::TrayAction>,
     pub discord: crate::discord_rpc::DiscordRpc,
@@ -133,16 +147,26 @@ pub(super) struct AppState {
     pub self_avatar_path: Rc<RefCell<Option<String>>>,
     pub self_picture_url: Rc<RefCell<Option<String>>>,
     pub msg_list_fp: Rc<RefCell<Option<MessageListFingerprint>>>,
-    pub notif_pending: Rc<RefCell<HashMap<String, PendingNotif>>>,
+    pub notified_msg_ids: Rc<RefCell<HashSet<String>>>,
     pub media_ready_paths: Rc<RefCell<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct PendingNotif {
-    pub chat_mid: String,
-    pub title: String,
-    pub body: String,
+pub(super) struct ProfileChatTarget {
+    pub mid: String,
+    pub name: String,
     pub avatar_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProfilePendingUi {
+    pub target: Rc<RefCell<ProfileChatTarget>>,
+    pub avatar: gtk::Picture,
+    pub name_label: gtk::Label,
+    pub bio_label: gtk::Label,
+    pub status: gtk::Label,
+    pub add_btn: gtk::Button,
+    pub chat_btn: gtk::Button,
 }
 
 #[derive(Debug, Clone)]
@@ -164,4 +188,10 @@ pub(super) enum Pending {
         content_type: String,
         suggest_name: String,
     },
+    ProfileLookup(ProfilePendingUi),
+    ProfileAddFriend(ProfilePendingUi),
+    ReactMessage,
+    UnsendMessage,
+    CallScreenStart,
+    CallScreenStop,
 }

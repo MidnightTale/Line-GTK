@@ -115,6 +115,10 @@ export interface PlanetTransportOpts {
 	keepaliveIntervalMs?: number;
 	mediaKeyMode?: PlanetMediaKeyMode;
 	rtpTimestampStep?: number;
+	/** Advertise and configure the native PT97 VIDEO path for screen sharing. */
+	enableVideo?: boolean;
+	videoBitrateKbps?: number;
+	videoFps?: number;
 	preferIpv6?: boolean;
 	groupDataSessionAfterProvisional?: boolean;
 	wireSend?: (
@@ -221,6 +225,8 @@ interface MediaKeyCandidate {
 	recv: string;
 	sendContext: SrtpCryptoContext;
 	recvContext: SrtpCryptoContext;
+	videoSendContext?: SrtpCryptoContext;
+	videoRecvContext?: SrtpCryptoContext;
 }
 
 const MEDIA_KEY_SELECTIONS: Record<
@@ -863,7 +869,11 @@ function fieldText(fields: DecodedField[], tag: number): string | undefined {
 	return /^[\x20-\x7e]{0,80}$/.test(s) ? s : undefined;
 }
 
-function defaultLocalMediaOffer(): PlanetLocalMediaOffer {
+function defaultLocalMediaOffer(opts: {
+	videoEnabled?: boolean;
+	videoBitrateKbps?: number;
+	videoFps?: number;
+} = {}): PlanetLocalMediaOffer {
 	const media = generateEphemeralKeypair();
 	const material: PlanetSetupOfferMaterial = {
 		mediaPubKey: media.publicKey,
@@ -877,7 +887,7 @@ function defaultLocalMediaOffer(): PlanetLocalMediaOffer {
 			privateKey: copyBytes(media.privateKey),
 		},
 		material: cloneMediaOfferMaterial(material),
-		offer: packNativeSetupOffer(material),
+		offer: packNativeSetupOffer(material, opts),
 	};
 }
 
@@ -979,6 +989,8 @@ export class PlanetTransport implements CallTransport {
 	#localMediaChanId = 1n;
 	#srtpSend?: SrtpCryptoContext;
 	#srtpRecv?: SrtpCryptoContext;
+	#videoSrtpSend?: SrtpCryptoContext;
+	#videoSrtpRecv?: SrtpCryptoContext;
 	#groupDataSrtpSend?: SrtpCryptoContext;
 	#dataSrtpRecv?: SrtpCryptoContext;
 	/** Extra DATA-channel recv contexts (line-gtk patch for PT98). */
@@ -987,6 +999,14 @@ export class PlanetTransport implements CallTransport {
 	#mediaKeyMode?: PlanetMediaKeyMode;
 	#mediaKeyCandidates: MediaKeyCandidate[] = [];
 	#rtp?: {
+		host: string;
+		port: number;
+		payloadType: number;
+		ssrc: number;
+		seq: number;
+		timestamp: number;
+	};
+	#videoRtp?: {
 		host: string;
 		port: number;
 		payloadType: number;
@@ -1105,6 +1125,8 @@ export class PlanetTransport implements CallTransport {
 		this.#peerMediaOffer = undefined;
 		this.#srtpSend = undefined;
 		this.#srtpRecv = undefined;
+		this.#videoSrtpSend = undefined;
+		this.#videoSrtpRecv = undefined;
 		this.#groupDataSrtpSend = undefined;
 		this.#dataSrtpRecv = undefined;
 		this.#dataSrtpRecvCandidates = [];
@@ -1112,6 +1134,7 @@ export class PlanetTransport implements CallTransport {
 		this.#mediaKeyMode = undefined;
 		this.#mediaKeyCandidates = [];
 		this.#rtp = undefined;
+		this.#videoRtp = undefined;
 		this.#groupDataRtp = undefined;
 		this.#rtpQueue = [];
 		this.#queued = [];
@@ -1683,7 +1706,11 @@ export class PlanetTransport implements CallTransport {
 		const cid = this.#callUuid!;
 		const localMediaOffer = this.#opts.setupOffer
 			? undefined
-			: defaultLocalMediaOffer();
+			: defaultLocalMediaOffer({
+				videoEnabled: this.#opts.enableVideo,
+				videoBitrateKbps: this.#opts.videoBitrateKbps,
+				videoFps: this.#opts.videoFps,
+			});
 		if (localMediaOffer) this.#localMediaOffer = localMediaOffer;
 		const setup: CcSetupReq = {
 			initiator: this.#opts.localMid,
@@ -1707,7 +1734,8 @@ export class PlanetTransport implements CallTransport {
 					cid,
 				),
 			fakeCall: false,
-			svcKey: this.#opts.serviceKey ?? "freecall.audio",
+			svcKey: this.#opts.serviceKey ??
+				(this.#opts.enableVideo ? "freecall.video" : "freecall.audio"),
 			netType: 1,
 			stid: this.#route.stid,
 			features: this.#opts.features ?? defaultSetupFeatures(),
@@ -2118,6 +2146,12 @@ export class PlanetTransport implements CallTransport {
 					...selection,
 					sendContext: await deriveSrtpContext(sendKeying),
 					recvContext: await deriveSrtpContext(recvKeying),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(sendKeying, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(recvKeying, "VIDEO"),
+					),
 				}, {
 					mode: audioMediaKeyMode(selection.mode),
 					send: `AUDIO/${selection.send}`,
@@ -2127,6 +2161,12 @@ export class PlanetTransport implements CallTransport {
 					),
 					recvContext: await deriveSrtpContext(
 						derivePlanetMediaStreamKeying(recvKeying, "AUDIO"),
+					),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(sendKeying, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(recvKeying, "VIDEO"),
 					),
 				});
 				// line-gtk: keep DATA stream contexts for PT98 (1:1 data channel).
@@ -2151,6 +2191,12 @@ export class PlanetTransport implements CallTransport {
 					recv: "local-secret",
 					sendContext: await deriveSrtpContext(peerOffer.mediaSecret),
 					recvContext: await deriveSrtpContext(local.material.mediaSecret),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(peerOffer.mediaSecret, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(local.material.mediaSecret, "VIDEO"),
+					),
 				},
 				{
 					mode: "secret-sender",
@@ -2158,6 +2204,12 @@ export class PlanetTransport implements CallTransport {
 					recv: "peer-secret",
 					sendContext: await deriveSrtpContext(local.material.mediaSecret),
 					recvContext: await deriveSrtpContext(peerOffer.mediaSecret),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(local.material.mediaSecret, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(peerOffer.mediaSecret, "VIDEO"),
+					),
 				},
 				{
 					mode: "audio-secret-receiver",
@@ -2169,6 +2221,12 @@ export class PlanetTransport implements CallTransport {
 					recvContext: await deriveSrtpContext(
 						derivePlanetMediaStreamKeying(local.material.mediaSecret, "AUDIO"),
 					),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(peerOffer.mediaSecret, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(local.material.mediaSecret, "VIDEO"),
+					),
 				},
 				{
 					mode: "audio-secret-sender",
@@ -2179,6 +2237,12 @@ export class PlanetTransport implements CallTransport {
 					),
 					recvContext: await deriveSrtpContext(
 						derivePlanetMediaStreamKeying(peerOffer.mediaSecret, "AUDIO"),
+					),
+					videoSendContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(local.material.mediaSecret, "VIDEO"),
+					),
+					videoRecvContext: await deriveSrtpContext(
+						derivePlanetMediaStreamKeying(peerOffer.mediaSecret, "VIDEO"),
 					),
 				},
 			);
@@ -2201,6 +2265,13 @@ export class PlanetTransport implements CallTransport {
 		if (!initial) return false;
 		this.#srtpSend = initial.sendContext;
 		this.#srtpRecv = initial.recvContext;
+		this.#videoSrtpSend = this.#opts.enableVideo
+			? initial.videoSendContext
+			: undefined;
+		this.#videoSrtpRecv = this.#opts.enableVideo
+			? initial.videoRecvContext
+			: undefined;
+		this.#videoRtp = undefined;
 		this.#groupDataSrtpSend = undefined;
 		this.#groupDataRtp = undefined;
 		this.#dataSrtpRecv = undefined;
@@ -2272,6 +2343,11 @@ export class PlanetTransport implements CallTransport {
 			) ?? peerOffer.media.find((m) =>
 				m.kind === 1 && m.enabled !== 0 && m.rtpId !== undefined
 			);
+		const video = peerOffer.media.find((m) =>
+			m.name === "V" && m.enabled !== 0 && m.rtpId !== undefined
+		) ?? peerOffer.media.find((m) =>
+			m.kind === 2 && m.enabled !== 0 && m.rtpId !== undefined
+		);
 		const data =
 			peerOffer.media.find((m) =>
 				m.name === "D" && m.enabled !== 0 && m.rtpId !== undefined
@@ -2287,6 +2363,7 @@ export class PlanetTransport implements CallTransport {
 		// 1:1: send with OUR SETUP-offer SSRCs (101/121), never the peer's
 		// rtpPort/rtcpId. Using the peer's ids makes CONN checks fail → 511.
 		const localAudioSsrc = LOCAL_1TO1_AUDIO_RTP_SSRC;
+		const localVideoSsrc = LOCAL_1TO1_VIDEO_RTP_SSRC;
 		const localDataSsrc = LOCAL_1TO1_DATA_RTP_SSRC;
 		this.#peerMediaOffer = peerOffer;
 		this.#rtp = {
@@ -2298,6 +2375,18 @@ export class PlanetTransport implements CallTransport {
 			seq: randomIntInclusive(0, 0xffff),
 			timestamp: 0,
 		};
+		if (
+			this.#opts.enableVideo && this.#videoSrtpSend && video?.rtpId !== undefined
+		) {
+			this.#videoRtp = {
+				host: endpoint.host,
+				port: endpoint.port,
+				payloadType: video.rtpId,
+				ssrc: localVideoSsrc,
+				seq: randomIntInclusive(0, 0xffff),
+				timestamp: randomIntInclusive(0, 0x7fffffff),
+			};
+		}
 		if (this.#groupDataSrtpSend) {
 			this.#groupDataRtp = {
 				ssrc: this.#groupDataSsrc ?? localDataSsrc,
@@ -2317,8 +2406,12 @@ export class PlanetTransport implements CallTransport {
 			rtcpId: audio?.rtcpId,
 			rtpPort: audio?.rtpPort,
 			localAudioSsrc,
+			localVideoSsrc,
 			localDataSsrc,
 			peerAudioRtpPort: audio?.rtpPort,
+			peerVideoRtpPort: video?.rtpPort,
+			videoEnabled: !!this.#videoRtp,
+			videoPayloadType: this.#videoRtp?.payloadType,
 			groupDataSsrc: this.#groupDataRtp?.ssrc,
 			dataPayloadType: this.#dataRtpPayloadType,
 			dataRecvContexts: this.#dataSrtpRecvCandidates.length +
@@ -2730,6 +2823,75 @@ export class PlanetTransport implements CallTransport {
 		);
 		await this.#sendGroupDataRtpControl();
 		await this.#sendGroupRtcpFeedback();
+	}
+
+	videoReady(): boolean {
+		return !!this.#videoSrtpSend && !!this.#videoRtp;
+	}
+
+	/** Send one already-packetized native video RTP payload.
+	 *
+	 * The caller is responsible for codec framing (for H.264, RFC 6184 NAL or
+	 * FU-A payloads). All fragments in one frame share a timestamp; set
+	 * `endOfFrame` only on the final fragment so the RTP marker and 90 kHz clock
+	 * advance together.
+	 */
+	async sendVideo(
+		videoPayload: Uint8Array,
+		opts: { endOfFrame?: boolean; timestampStep?: number } = {},
+	): Promise<void> {
+		if (!this.#videoSrtpSend || !this.#videoRtp) {
+			throw new Error("PlanetTransport.sendVideo: video media not established");
+		}
+		const video = this.#videoRtp;
+		const seq = video.seq++ & 0xffff;
+		const timestamp = video.timestamp >>> 0;
+		const endOfFrame = !!opts.endOfFrame;
+		const rtp = buildRtp({
+			payloadType: video.payloadType,
+			marker: endOfFrame,
+			seq,
+			timestamp,
+			ssrc: video.ssrc,
+			payload: videoPayload,
+		});
+		const wire = await srtpEncrypt(this.#videoSrtpSend, rtp);
+		this.#debug({
+			type: "video_send",
+			bytes: wire.length,
+			payloadBytes: videoPayload.length,
+			payloadType: video.payloadType,
+			marker: endOfFrame,
+			ssrc: video.ssrc,
+			seq,
+			timestamp,
+		});
+		if (this.#opts.wireSend) {
+			await this.#opts.wireSend(wire, {
+				host: video.host,
+				port: video.port,
+				bootstrap: false,
+				seq: video.seq,
+				plainLen: videoPayload.length,
+				bodyLen: wire.length,
+				plaintext: videoPayload,
+			});
+		} else {
+			if (!this.#sock) {
+				throw new Error("PlanetTransport.sendVideo: socket closed");
+			}
+			await new Promise<void>((res, rj) =>
+				this.#sock!.send(
+					Buffer.from(wire),
+					video.port,
+					video.host,
+					(e) => (e ? rj(e) : res()),
+				)
+			);
+		}
+		if (endOfFrame) {
+			video.timestamp = (video.timestamp + (opts.timestampStep ?? 3750)) >>> 0;
+		}
 	}
 
 	#nextAudioRtpTimestamp(timestampStep: number): number {

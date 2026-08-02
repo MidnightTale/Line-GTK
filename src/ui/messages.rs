@@ -53,9 +53,15 @@ pub(super) fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     }
 
     let chat_mid = state.current_chat.borrow().clone();
+    let render_gen = *state.message_render_gen.borrow();
     let state_c = state.clone();
     let batch = Rc::new(RefCell::new(messages));
     glib::idle_add_local(move || {
+        if state_c.current_chat.borrow().as_ref() != chat_mid.as_ref()
+            || *state_c.message_render_gen.borrow() != render_gen
+        {
+            return glib::ControlFlow::Break;
+        }
         let mut left = batch.borrow_mut();
         let take = left.len().min(14);
         if take == 0 {
@@ -181,7 +187,8 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
     let waiting_visual = (msg.content_type.eq_ignore_ascii_case("image")
         || msg.content_type.eq_ignore_ascii_case("sticker")
         || msg.content_type.eq_ignore_ascii_case("video"))
-        && !has_image;
+        && !has_image
+        && !msg.media_failed;
     let is_audio = msg.content_type.eq_ignore_ascii_case("audio");
     let is_file = msg.content_type.eq_ignore_ascii_case("file");
     let is_video = msg.content_type.eq_ignore_ascii_case("video");
@@ -255,6 +262,19 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
                 bubble.append(&pic);
             }
         }
+    } else if msg.media_failed && (is_image || is_video || is_sticker) {
+        if is_video {
+            append_video_placeholder(state, &bubble, msg, true);
+        } else {
+            bubble.append(
+                &gtk::Label::builder()
+                    .label(crate::i18n::t("media_download_failed"))
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["dim-label", "line-media-failed"])
+                    .build(),
+            );
+        }
     } else if waiting_visual {
         if is_video {
             append_video_placeholder(state, &bubble, msg, false);
@@ -271,6 +291,9 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             bubble.append(&placeholder);
         }
     }
+
+    append_message_reactions(state, &bubble, msg);
+    wire_message_actions(state, &bubble, msg);
 
     if !msg.id.is_empty() && message_tracks_media(msg) {
         state
@@ -335,14 +358,97 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         outer.append(&gtk::Box::builder().hexpand(true).build());
         outer.append(&col);
     } else {
-        // Incoming: bubble + time on the right (mobile style).
+        // Incoming: sender profile + name + bubble/time (mobile group/OpenChat style).
+        let sender_col = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .halign(gtk::Align::Start)
+            .build();
+        if !msg.sender_name.is_empty() {
+            let sender_name = gtk::Label::builder()
+                .label(&msg.sender_name)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(34)
+                .css_classes(["line-msg-sender-name"])
+                .build();
+            sender_col.append(&sender_name);
+        }
+        let bubble_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .valign(gtk::Align::End)
+            .build();
         let time = gtk::Label::builder()
             .label(&time_txt)
             .valign(gtk::Align::End)
             .css_classes(["line-msg-time"])
             .build();
-        outer.append(&bubble);
-        outer.append(&time);
+        bubble_line.append(&bubble);
+        bubble_line.append(&time);
+        sender_col.append(&bubble_line);
+
+        // Keep the sender avatar in its own non-expanding slot. GtkButton's
+        // width/height requests are minimums, so an intrinsically large image
+        // could make the whole button grow on media-message rows.
+        let avatar_slot = gtk::Overlay::builder()
+            .width_request(38)
+            .height_request(38)
+            .hexpand(false)
+            .vexpand(false)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .tooltip_text(if msg.sender_name.is_empty() {
+                msg.from.clone()
+            } else {
+                msg.sender_name.clone()
+            })
+            .css_classes(["line-msg-avatar-slot"])
+            .build();
+        avatar_slot.set_overflow(gtk::Overflow::Hidden);
+        avatar_slot.set_cursor_from_name(Some("pointer"));
+        if let Some(path) = msg
+            .sender_avatar_path
+            .as_deref()
+            .filter(|path| std::path::Path::new(path).exists())
+        {
+            let avatar = gtk::Picture::builder()
+                .content_fit(gtk::ContentFit::Cover)
+                .can_shrink(true)
+                .width_request(34)
+                .height_request(34)
+                .hexpand(false)
+                .vexpand(false)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .css_classes(["line-msg-avatar"])
+                .build();
+            avatar.set_overflow(gtk::Overflow::Hidden);
+            attach_avatar_texture_async(avatar.clone(), path.to_string(), 34);
+            avatar_slot.set_child(Some(&avatar));
+        } else {
+            avatar_slot.set_child(Some(
+                &gtk::Image::builder()
+                    .icon_name("avatar-default-symbolic")
+                    .pixel_size(24)
+                    .hexpand(false)
+                    .vexpand(false)
+                    .halign(gtk::Align::Center)
+                    .valign(gtk::Align::Center)
+                    .build(),
+            ));
+        }
+        {
+            let state = state.clone();
+            let profile = msg.clone();
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                open_sender_profile(&state, &profile);
+            });
+            avatar_slot.add_controller(click);
+        }
+        outer.append(&avatar_slot);
+        outer.append(&sender_col);
         outer.append(&gtk::Box::builder().hexpand(true).build());
     }
 
@@ -368,6 +474,378 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
     list.append(&row);
 }
 
+fn reaction_choices() -> [(&'static str, &'static str); 6] {
+    [
+        ("NICE", "👍"),
+        ("LOVE", "❤️"),
+        ("FUN", "😂"),
+        ("AMAZING", "😮"),
+        ("SAD", "😢"),
+        ("OMG", "😱"),
+    ]
+}
+
+fn reaction_emoji(kind: &str) -> &'static str {
+    reaction_choices()
+        .into_iter()
+        .find_map(|(candidate, emoji)| (candidate == kind).then_some(emoji))
+        .unwrap_or("🙂")
+}
+
+fn request_message_reaction(state: &AppState, chat_mid: &str, message_id: &str, reaction: &str) {
+    match state.sidecar.react_message(chat_mid, message_id, reaction) {
+        Ok(id) => {
+            state.pending.borrow_mut().insert(id, Pending::ReactMessage);
+        }
+        Err(error) => toast(
+            state,
+            &crate::i18n::tf("message_reaction_failed", &[("error", &error.to_string())]),
+        ),
+    }
+}
+
+fn append_message_reactions(state: &AppState, bubble: &gtk::Box, msg: &MessageInfo) {
+    let visible: Vec<_> = msg
+        .reactions
+        .iter()
+        .filter(|reaction| reaction.count > 0)
+        .collect();
+    if visible.is_empty() {
+        return;
+    }
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .css_classes(["line-message-reactions"])
+        .build();
+    for reaction in visible {
+        let button = gtk::Button::builder()
+            .label(format!(
+                "{} {}",
+                reaction_emoji(&reaction.kind),
+                reaction.count
+            ))
+            .tooltip_text(crate::i18n::t("message_react"))
+            .css_classes(["flat", "line-message-reaction-chip"])
+            .build();
+        if reaction.mine {
+            button.add_css_class("line-message-reaction-mine");
+        }
+        let state = state.clone();
+        let chat_mid = msg.chat_mid.clone();
+        let message_id = msg.id.clone();
+        let kind = if reaction.mine {
+            "UNDO".to_string()
+        } else {
+            reaction.kind.clone()
+        };
+        button.connect_clicked(move |_| {
+            request_message_reaction(&state, &chat_mid, &message_id, &kind);
+        });
+        bar.append(&button);
+    }
+    bubble.append(&bar);
+}
+
+fn request_message_unsend(state: &AppState, msg: &MessageInfo) {
+    let dialog = libadwaita::AlertDialog::new(
+        Some(&crate::i18n::t("message_unsend_title")),
+        Some(&crate::i18n::t("message_unsend_body")),
+    );
+    dialog.add_response("cancel", &crate::i18n::t("cancel"));
+    dialog.add_response("unsend", &crate::i18n::t("message_unsend"));
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("unsend", libadwaita::ResponseAppearance::Destructive);
+    let parent = state.window.clone();
+    let state = state.clone();
+    let chat_mid = msg.chat_mid.clone();
+    let message_id = msg.id.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response != "unsend" {
+            return;
+        }
+        match state.sidecar.unsend_message(&chat_mid, &message_id) {
+            Ok(id) => {
+                state
+                    .pending
+                    .borrow_mut()
+                    .insert(id, Pending::UnsendMessage);
+            }
+            Err(error) => toast(
+                &state,
+                &crate::i18n::tf("message_unsend_failed", &[("error", &error.to_string())]),
+            ),
+        }
+    });
+    dialog.present(Some(&parent));
+}
+
+fn wire_message_actions(state: &AppState, bubble: &gtk::Box, msg: &MessageInfo) {
+    if msg.id.is_empty() || msg.id.starts_with("pending-") {
+        return;
+    }
+    let popover = gtk::Popover::builder()
+        .has_arrow(true)
+        .autohide(true)
+        .css_classes(["line-message-actions-popover"])
+        .build();
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    root.append(
+        &gtk::Label::builder()
+            .label(crate::i18n::t("message_react"))
+            .xalign(0.0)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+    let reactions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(2)
+        .css_classes(["line-message-reaction-picker"])
+        .build();
+    for (kind, emoji) in reaction_choices() {
+        let button = gtk::Button::builder()
+            .label(emoji)
+            .tooltip_text(format!("{} · {kind}", crate::i18n::t("message_react")))
+            .css_classes(["flat", "circular", "line-message-reaction-choice"])
+            .build();
+        let state = state.clone();
+        let chat_mid = msg.chat_mid.clone();
+        let message_id = msg.id.clone();
+        let popover = popover.clone();
+        button.connect_clicked(move |_| {
+            popover.popdown();
+            request_message_reaction(&state, &chat_mid, &message_id, kind);
+        });
+        reactions.append(&button);
+    }
+    root.append(&reactions);
+    if msg.mine {
+        root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let unsend = gtk::Button::builder()
+            .label(crate::i18n::t("message_unsend"))
+            .halign(gtk::Align::Fill)
+            .css_classes(["flat", "destructive-action", "line-message-unsend"])
+            .build();
+        let state = state.clone();
+        let msg = msg.clone();
+        let popover = popover.clone();
+        unsend.connect_clicked(move |_| {
+            popover.popdown();
+            request_message_unsend(&state, &msg);
+        });
+        root.append(&unsend);
+    }
+    popover.set_child(Some(&root));
+    popover.set_parent(bubble);
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    let popover_c = popover.clone();
+    click.connect_pressed(move |gesture, _presses, x, y| {
+        popover_c.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover_c.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    bubble.add_controller(click);
+}
+
+pub(super) fn open_sender_profile(state: &AppState, msg: &MessageInfo) {
+    let display_name = if msg.sender_name.is_empty() {
+        msg.from.clone()
+    } else {
+        msg.sender_name.clone()
+    };
+    let win = gtk::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .resizable(false)
+        .default_width(360)
+        .title(&display_name)
+        .css_classes(["line-sender-profile-window"])
+        .build();
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .halign(gtk::Align::Fill)
+        .css_classes(["line-sender-profile"])
+        .build();
+    let avatar = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .can_shrink(true)
+        .width_request(96)
+        .height_request(96)
+        .halign(gtk::Align::Center)
+        .css_classes(["line-sender-profile-avatar"])
+        .build();
+    avatar.set_overflow(gtk::Overflow::Hidden);
+    if let Some(path) = msg
+        .sender_avatar_path
+        .as_deref()
+        .filter(|path| std::path::Path::new(path).exists())
+    {
+        attach_avatar_texture_async(avatar.clone(), path.to_string(), 96);
+    }
+    root.append(&avatar);
+    let name_label = gtk::Label::builder()
+        .label(&display_name)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["title-2", "line-sender-profile-name"])
+        .build();
+    root.append(&name_label);
+    let bio_label = gtk::Label::builder()
+        .label(&msg.sender_status_message)
+        .wrap(true)
+        .selectable(true)
+        .justify(gtk::Justification::Center)
+        .visible(!msg.sender_status_message.is_empty())
+        .css_classes(["dim-label", "line-sender-profile-status"])
+        .build();
+    root.append(&bio_label);
+    root.append(
+        &gtk::Label::builder()
+            .label(if msg.sender_kind == "openchat" {
+                format!("OpenChat member · {}", msg.from)
+            } else {
+                format!("LINE · {}", msg.from)
+            })
+            .selectable(true)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+
+    let relation_status = gtk::Label::builder()
+        .label(crate::i18n::t("profile_checking"))
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["caption", "dim-label", "line-profile-relation"])
+        .build();
+    root.append(&relation_status);
+
+    let actions = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .css_classes(["line-sender-profile-actions"])
+        .build();
+    let add_btn = gtk::Button::builder()
+        .label(crate::i18n::t("profile_add_friend"))
+        .sensitive(false)
+        .css_classes(["suggested-action"])
+        .build();
+    let chat_btn = gtk::Button::builder()
+        .label(crate::i18n::t("profile_private_chat"))
+        .sensitive(false)
+        .build();
+    actions.append(&add_btn);
+    actions.append(&chat_btn);
+    root.append(&actions);
+
+    let target = Rc::new(RefCell::new(ProfileChatTarget {
+        mid: msg.from.clone(),
+        name: display_name,
+        avatar_path: msg.sender_avatar_path.clone(),
+    }));
+    let pending_ui = ProfilePendingUi {
+        target: target.clone(),
+        avatar: avatar.clone(),
+        name_label: name_label.clone(),
+        bio_label: bio_label.clone(),
+        status: relation_status.clone(),
+        add_btn: add_btn.clone(),
+        chat_btn: chat_btn.clone(),
+    };
+
+    {
+        let state = state.clone();
+        let pending_ui = pending_ui.clone();
+        add_btn.connect_clicked(move |button| {
+            let mid = pending_ui.target.borrow().mid.clone();
+            button.set_sensitive(false);
+            pending_ui
+                .status
+                .set_text(&crate::i18n::t("profile_checking"));
+            match state.sidecar.add_friend_mid(&mid) {
+                Ok(id) => {
+                    state
+                        .pending
+                        .borrow_mut()
+                        .insert(id, Pending::ProfileAddFriend(pending_ui.clone()));
+                }
+                Err(error) => {
+                    button.set_sensitive(true);
+                    let message =
+                        crate::i18n::tf("profile_add_failed", &[("error", &error.to_string())]);
+                    pending_ui.status.set_text(&message);
+                    toast(&state, &message);
+                }
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let target = target.clone();
+        let win = win.clone();
+        chat_btn.connect_clicked(move |_| {
+            let target = target.borrow().clone();
+            let chat = ChatInfo {
+                mid: target.mid,
+                name: target.name,
+                kind: "dm".into(),
+                avatar_path: target.avatar_path,
+                last_activity: 0,
+                unread: 0,
+                preview: String::new(),
+                muted: false,
+                pinned: false,
+            };
+            ensure_chat_visible(&state, &chat);
+            win.close();
+            open_chat(&state, &chat);
+        });
+    }
+
+    win.set_child(Some(&root));
+    win.present();
+
+    let is_openchat = msg.sender_kind == "openchat" || !msg.from.starts_with('u');
+    let is_self = state.self_mid.borrow().as_deref() == Some(msg.from.as_str());
+    if is_openchat {
+        relation_status.set_text(&crate::i18n::t("profile_openchat_private_unavailable"));
+        return;
+    }
+    if is_self {
+        relation_status.set_text(&crate::i18n::t("profile_self"));
+        return;
+    }
+    match state.sidecar.profile_relation(&msg.from) {
+        Ok(id) => {
+            state
+                .pending
+                .borrow_mut()
+                .insert(id, Pending::ProfileLookup(pending_ui));
+        }
+        Err(error) => {
+            relation_status.set_text(&error.to_string());
+            toast(state, &error.to_string());
+        }
+    }
+}
+
 pub(super) fn format_outgoing_status(read: bool, created_ms: i64) -> String {
     let t = format_msg_time(created_ms);
     if read {
@@ -378,9 +856,9 @@ pub(super) fn format_outgoing_status(read: bool, created_ms: i64) -> String {
             format!("✓✓ {} {}", crate::i18n::t("status_read"), t)
         }
     } else if t.is_empty() {
-        "✓".into()
+        format!("✓ {}", crate::i18n::t("status_sent"))
     } else {
-        format!("✓ {t}")
+        format!("✓ {} {t}", crate::i18n::t("status_sent"))
     }
 }
 
@@ -452,12 +930,18 @@ pub(super) fn append_voice_card(
     let play = gtk::Button::builder()
         .icon_name(if has_audio {
             "media-playback-start-symbolic"
+        } else if msg.media_failed {
+            "dialog-error-symbolic"
         } else {
             "content-loading-symbolic"
         })
         .sensitive(has_audio)
         .css_classes(["circular", "line-voice-play"])
-        .tooltip_text(crate::i18n::t("play_voice"))
+        .tooltip_text(if msg.media_failed {
+            crate::i18n::t("media_download_failed")
+        } else {
+            crate::i18n::t("play_voice")
+        })
         .build();
 
     let peaks = Rc::new(RefCell::new(placeholder_peaks(36)));
@@ -499,6 +983,8 @@ pub(super) fn append_voice_card(
         format_voice_duration(duration_ms)
     } else if has_audio {
         "--:--".into()
+    } else if msg.media_failed {
+        crate::i18n::t("media_download_failed")
     } else {
         crate::i18n::t("loading_voice")
     };
@@ -974,6 +1460,7 @@ pub(super) fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &st
         file_path: Some(path.to_string()),
         duration_ms,
         flex: None,
+        ..Default::default()
     };
     append_voice_card(state, &bubble, &msg, true);
 }
@@ -1003,9 +1490,10 @@ pub(super) fn spawn_audio_player(
     };
     let gain = gain.clamp(0.0, 2.5);
     let mpv_vol = (gain * 100.0).round().clamp(0.0, 250.0);
+    let mut failures = Vec::new();
 
     let mut mpv = std::process::Command::new("mpv");
-    mpv.args(["--no-video", "--really-quiet"]);
+    mpv.args(["--no-config", "--no-video", "--really-quiet"]);
     mpv.arg(format!("--volume={mpv_vol}"));
     if let Some(ref s) = sink {
         mpv.arg(format!("--audio-device=pulse/{s}"));
@@ -1013,8 +1501,12 @@ pub(super) fn spawn_audio_player(
     mpv.arg(path);
     mpv.stdout(std::process::Stdio::null());
     mpv.stderr(std::process::Stdio::null());
-    if let Ok(child) = mpv.spawn() {
-        return Ok(child);
+    match mpv.spawn() {
+        Ok(child) => match verify_audio_child(child, "mpv") {
+            Ok(child) => return Ok(child),
+            Err(error) => failures.push(error),
+        },
+        Err(error) => failures.push(format!("mpv: {error}")),
     }
 
     let mut ff = std::process::Command::new("ffplay");
@@ -1023,13 +1515,19 @@ pub(super) fn spawn_audio_player(
         ff.args(["-af", &format!("volume={gain}")]);
     }
     if let Some(ref s) = sink {
-        ff.args(["-audiodevice", s]);
+        // ffplay uses SDL; PULSE_SINK is understood when its Pulse/PipeWire
+        // backend is active, while `-audiodevice` is not a portable ffplay flag.
+        ff.env("PULSE_SINK", s);
     }
     ff.arg(path);
     ff.stdout(std::process::Stdio::null());
     ff.stderr(std::process::Stdio::null());
-    if let Ok(child) = ff.spawn() {
-        return Ok(child);
+    match ff.spawn() {
+        Ok(child) => match verify_audio_child(child, "ffplay") {
+            Ok(child) => return Ok(child),
+            Err(error) => failures.push(error),
+        },
+        Err(error) => failures.push(format!("ffplay: {error}")),
     }
 
     if (gain - 1.0).abs() < 0.01 {
@@ -1040,12 +1538,39 @@ pub(super) fn spawn_audio_player(
         paplay.arg(path);
         paplay.stdout(std::process::Stdio::null());
         paplay.stderr(std::process::Stdio::null());
-        if let Ok(child) = paplay.spawn() {
-            return Ok(child);
+        match paplay.spawn() {
+            Ok(child) => match verify_audio_child(child, "paplay") {
+                Ok(child) => return Ok(child),
+                Err(error) => failures.push(error),
+            },
+            Err(error) => failures.push(format!("paplay: {error}")),
         }
     }
 
-    Err("no audio player (mpv/ffplay)".into())
+    Err(if failures.is_empty() {
+        "no audio player (mpv/ffplay/paplay)".into()
+    } else {
+        failures.join("; ")
+    })
+}
+
+fn verify_audio_child(
+    mut child: std::process::Child,
+    player: &str,
+) -> Result<std::process::Child, String> {
+    // spawn() only confirms that the executable was found. Broken shared
+    // libraries or an invalid audio backend make it exit immediately; detect
+    // that and continue to the next player instead of showing fake playback.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    match child.try_wait() {
+        Ok(None) => Ok(child),
+        Ok(Some(status)) => Err(format!("{player} exited immediately ({status})")),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("{player}: {error}"))
+        }
+    }
 }
 
 pub(super) fn filter_chats(state: &AppState, query: &str) {
@@ -1208,6 +1733,8 @@ pub(super) fn append_link_chips(_state: &AppState, bubble: &gtk::Box, text: &str
 }
 
 pub(super) fn clear_messages(state: &AppState) {
+    let next_render_gen = state.message_render_gen.borrow().wrapping_add(1);
+    *state.message_render_gen.borrow_mut() = next_render_gen;
     stop_voice_playback(state);
     state.message_list.clear();
     state.media_slots.borrow_mut().clear();

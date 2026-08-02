@@ -135,7 +135,10 @@ export function createMessageView(runtime: MessageViewRuntime) {
       const id = String(m.id ?? "");
       let imagePath: string | null = (m.imagePath as string) || null;
       let audioPath: string | null = (m.audioPath as string) || null;
-      let needsMedia = isMediaType(ct) && !imagePath && !audioPath;
+      const mediaRetryAfter = Number(m.mediaRetryAfter ?? 0);
+      let mediaFailed = mediaRetryAfter > Date.now();
+      let needsMedia = isMediaType(ct) && !imagePath && !audioPath &&
+        !mediaFailed;
 
       if (ct === "STICKER") {
         const stkId = String(m.stickerId || "");
@@ -147,10 +150,11 @@ export function createMessageView(runtime: MessageViewRuntime) {
           if (anim) {
             imagePath = anim;
             needsMedia = false;
+            mediaFailed = false;
           } else if (st) {
             // Show static now; hydrate may upgrade to APNG.
             imagePath = st;
-            needsMedia = true;
+            needsMedia = !mediaFailed;
           }
         }
       } else if (ct === "IMAGE" || ct === "VIDEO") {
@@ -161,6 +165,7 @@ export function createMessageView(runtime: MessageViewRuntime) {
         if (cached) {
           imagePath = (await uiMediaPath(id, cached)) || cached;
           needsMedia = false;
+          mediaFailed = false;
         }
       } else if (ct === "AUDIO") {
         audioPath = null;
@@ -171,14 +176,16 @@ export function createMessageView(runtime: MessageViewRuntime) {
             break;
           }
         }
-        if (audioPath) needsMedia = false;
-        else needsMedia = true;
+        if (audioPath) {
+          needsMedia = false;
+          mediaFailed = false;
+        } else needsMedia = !mediaFailed;
       } else if (ct === "FILE") {
         // Filename-only bubble; download is on demand / background, not a preview.
         needsMedia = false;
       }
 
-      return { ...m, imagePath, audioPath, needsMedia };
+      return { ...m, imagePath, audioPath, needsMedia, mediaFailed };
     }));
   }
 

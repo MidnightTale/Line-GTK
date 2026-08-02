@@ -27,6 +27,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 | GTK4 + Libadwaita | `pacman -S gtk4 libadwaita` |
 | Deno | Build-time protocol compiler; source-tree runs use `deno` or `DENO` |
 | ffmpeg / ffprobe | voice record, video thumbs |
+| wf-recorder + slurp | experimental Wayland screen sharing during calls |
 | Optional | `pdftoppm`, `pdftotext` for PDF preview |
 
 Wayland and X11 both work. Tested mainly on Arch-based desktops.

@@ -80,7 +80,7 @@ impl Sidecar {
                 .arg("--allow-read")
                 .arg(format!("--allow-write={}", self.data_dir.display()))
                 .arg("--allow-net")
-                .arg("--allow-run=ffmpeg,ffprobe")
+                .arg("--allow-run=ffmpeg,ffprobe,slurp,wf-recorder")
                 .arg("--allow-sys")
                 .arg("--allow-env=HOME,PATH,DENO_DIR,Q_DEBUG,NODE_DEBUG,NO_COLOR,LINE_GTK_DATA,LINE_GTK_LANG,LINE_GTK_CACHE_RETENTION,LINE_GTK_AUDIO_INPUT,LINE_GTK_AUDIO_OUTPUT,LINE_DEVICE,LINE_VERSION,LINE_CALL_DEVNAME,LINE_CALL_DEVICE_INFO,LINE_CALL_OPUS_SIGNAL,LINE_CALL_DEBUG")
                 .arg(&script);
@@ -263,6 +263,24 @@ impl Sidecar {
         )
     }
 
+    pub fn react_message(&self, chat_mid: &str, message_id: &str, reaction: &str) -> Result<u64> {
+        self.request(
+            "react_message",
+            Some(json!({
+                "chatMid": chat_mid,
+                "messageId": message_id,
+                "reaction": reaction,
+            })),
+        )
+    }
+
+    pub fn unsend_message(&self, chat_mid: &str, message_id: &str) -> Result<u64> {
+        self.request(
+            "unsend_message",
+            Some(json!({ "chatMid": chat_mid, "messageId": message_id })),
+        )
+    }
+
     pub fn send_audio(
         &self,
         chat_mid: &str,
@@ -341,6 +359,7 @@ impl Sidecar {
         audio_output: &str,
         mic_gain: f64,
         spk_gain: f64,
+        video_capable: bool,
     ) -> Result<u64> {
         self.request(
             "call_start",
@@ -350,6 +369,7 @@ impl Sidecar {
                 "audioOutput": if audio_output.is_empty() { "default" } else { audio_output },
                 "micGain": mic_gain,
                 "spkGain": spk_gain,
+                "videoCapable": video_capable,
             })),
         )
     }
@@ -378,6 +398,14 @@ impl Sidecar {
 
     pub fn call_end(&self) -> Result<u64> {
         self.request("call_end", None)
+    }
+
+    pub fn call_screen_start(&self) -> Result<u64> {
+        self.request("call_screen_start", None)
+    }
+
+    pub fn call_screen_stop(&self) -> Result<u64> {
+        self.request("call_screen_stop", None)
     }
 
     pub fn call_set_audio(
@@ -425,6 +453,14 @@ impl Sidecar {
 
     pub fn add_friend(&self, userid: &str) -> Result<u64> {
         self.request("add_friend", Some(json!({ "userid": userid })))
+    }
+
+    pub fn profile_relation(&self, mid: &str) -> Result<u64> {
+        self.request("profile_relation", Some(json!({ "mid": mid })))
+    }
+
+    pub fn add_friend_mid(&self, mid: &str) -> Result<u64> {
+        self.request("add_friend_mid", Some(json!({ "mid": mid })))
     }
 
     pub fn logout(&self) -> Result<u64> {
@@ -545,7 +581,7 @@ fn read_loop<R: std::io::Read>(
                         "message" => {
                             if let Some(msg) = resp.extra.get("message") {
                                 match serde_json::from_value(msg.clone()) {
-                                    Ok(m) => ProtocolEvent::Message(m),
+                                    Ok(m) => ProtocolEvent::Message(Box::new(m)),
                                     Err(e) => ProtocolEvent::Error(e.to_string()),
                                 }
                             } else {
@@ -581,6 +617,9 @@ fn read_loop<R: std::io::Read>(
                                 .unwrap_or_default();
                             ProtocolEvent::Messages { chat_mid, messages }
                         }
+                        "stickers_updated" => ProtocolEvent::StickersUpdated {
+                            result: resp.extra.clone(),
+                        },
                         "avatar_ready" => ProtocolEvent::AvatarReady {
                             mid: resp
                                 .extra
@@ -716,6 +755,19 @@ fn read_loop<R: std::io::Read>(
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         },
+                        "screen_share_state" => ProtocolEvent::ScreenShareState {
+                            state: resp
+                                .extra
+                                .get("state")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            error: resp
+                                .extra
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        },
                         "upload_progress" => ProtocolEvent::UploadProgress {
                             chat_mid: resp
                                 .extra
@@ -818,6 +870,11 @@ fn read_loop<R: std::io::Read>(
                                 .get("error")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            video_capable: resp
+                                .extra
+                                .get("videoCapable")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
                         },
                         other => ProtocolEvent::Error(format!("unknown event: {other}")),
                     };

@@ -321,6 +321,7 @@ pub(super) fn send_sticker_now(
                     file_path: None,
                     duration_ms: None,
                     flex: None,
+                    ..Default::default()
                 },
             );
             dismiss_new_marker(state);
@@ -376,23 +377,304 @@ pub(super) fn pick_and_send_media(state: &AppState) {
         .build();
 
     let s = state.clone();
-    dialog.open(
+    dialog.open_multiple(
         Some(&state.window),
         None::<&gio::Cancellable>,
         move |result| {
-            let Ok(file) = result else {
+            let Ok(files) = result else {
                 return;
             };
-            let Some(path) = file.path() else {
+            let paths = paths_from_file_model(&files);
+            if paths.is_empty() {
                 toast(
                     &s,
                     &crate::i18n::tf("media_send_failed", &[("error", "no path")]),
                 );
                 return;
-            };
-            send_local_media_path(&s, path);
+            }
+            open_media_review(&s, paths);
         },
     );
+}
+
+fn paths_from_file_model(files: &gio::ListModel) -> Vec<PathBuf> {
+    (0..files.n_items())
+        .filter_map(|index| files.item(index))
+        .filter_map(|item| item.downcast::<gio::File>().ok())
+        .filter_map(|file| file.path())
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn is_previewable_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "avif"
+    )
+}
+
+fn media_review_icon(path: &std::path::Path) -> &'static str {
+    match guess_media_o_type(path) {
+        "video" => "video-x-generic-symbolic",
+        "audio" => "audio-x-generic-symbolic",
+        _ => "text-x-generic-symbolic",
+    }
+}
+
+fn update_media_review_controls(
+    queue: &Rc<RefCell<Vec<PathBuf>>>,
+    count: &gtk::Label,
+    send: &gtk::Button,
+    empty: &gtk::Label,
+) {
+    let len = queue.borrow().len();
+    let n = len.to_string();
+    count.set_text(&crate::i18n::tf("media_review_count", &[("n", &n)]));
+    send.set_label(&crate::i18n::tf("media_review_send", &[("n", &n)]));
+    send.set_sensitive(len > 0);
+    empty.set_visible(len == 0);
+}
+
+fn append_media_review_item(
+    path: PathBuf,
+    flow: &gtk::FlowBox,
+    queue: &Rc<RefCell<Vec<PathBuf>>>,
+    count: &gtk::Label,
+    send: &gtk::Button,
+    empty: &gtk::Label,
+) {
+    if !path.is_file() || queue.borrow().contains(&path) {
+        return;
+    }
+    queue.borrow_mut().push(path.clone());
+
+    let preview = gtk::Overlay::builder()
+        .width_request(156)
+        .height_request(132)
+        .css_classes(["line-media-review-preview"])
+        .build();
+    preview.set_overflow(gtk::Overflow::Hidden);
+    if is_previewable_image(&path) {
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .can_shrink(true)
+            .width_request(156)
+            .height_request(132)
+            .css_classes(["line-media-review-thumb"])
+            .build();
+        attach_texture_async(picture.clone(), path.to_string_lossy().to_string(), 256);
+        preview.set_child(Some(&picture));
+    } else {
+        let icon = gtk::Image::builder()
+            .icon_name(media_review_icon(&path))
+            .pixel_size(52)
+            .css_classes(["dim-label", "line-media-review-file-icon"])
+            .build();
+        preview.set_child(Some(&icon));
+    }
+
+    let remove = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text(crate::i18n::t("media_review_remove"))
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .css_classes(["circular", "line-media-review-remove"])
+        .build();
+    preview.add_overlay(&remove);
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .css_classes(["line-media-review-card"])
+        .tooltip_text(path.to_string_lossy())
+        .build();
+    card.append(&preview);
+    card.append(
+        &gtk::Label::builder()
+            .label(file_name)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(22)
+            .xalign(0.5)
+            .css_classes(["caption"])
+            .build(),
+    );
+
+    let child = gtk::FlowBoxChild::new();
+    child.set_child(Some(&card));
+    flow.append(&child);
+
+    let flow_c = flow.clone();
+    let child_c = child.clone();
+    let queue_c = queue.clone();
+    let count_c = count.clone();
+    let send_c = send.clone();
+    let empty_c = empty.clone();
+    remove.connect_clicked(move |_| {
+        queue_c.borrow_mut().retain(|queued| queued != &path);
+        flow_c.remove(&child_c);
+        update_media_review_controls(&queue_c, &count_c, &send_c, &empty_c);
+    });
+    update_media_review_controls(queue, count, send, empty);
+}
+
+pub(super) fn open_media_review(state: &AppState, paths: Vec<PathBuf>) {
+    let window = gtk::Window::builder()
+        .title(crate::i18n::t("media_review_title"))
+        .transient_for(&state.window)
+        .modal(true)
+        .default_width(680)
+        .default_height(520)
+        .css_classes(["line-media-review-window"])
+        .build();
+
+    let header = gtk::HeaderBar::builder().show_title_buttons(true).build();
+    let title = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .build();
+    title.append(
+        &gtk::Label::builder()
+            .label(crate::i18n::t("media_review_title"))
+            .css_classes(["heading"])
+            .build(),
+    );
+    title.append(
+        &gtk::Label::builder()
+            .label(crate::i18n::t("media_review_hint"))
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+    header.set_title_widget(Some(&title));
+
+    let add = gtk::Button::builder()
+        .label(crate::i18n::t("media_review_add"))
+        .tooltip_text(crate::i18n::t("media_review_add"))
+        .build();
+    header.pack_start(&add);
+
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .min_children_per_line(2)
+        .max_children_per_line(4)
+        .row_spacing(12)
+        .column_spacing(12)
+        .homogeneous(true)
+        .valign(gtk::Align::Start)
+        .css_classes(["line-media-review-grid"])
+        .build();
+    let empty = gtk::Label::builder()
+        .label(crate::i18n::t("media_review_empty"))
+        .visible(false)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let content = gtk::Overlay::new();
+    content.set_child(Some(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&flow)
+            .build(),
+    ));
+    content.add_overlay(&empty);
+
+    let count = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .css_classes(["dim-label"])
+        .build();
+    let cancel = gtk::Button::builder()
+        .label(crate::i18n::t("cancel"))
+        .build();
+    let send = gtk::Button::builder()
+        .css_classes(["suggested-action"])
+        .build();
+    let footer = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(16)
+        .margin_end(16)
+        .css_classes(["line-media-review-footer"])
+        .build();
+    footer.append(&count);
+    footer.append(&cancel);
+    footer.append(&send);
+
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["line-media-review"])
+        .build();
+    root.append(&header);
+    root.append(&content);
+    root.append(&footer);
+    window.set_child(Some(&root));
+
+    let queue = Rc::new(RefCell::new(Vec::new()));
+    for path in paths {
+        append_media_review_item(path, &flow, &queue, &count, &send, &empty);
+    }
+    update_media_review_controls(&queue, &count, &send, &empty);
+
+    {
+        let window = window.clone();
+        cancel.connect_clicked(move |_| window.close());
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let queue = queue.clone();
+        send.connect_clicked(move |_| {
+            let files = queue.borrow().clone();
+            if files.is_empty() {
+                return;
+            }
+            window.close();
+            for path in files {
+                send_local_media_path(&state, path);
+            }
+        });
+    }
+    {
+        let parent = window.clone();
+        let flow = flow.clone();
+        let queue = queue.clone();
+        let count = count.clone();
+        let send = send.clone();
+        let empty = empty.clone();
+        add.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title(crate::i18n::t("media_review_add"))
+                .modal(true)
+                .build();
+            let flow = flow.clone();
+            let queue = queue.clone();
+            let count = count.clone();
+            let send = send.clone();
+            let empty = empty.clone();
+            dialog.open_multiple(Some(&parent), None::<&gio::Cancellable>, move |result| {
+                let Ok(files) = result else {
+                    return;
+                };
+                for path in paths_from_file_model(&files) {
+                    append_media_review_item(path, &flow, &queue, &count, &send, &empty);
+                }
+            });
+        });
+    }
+    window.present();
 }
 
 /// Ctrl+V attachment: files (URI list / FileList) or a clipboard image.
@@ -407,15 +689,18 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
 
     let clipboard = state.composer.clipboard();
     let formats = clipboard.formats();
-    let has_files = formats.contains_type(gdk::FileList::static_type())
-        || formats.contain_mime_type("text/uri-list");
+    let has_file_list = formats.contains_type(gdk::FileList::static_type());
+    let has_uri_list = formats.contain_mime_type("text/uri-list");
     let has_image = formats.contains_type(gdk::Texture::static_type())
-        || formats.contain_mime_type("image/png")
-        || formats.contain_mime_type("image/jpeg")
-        || formats.contain_mime_type("image/bmp")
-        || formats.contain_mime_type("image/tiff");
+        || formats
+            .mime_types()
+            .iter()
+            .any(|mime| mime.as_str().starts_with("image/"));
 
-    if has_files {
+    // A browser often advertises both text/uri-list and image/png when copying
+    // a picture. Only prefer the file path route for a real GdkFileList;
+    // otherwise the URI is usually a remote web URL and silently yields no file.
+    if has_file_list {
         let s = state.clone();
         clipboard.read_value_async(
             gdk::FileList::static_type(),
@@ -424,44 +709,69 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
             move |res| match res {
                 Ok(value) => {
                     if let Ok(list) = value.get::<gdk::FileList>() {
-                        let mut any = false;
+                        let mut paths = Vec::new();
                         for file in list.files() {
                             if let Some(path) = file.path()
                                 && path.is_file()
                             {
-                                send_local_media_path(&s, path);
-                                any = true;
+                                paths.push(path);
                             }
                         }
-                        if !any {
-                            paste_clipboard_uri_list(&s);
+                        if paths.is_empty() {
+                            if has_image {
+                                paste_clipboard_image(&s);
+                            } else if has_uri_list {
+                                paste_clipboard_uri_list(&s);
+                            }
+                        } else {
+                            open_media_review(&s, paths);
                         }
                     } else {
+                        if has_image {
+                            paste_clipboard_image(&s);
+                        } else if has_uri_list {
+                            paste_clipboard_uri_list(&s);
+                        }
+                    }
+                }
+                Err(_) => {
+                    if has_image {
+                        paste_clipboard_image(&s);
+                    } else if has_uri_list {
                         paste_clipboard_uri_list(&s);
                     }
                 }
-                Err(_) => paste_clipboard_uri_list(&s),
             },
         );
         return true;
     }
 
     if has_image {
-        let s = state.clone();
-        clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
-            Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
-                Ok(path) => send_local_media_path(&s, path),
-                Err(e) => toast(
-                    &s,
-                    &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
-                ),
-            },
-            _ => paste_clipboard_image_bytes(&s),
-        });
+        paste_clipboard_image(state);
+        return true;
+    }
+
+    if has_uri_list {
+        paste_clipboard_uri_list(state);
         return true;
     }
 
     false
+}
+
+fn paste_clipboard_image(state: &AppState) {
+    let clipboard = state.composer.clipboard();
+    let s = state.clone();
+    clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
+        Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
+            Ok(path) => open_media_review(&s, vec![path]),
+            Err(e) => toast(
+                &s,
+                &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+            ),
+        },
+        _ => paste_clipboard_image_bytes(&s),
+    });
 }
 
 pub(super) fn paste_clipboard_uri_list(state: &AppState) {
@@ -481,6 +791,7 @@ pub(super) fn paste_clipboard_uri_list(state: &AppState) {
             if input.read_to_string(&mut buf).is_err() {
                 return;
             }
+            let mut paths = Vec::new();
             for line in buf.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -490,8 +801,11 @@ pub(super) fn paste_clipboard_uri_list(state: &AppState) {
                 if let Some(path) = file.path()
                     && path.is_file()
                 {
-                    send_local_media_path(&s, path);
+                    paths.push(path);
                 }
+            }
+            if !paths.is_empty() {
+                open_media_review(&s, paths);
             }
         },
     );
@@ -501,7 +815,16 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
     let clipboard = state.composer.clipboard();
     let s = state.clone();
     clipboard.read_async(
-        &["image/png", "image/jpeg", "image/bmp", "image/tiff"],
+        &[
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "image/avif",
+            "image/bmp",
+            "image/x-MS-bmp",
+            "image/tiff",
+        ],
         glib::Priority::DEFAULT,
         None::<&gio::Cancellable>,
         move |res| {
@@ -516,6 +839,12 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
             }
             let ext = if mime.as_str().contains("jpeg") {
                 "jpg"
+            } else if mime.as_str().contains("webp") {
+                "webp"
+            } else if mime.as_str().contains("gif") {
+                "gif"
+            } else if mime.as_str().contains("avif") {
+                "avif"
             } else if mime.as_str().contains("bmp") {
                 "bmp"
             } else if mime.as_str().contains("tiff") {
@@ -524,7 +853,7 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
                 "png"
             };
             match write_clipboard_bytes(&s, &bytes, ext) {
-                Ok(path) => send_local_media_path(&s, path),
+                Ok(path) => open_media_review(&s, vec![path]),
                 Err(e) => toast(
                     &s,
                     &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
@@ -663,6 +992,7 @@ pub(super) fn send_local_media_path(state: &AppState, path: PathBuf) {
                     file_path,
                     duration_ms: duration_ms.map(|v| v as i64),
                     flex: None,
+                    ..Default::default()
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));
@@ -877,6 +1207,7 @@ pub(super) fn finish_voice_record(state: &AppState, send: bool) {
                     file_path: Some(path_str),
                     duration_ms: Some(duration_ms as i64),
                     flex: None,
+                    ..Default::default()
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));

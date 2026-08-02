@@ -1,5 +1,72 @@
 use super::*;
 
+fn remember_message_snapshot(state: &AppState, chat_mid: &str, messages: &[MessageInfo]) {
+    state
+        .message_cache
+        .borrow_mut()
+        .insert(chat_mid.to_string(), messages.to_vec());
+}
+
+/// Merge one live row into the in-process cache. Returns true when this exact
+/// message id was already present (polling can deliver the same operation more
+/// than once during reconnect/recovery).
+fn remember_live_message(state: &AppState, chat_mid: &str, message: &MessageInfo) -> bool {
+    let mut cache = state.message_cache.borrow_mut();
+    let messages = cache.entry(chat_mid.to_string()).or_default();
+    if !message.id.is_empty()
+        && let Some(previous) = messages.iter_mut().find(|row| row.id == message.id)
+    {
+        let image_path = message
+            .image_path
+            .clone()
+            .or_else(|| previous.image_path.clone());
+        let audio_path = message
+            .audio_path
+            .clone()
+            .or_else(|| previous.audio_path.clone());
+        let file_path = message
+            .file_path
+            .clone()
+            .or_else(|| previous.file_path.clone());
+        *previous = MessageInfo {
+            image_path,
+            audio_path,
+            file_path,
+            ..message.clone()
+        };
+        return true;
+    }
+    messages.push(message.clone());
+    messages.sort_by_key(|row| row.created_time);
+    false
+}
+
+fn remember_media_paths(
+    state: &AppState,
+    chat_mid: &str,
+    message_id: &str,
+    image_path: &str,
+    audio_path: Option<&str>,
+    file_path: Option<&str>,
+) {
+    let mut cache = state.message_cache.borrow_mut();
+    let Some(message) = cache
+        .get_mut(chat_mid)
+        .and_then(|messages| messages.iter_mut().find(|row| row.id == message_id))
+    else {
+        return;
+    };
+    if !image_path.is_empty() {
+        message.image_path = Some(image_path.to_string());
+    }
+    if let Some(path) = audio_path {
+        message.audio_path = Some(path.to_string());
+    }
+    if let Some(path) = file_path {
+        message.file_path = Some(path.to_string());
+    }
+}
+
 pub(super) fn pump_events(state: AppState) {
     let rx = state.sidecar.events.clone();
     glib::spawn_future_local(async move {
@@ -128,20 +195,35 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             peer,
             state: call_state,
             error,
+            video_capable,
         } => {
             tracing::debug!(%call_id, %peer, state = %call_state, ?error, "call state changed");
-            handle_call_state(state, &peer, &call_state, error.as_deref());
+            handle_call_state(state, &peer, &call_state, error.as_deref(), video_capable);
+        }
+        ProtocolEvent::ScreenShareState {
+            state: screen_state,
+            error,
+        } => {
+            handle_screen_share_state(state, &screen_state, error.as_deref());
         }
         ProtocolEvent::Message(msg) => {
-            let peer = if msg.mine {
+            let peer = if !msg.chat_mid.is_empty() {
+                msg.chat_mid.clone()
+            } else if msg.mine {
                 msg.to.clone()
             } else {
                 msg.from.clone()
             };
+            if remember_live_message(state, &peer, &msg) {
+                tracing::debug!(message_id = %msg.id, chat_mid = %peer, "ignored duplicate live message");
+                return;
+            }
             let mut preview = format!(
                 "{}: {}",
                 if msg.mine {
                     crate::i18n::t("you")
+                } else if !msg.sender_name.is_empty() {
+                    msg.sender_name.clone()
                 } else {
                     crate::i18n::t("they")
                 },
@@ -155,7 +237,9 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 &ChatInfo {
                     mid: peer.clone(),
                     name: peer_display_name(state, &peer),
-                    kind: if peer.starts_with('c') {
+                    kind: if peer.starts_with('m') {
+                        "openchat".into()
+                    } else if peer.starts_with('c') {
                         "group".into()
                     } else {
                         "dm".into()
@@ -165,6 +249,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     unread: 0,
                     preview: preview.clone(),
                     muted: false,
+                    pinned: false,
                 },
             );
 
@@ -234,28 +319,39 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             apply_chats(state, chats, cached);
         }
         ProtocolEvent::Messages { chat_mid, messages } => {
+            remember_message_snapshot(state, &chat_mid, &messages);
             if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str()) {
                 apply_messages(state, messages);
+            }
+        }
+        ProtocolEvent::StickersUpdated { result } => {
+            if state.sticker_popover.is_visible() {
+                fill_sticker_popover(state, &result);
             }
         }
         ProtocolEvent::AvatarReady { mid, avatar_path } => {
             if state.self_mid.borrow().as_deref() == Some(mid.as_str()) {
                 *state.self_avatar_path.borrow_mut() = Some(avatar_path.clone());
                 if std::path::Path::new(&avatar_path).exists() {
-                    attach_texture_async(state.profile_avatar.clone(), avatar_path.clone(), 64);
+                    attach_avatar_texture_async(
+                        state.profile_avatar.clone(),
+                        avatar_path.clone(),
+                        26,
+                    );
                 }
                 sync_discord_rpc(state);
             }
             if let Some(img) = state.chat_avatars.borrow().get(&mid).cloned()
                 && std::path::Path::new(&avatar_path).exists()
             {
-                attach_texture_async(img, avatar_path.clone(), 72);
+                let px = img.width_request().max(AVATAR_COMPACT_PX);
+                attach_avatar_texture_async(img, avatar_path.clone(), px);
             }
             if let Some(ui) = state.friends_ui.borrow().as_ref() {
                 if let Some(img) = ui.avatars.borrow().get(&mid).cloned()
                     && std::path::Path::new(&avatar_path).exists()
                 {
-                    attach_texture_async(img, avatar_path.clone(), 80);
+                    attach_avatar_texture_async(img, avatar_path.clone(), 40);
                 }
                 if let Some(f) = ui.friends.borrow_mut().iter_mut().find(|c| c.mid == mid) {
                     f.avatar_path = Some(avatar_path.clone());
@@ -309,6 +405,14 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             audio_path,
             file_path,
         } => {
+            remember_media_paths(
+                state,
+                &chat_mid,
+                &message_id,
+                &image_path,
+                audio_path.as_deref(),
+                file_path.as_deref(),
+            );
             // Always remember hydrated paths so list rebuilds / late bubbles can attach.
             if !image_path.is_empty() && std::path::Path::new(&image_path).exists() {
                 state
@@ -521,6 +625,58 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     remove_pending_placeholder(state, placeholder_id);
                 }
                 let err = error.as_deref().unwrap_or("request failed");
+                if let Some(Pending::ProfileLookup(ui)) = pending.as_ref() {
+                    let message = crate::i18n::tf("profile_check_failed", &[("error", err)]);
+                    ui.status.set_text(&message);
+                    ui.add_btn.set_sensitive(false);
+                    ui.chat_btn.set_sensitive(false);
+                    toast(state, &message);
+                    return;
+                }
+                if let Some(Pending::ProfileAddFriend(ui)) = pending.as_ref() {
+                    let message = crate::i18n::tf("profile_add_failed", &[("error", err)]);
+                    ui.status.set_text(&message);
+                    ui.add_btn.set_sensitive(true);
+                    ui.chat_btn.set_sensitive(false);
+                    toast(state, &message);
+                    return;
+                }
+                if matches!(pending, Some(Pending::CallScreenStart)) {
+                    *state.call_screen_sharing.borrow_mut() = false;
+                    if let Some(ui) = state.call_ui.borrow().as_ref() {
+                        call_window::update_screen_visual(ui, false);
+                    }
+                    toast(
+                        state,
+                        &crate::i18n::tf("call_share_failed", &[("error", err)]),
+                    );
+                    return;
+                }
+                if matches!(pending, Some(Pending::CallScreenStop)) {
+                    *state.call_screen_sharing.borrow_mut() = true;
+                    if let Some(ui) = state.call_ui.borrow().as_ref() {
+                        call_window::update_screen_visual(ui, true);
+                    }
+                    toast(
+                        state,
+                        &crate::i18n::tf("call_share_failed", &[("error", err)]),
+                    );
+                    return;
+                }
+                if matches!(pending, Some(Pending::ReactMessage)) {
+                    toast(
+                        state,
+                        &crate::i18n::tf("message_reaction_failed", &[("error", err)]),
+                    );
+                    return;
+                }
+                if matches!(pending, Some(Pending::UnsendMessage)) {
+                    toast(
+                        state,
+                        &crate::i18n::tf("message_unsend_failed", &[("error", err)]),
+                    );
+                    return;
+                }
                 if err.contains("sticker_not_owned") || err.contains("USER_NOT_STICKER_OWNER") {
                     toast(state, &crate::i18n::t("sticker_not_owned"));
                 } else {
@@ -553,15 +709,16 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     }
                 }
                 Some(Pending::FetchMessages { chat_mid }) => {
-                    if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str()) {
-                        let messages: Vec<MessageInfo> = result
-                            .get("messages")
-                            .cloned()
-                            .and_then(|v| serde_json::from_value(v).ok())
-                            .unwrap_or_default();
-                        if !same_message_list(state, &chat_mid, &messages) {
-                            apply_messages(state, messages);
-                        }
+                    let messages: Vec<MessageInfo> = result
+                        .get("messages")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    remember_message_snapshot(state, &chat_mid, &messages);
+                    if state.current_chat.borrow().as_deref() == Some(chat_mid.as_str())
+                        && !same_message_list(state, &chat_mid, &messages)
+                    {
+                        apply_messages(state, messages);
                     }
                 }
                 Some(Pending::Send {
@@ -575,6 +732,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     if let Ok(msg) = serde_json::from_value::<MessageInfo>(
                         result.get("message").cloned().unwrap_or_default(),
                     ) {
+                        remember_live_message(state, &chat_mid, &msg);
                         if state.msg_stack.visible_child_name().as_deref() != Some("list") {
                             set_msg_state(state, "list", None);
                         }
@@ -606,16 +764,103 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                         toast(state, &crate::i18n::t("media_download_failed"));
                     }
                 }
+                Some(Pending::ProfileLookup(ui)) => {
+                    apply_profile_relation(state, &ui, &result, false);
+                }
+                Some(Pending::ProfileAddFriend(ui)) => {
+                    apply_profile_relation(state, &ui, &result, true);
+                }
+                Some(Pending::ReactMessage) => {}
+                Some(Pending::UnsendMessage) => {
+                    toast(state, &crate::i18n::t("message_unsent"));
+                }
+                Some(Pending::CallScreenStart | Pending::CallScreenStop) => {}
                 None => {}
             }
         }
-        ProtocolEvent::Error(e) => toast(state, &e),
+        ProtocolEvent::Error(e) => {
+            tracing::error!(error = %e, "protocol error");
+            toast(state, &e);
+        }
         ProtocolEvent::Exited(code) => {
             if !*state.restarting.borrow() {
                 tracing::warn!(code, "protocol engine exited unexpectedly");
                 schedule_sidecar_recovery(state);
             }
         }
+    }
+}
+
+fn apply_profile_relation(
+    state: &AppState,
+    ui: &ProfilePendingUi,
+    result: &serde_json::Value,
+    just_added: bool,
+) {
+    {
+        let mut target = ui.target.borrow_mut();
+        if let Some(mid) = result.get("mid").and_then(|value| value.as_str()) {
+            target.mid = mid.to_string();
+        }
+        if let Some(name) = result
+            .get("displayName")
+            .and_then(|value| value.as_str())
+            .filter(|name| !name.is_empty())
+        {
+            target.name = name.to_string();
+            ui.name_label.set_text(name);
+        }
+        if let Some(path) = result
+            .get("avatarPath")
+            .and_then(|value| value.as_str())
+            .filter(|path| std::path::Path::new(path).exists())
+        {
+            target.avatar_path = Some(path.to_string());
+            attach_avatar_texture_async(ui.avatar.clone(), path.to_string(), 96);
+        }
+    }
+    let bio = result
+        .get("statusMessage")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    ui.bio_label.set_text(bio);
+    ui.bio_label.set_visible(!bio.is_empty());
+
+    let is_friend = just_added
+        || result
+            .get("isFriend")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    let blocked = result
+        .get("blocked")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let can_add = !just_added
+        && result
+            .get("canAdd")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    let can_chat = is_friend
+        && result
+            .get("canChat")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(is_friend);
+
+    ui.add_btn.set_visible(!is_friend);
+    ui.add_btn.set_sensitive(can_add);
+    ui.chat_btn.set_sensitive(can_chat);
+    let status = if just_added {
+        crate::i18n::t("profile_add_success")
+    } else if is_friend {
+        crate::i18n::t("profile_friend")
+    } else if blocked {
+        crate::i18n::t("profile_blocked")
+    } else {
+        crate::i18n::t("profile_not_friend")
+    };
+    ui.status.set_text(&status);
+    if just_added {
+        toast(state, &crate::i18n::t("profile_add_success"));
     }
 }
 

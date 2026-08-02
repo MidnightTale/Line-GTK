@@ -2,13 +2,14 @@ import {
   type Client,
   loginWithAuthToken,
   loginWithQR,
+  SquareMessage,
   type TalkMessage,
 } from "@evex/linejs";
 import { FileStorage } from "@evex/linejs/storage";
 import { join } from "@std/path";
 import { atomicWriteJson } from "./storage.ts";
 import type { CachePolicy } from "./cache_policy.ts";
-import { friendName, picturePathOf } from "./contacts.ts";
+import { friendName, picturePathOf, squareObsUrl } from "./contacts.ts";
 import type { LineDevice } from "./auth.ts";
 
 type Json = Record<string, unknown>;
@@ -22,14 +23,24 @@ type ChatRow = {
   unread: number;
   preview: string;
   muted?: boolean;
+  pinned?: boolean;
 };
 type ChatCache = { at: number; chats: ChatRow[] };
 type BoxCursor = { messageId: bigint | number; deliveredTime: bigint | number };
 type ContactInfo = {
   name: string;
   picturePath: string | null;
+  statusMessage: string;
   kind: string;
   muted: boolean;
+};
+type MessageHistoryCursor = { messageId: string; deliveredTime: string };
+type MessageCacheEntry = {
+  at: number;
+  messages: Json[];
+  historyComplete?: boolean;
+  oldestCursor?: MessageHistoryCursor;
+  squareSyncToken?: string;
 };
 
 export type CommandRuntime = {
@@ -39,8 +50,9 @@ export type CommandRuntime = {
   setAuthDead: (dead: boolean) => void;
   getChatCache: () => ChatCache | null;
   setChatCache: (cache: ChatCache | null) => void;
-  msgCache: Map<string, { at: number; messages: Json[] }>;
+  msgCache: Map<string, MessageCacheEntry>;
   contactIndex: Map<string, ContactInfo>;
+  squareChatIndex: Set<string>;
   boxCursor: Map<string, BoxCursor>;
   avatarDir: string;
   chatCachePath: string;
@@ -60,12 +72,19 @@ export type CommandRuntime = {
   hydrateAvatars: (chats: ChatRow[]) => Promise<void>;
   hydratePreviews: (chats: ChatRow[]) => Promise<void>;
   bumpMediaEpoch: (chatMid: string) => number;
-  loadDiskMessages: (chatMid: string) => Promise<Json[] | null>;
-  saveDiskMessages: (chatMid: string, messages: Json[]) => Promise<void>;
+  loadDiskMessages: (chatMid: string) => Promise<MessageCacheEntry | null>;
+  saveDiskMessages: (
+    chatMid: string,
+    entry: MessageCacheEntry,
+  ) => Promise<void>;
   forUiMessages: (messages: Json[]) => Promise<Json[]>;
   hydrateMedia: (messages: Json[], chatMid: string) => Promise<void>;
   summarizeTalkMessage: (
     message: TalkMessage,
+    opts?: { withMedia?: boolean },
+  ) => Promise<Json>;
+  summarizeSquareMessage: (
+    message: SquareMessage,
     opts?: { withMedia?: boolean },
   ) => Promise<Json>;
   summarizeRawMessage: (
@@ -101,6 +120,7 @@ export function createCommandService(runtime: CommandRuntime) {
   const {
     msgCache,
     contactIndex,
+    squareChatIndex,
     boxCursor,
     avatarDir,
     chatCachePath,
@@ -122,6 +142,7 @@ export function createCommandService(runtime: CommandRuntime) {
     forUiMessages,
     hydrateMedia,
     summarizeTalkMessage,
+    summarizeSquareMessage,
     summarizeRawMessage,
     saveAuth,
     loadAuth,
@@ -154,6 +175,20 @@ export function createCommandService(runtime: CommandRuntime) {
       return;
     }
     try {
+      if (squareChatIndex.has(chatMid) || chatMid.startsWith("m")) {
+        await client.base.square.markAsRead({
+          request: {
+            squareChatMid: chatMid,
+            messageId: String(lastMessageId),
+          },
+        });
+        ok(id, {
+          marked: true,
+          chatMid,
+          lastMessageId: String(lastMessageId),
+        });
+        return;
+      }
       const requestSequence = client.base.getReqseq;
       const seq = typeof requestSequence === "function"
         ? await requestSequence.call(client.base)
@@ -322,6 +357,8 @@ export function createCommandService(runtime: CommandRuntime) {
             unread: Number(box.unreadCount ?? 0),
             preview: prevPreview,
             muted: !!contactIndex.get(mid)?.muted,
+            pinned: chatCache?.chats.find((x) => x.mid === mid)?.pinned ??
+              false,
           });
         }
       } catch (e) {
@@ -355,6 +392,7 @@ export function createCommandService(runtime: CommandRuntime) {
               unread: 0,
               preview: "",
               muted: !!info.muted,
+              pinned: false,
             });
           }
         }
@@ -371,6 +409,7 @@ export function createCommandService(runtime: CommandRuntime) {
             contactIndex.set(user.mid, {
               name,
               picturePath,
+              statusMessage: "",
               kind: "dm",
               muted: false,
             });
@@ -385,6 +424,33 @@ export function createCommandService(runtime: CommandRuntime) {
         }
       }
 
+      // Keep Memo is LINE's notes-to-self conversation. It uses the signed-in
+      // account MID as a regular Talk message box, so expose it even before the
+      // account has sent its first memo and a recent box exists.
+      try {
+        const profile = client!.base.profile;
+        if (profile?.mid) {
+          const prev = byMid.get(profile.mid);
+          byMid.set(profile.mid, {
+            mid: profile.mid,
+            name: "Keep Memo",
+            kind: "keep",
+            picturePath: picturePathOf(
+              profile as unknown as Record<string, unknown>,
+            ),
+            avatarPath: prev?.avatarPath ??
+              await existingFile(join(avatarDir, `${profile.mid}.jpg`)),
+            lastActivity: prev?.lastActivity ?? 0,
+            unread: prev?.unread ?? 0,
+            preview: prev?.preview ?? "",
+            muted: false,
+            pinned: prev?.pinned ?? false,
+          });
+        }
+      } catch (e) {
+        console.error("[list_chats] keep memo", e);
+      }
+
       // 3) Groups optional (often empty) — don't block naming
       try {
         const chats = await client!.fetchJoinedChats();
@@ -397,15 +463,47 @@ export function createCommandService(runtime: CommandRuntime) {
             lastActivity: prev?.lastActivity ?? 0,
             unread: prev?.unread ?? 0,
             preview: prev?.preview ?? "",
-            picturePath: prev?.picturePath ?? null,
+            // Group chat pictures live directly on Chat.picturePath; using the
+            // contact index here produced blank/default avatars.
+            picturePath: chat.raw.picturePath || prev?.picturePath || null,
             avatarPath: prev?.avatarPath ?? null,
+            muted: chat.raw.notificationDisabled ?? prev?.muted ?? false,
+            pinned: Number(chat.raw.favoriteTimestamp ?? 0) > 0,
           });
         }
       } catch (e) {
         console.error("[list_chats] groups", e);
       }
 
+      // 4) OpenChat (Square) rooms joined by this account.
+      try {
+        const openChats = await client!.fetchJoinedSquareChats();
+        for (const chat of openChats) {
+          const mid = chat.mid;
+          if (!mid) continue;
+          squareChatIndex.add(mid);
+          const prev = byMid.get(mid);
+          const picturePath = squareObsUrl(chat.raw.chatImageObsHash);
+          byMid.set(mid, {
+            mid,
+            name: chat.name || mid,
+            kind: "openchat",
+            lastActivity: prev?.lastActivity ?? 0,
+            unread: prev?.unread ?? 0,
+            preview: prev?.preview ?? "",
+            picturePath,
+            avatarPath: await existingFile(join(avatarDir, `${mid}.jpg`)),
+            muted: false,
+            pinned: prev?.pinned ?? false,
+          });
+        }
+      } catch (e) {
+        // Accounts/device types without Square access should still load Talk.
+        console.error("[list_chats] openchat", e);
+      }
+
       const chats = [...byMid.values()].sort((a, b) => {
+        if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
         if (b.lastActivity !== a.lastActivity) {
           return b.lastActivity - a.lastActivity;
         }
@@ -432,10 +530,346 @@ export function createCommandService(runtime: CommandRuntime) {
     });
   }
 
+  function mergeMessageRows(current: Json[], incoming: Json[]): Json[] {
+    const byId = new Map<string, Json>();
+    for (const [index, message] of current.entries()) {
+      const id = String(
+        message.id ?? `cached:${index}:${message.createdTime ?? 0}`,
+      );
+      byId.set(id, message);
+    }
+    for (const [index, message] of incoming.entries()) {
+      const id = String(
+        message.id ?? `incoming:${index}:${message.createdTime ?? 0}`,
+      );
+      const previous = byId.get(id);
+      byId.set(
+        id,
+        previous
+          ? {
+            ...previous,
+            ...message,
+            imagePath: message.imagePath || previous.imagePath || null,
+            audioPath: message.audioPath || previous.audioPath || null,
+            filePath: message.filePath || previous.filePath || null,
+          }
+          : message,
+      );
+    }
+    return [...byId.values()].sort((a, b) =>
+      Number(a.createdTime ?? 0) - Number(b.createdTime ?? 0)
+    );
+  }
+
+  async function cacheMessageRow(chatMid: string, message: Json) {
+    let entry = msgCache.get(chatMid);
+    if (!entry) entry = await loadDiskMessages(chatMid) ?? undefined;
+    entry ??= { at: Date.now(), messages: [], historyComplete: false };
+    entry.messages = mergeMessageRows(entry.messages, [message]);
+    entry.at = Date.now();
+    msgCache.set(chatMid, entry);
+    void saveDiskMessages(chatMid, entry);
+  }
+
+  function rawHistoryCursor(raw: unknown): MessageHistoryCursor | undefined {
+    const row = raw as { id?: unknown; deliveredTime?: unknown };
+    if (row?.id == null) return undefined;
+    return {
+      messageId: String(row.id),
+      deliveredTime: String(row.deliveredTime ?? 0),
+    };
+  }
+
+  async function refreshBoxCursor(
+    chatMid: string,
+  ): Promise<BoxCursor | undefined> {
+    const client = runtime.getClient();
+    if (!client) return undefined;
+    let cursor = boxCursor.get(chatMid);
+    if (cursor) return cursor;
+    const boxes = await client.base.talk.getMessageBoxes({
+      messageBoxListRequest: {},
+    });
+    for (const box of boxes.messageBoxes ?? []) {
+      storeBoxCursor(String(box.id ?? ""), box.lastDeliveredMessageId);
+    }
+    cursor = boxCursor.get(chatMid);
+    return cursor;
+  }
+
+  async function summarizeTalkHistoryPage(
+    rawMessages: unknown[],
+  ): Promise<Json[]> {
+    const out: Json[] = [];
+    for (const raw of rawMessages) {
+      try {
+        const meta = (raw as { contentMetadata?: Record<string, string> })
+          .contentMetadata;
+        if (meta?.BOT_CHECK || meta?.BOT_ORIGIN) {
+          const from = String((raw as { from?: unknown }).from ?? "");
+          const contact = contactIndex.get(from);
+          if (contact) contact.kind = "bot";
+        }
+        out.push(await summarizeRawMessage(raw, { withMedia: false }));
+      } catch (error) {
+        console.error("[fetch msg skip]", error);
+      }
+    }
+    return out;
+  }
+
+  async function summarizeSquareHistoryEvents(
+    events: unknown[],
+  ): Promise<Json[]> {
+    const client = runtime.getClient();
+    if (!client) return [];
+    const out: Json[] = [];
+    for (const event of events) {
+      const payload = (event as { payload?: unknown }).payload as {
+        sendMessage?: { squareMessage?: unknown };
+        receiveMessage?: { squareMessage?: unknown };
+        notificationMessage?: { squareMessage?: unknown };
+      } | undefined;
+      const raw = payload?.sendMessage?.squareMessage ??
+        payload?.receiveMessage?.squareMessage ??
+        payload?.notificationMessage?.squareMessage;
+      if (!raw) continue;
+      try {
+        const message = SquareMessage.fromRawTalk(
+          raw as Parameters<typeof SquareMessage.fromRawTalk>[0],
+          client,
+        );
+        out.push(await summarizeSquareMessage(message, { withMedia: false }));
+      } catch (error) {
+        console.error("[fetch openchat msg skip]", error);
+      }
+    }
+    return out;
+  }
+
+  async function publishMessageHistory(
+    chatMid: string,
+    entry: MessageCacheEntry,
+    state: "syncing" | "complete" = "syncing",
+  ) {
+    entry.at = Date.now();
+    msgCache.set(chatMid, entry);
+    await saveDiskMessages(chatMid, entry);
+    emitEvent("messages", {
+      chatMid,
+      messages: await forUiMessages(entry.messages),
+      cached: false,
+      historyComplete: !!entry.historyComplete,
+    });
+    emitEvent("progress", {
+      scope: "messages",
+      chatMid,
+      state,
+      count: entry.messages.length,
+    });
+  }
+
+  async function seedMessageHistory(
+    chatMid: string,
+  ): Promise<MessageCacheEntry> {
+    const client = runtime.getClient();
+    if (!client) throw new Error("not_logged_in");
+    if (squareChatIndex.has(chatMid) || chatMid.startsWith("m")) {
+      squareChatIndex.add(chatMid);
+      const response = await client.base.square.fetchSquareChatEvents({
+        squareChatMid: chatMid,
+        limit: 100,
+        direction: "BACKWARD",
+      });
+      return {
+        at: Date.now(),
+        messages: await summarizeSquareHistoryEvents(response.events ?? []),
+        historyComplete: !(response.events?.length),
+        squareSyncToken: response.syncToken || undefined,
+      };
+    }
+
+    const cursor = await refreshBoxCursor(chatMid);
+    if (!cursor) {
+      return { at: Date.now(), messages: [], historyComplete: true };
+    }
+    const raw = await client.base.talk.getPreviousMessagesV2WithRequest({
+      request: {
+        messageBoxId: chatMid,
+        endMessageId: cursor,
+        messagesCount: 100,
+      },
+    });
+    return {
+      at: Date.now(),
+      messages: await summarizeTalkHistoryPage(raw),
+      historyComplete: raw.length === 0,
+      oldestCursor: rawHistoryCursor(raw.at(-1)),
+    };
+  }
+
+  async function syncTalkHistory(chatMid: string, initial: MessageCacheEntry) {
+    const client = runtime.getClient();
+    if (!client) return;
+    let entry = msgCache.get(chatMid) ?? initial;
+    const newest = await refreshBoxCursor(chatMid);
+
+    // First close the gap from the newest server message back to any local row.
+    if (newest && !entry.messages.length) {
+      const raw = await client.base.talk.getPreviousMessagesV2WithRequest({
+        request: {
+          messageBoxId: chatMid,
+          endMessageId: newest,
+          messagesCount: 100,
+        },
+      });
+      entry.messages = mergeMessageRows(
+        entry.messages,
+        await summarizeTalkHistoryPage(raw),
+      );
+      entry.oldestCursor = rawHistoryCursor(raw.at(-1));
+      entry.historyComplete = raw.length < 100;
+      msgCache.set(chatMid, entry);
+    } else if (newest && entry.messages.length) {
+      const known = new Set(
+        entry.messages.map((message) => String(message.id ?? "")),
+      );
+      let end: BoxCursor = newest;
+      for (let page = 0; page < 10_000; page++) {
+        const raw = await client.base.talk.getPreviousMessagesV2WithRequest({
+          request: {
+            messageBoxId: chatMid,
+            endMessageId: end,
+            messagesCount: 100,
+          },
+        });
+        if (!raw.length) break;
+        const overlap = raw.some((message) =>
+          known.has(String((message as { id?: unknown }).id ?? ""))
+        );
+        const rows = await summarizeTalkHistoryPage(raw);
+        entry = msgCache.get(chatMid) ?? entry;
+        entry.messages = mergeMessageRows(entry.messages, rows);
+        entry.at = Date.now();
+        msgCache.set(chatMid, entry);
+        const oldest = rawHistoryCursor(raw.at(-1));
+        if (!oldest || overlap) break;
+        end = {
+          messageId: BigInt(oldest.messageId),
+          deliveredTime: BigInt(oldest.deliveredTime),
+        };
+        if (raw.length < 100) {
+          entry.historyComplete = true;
+          entry.oldestCursor = oldest;
+          break;
+        }
+      }
+    }
+
+    // Continue the durable oldest cursor until LINE says there is no older page.
+    if (!entry.historyComplete) {
+      let oldest = entry.oldestCursor;
+      if (!oldest && entry.messages.length) {
+        const first = entry.messages[0]!;
+        oldest = {
+          messageId: String(first.id ?? ""),
+          deliveredTime: String(first.createdTime ?? 0),
+        };
+      }
+      let pagesSincePublish = 0;
+      while (oldest?.messageId) {
+        const raw = await client.base.talk.getPreviousMessagesV2WithRequest({
+          request: {
+            messageBoxId: chatMid,
+            endMessageId: {
+              messageId: BigInt(oldest.messageId),
+              deliveredTime: BigInt(oldest.deliveredTime),
+            },
+            messagesCount: 100,
+          },
+        });
+        if (!raw.length) {
+          entry.historyComplete = true;
+          break;
+        }
+        const nextOldest = rawHistoryCursor(raw.at(-1));
+        if (!nextOldest) break;
+        const before = entry.messages.length;
+        const rows = await summarizeTalkHistoryPage(raw);
+        entry = msgCache.get(chatMid) ?? entry;
+        entry.messages = mergeMessageRows(entry.messages, rows);
+        entry.oldestCursor = nextOldest;
+        pagesSincePublish++;
+        const stuck = nextOldest.messageId === oldest.messageId;
+        oldest = nextOldest;
+        if (raw.length < 100 || stuck || entry.messages.length === before) {
+          entry.historyComplete = raw.length < 100 || stuck;
+          break;
+        }
+        if (pagesSincePublish >= 5) {
+          pagesSincePublish = 0;
+          await publishMessageHistory(chatMid, entry);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    await publishMessageHistory(chatMid, entry, "complete");
+    void hydrateMedia(
+      await forUiMessages(entry.messages.slice(-200)),
+      chatMid,
+    );
+  }
+
+  async function syncSquareHistory(
+    chatMid: string,
+    initial: MessageCacheEntry,
+  ) {
+    const client = runtime.getClient();
+    if (!client) return;
+    let entry = msgCache.get(chatMid) ?? initial;
+    let token = entry.squareSyncToken;
+    let pagesSincePublish = 0;
+    while (!entry.historyComplete) {
+      const response = await client.base.square.fetchSquareChatEvents({
+        squareChatMid: chatMid,
+        syncToken: token,
+        limit: 100,
+        direction: "BACKWARD",
+      });
+      const events = response.events ?? [];
+      const nextToken = response.syncToken || undefined;
+      if (!events.length || (token && nextToken === token)) {
+        entry.historyComplete = true;
+        break;
+      }
+      const rows = await summarizeSquareHistoryEvents(events);
+      entry = msgCache.get(chatMid) ?? entry;
+      const before = entry.messages.length;
+      entry.messages = mergeMessageRows(entry.messages, rows);
+      entry.squareSyncToken = nextToken;
+      token = nextToken;
+      pagesSincePublish++;
+      if (entry.messages.length === before) {
+        entry.historyComplete = true;
+        break;
+      }
+      if (pagesSincePublish >= 5) {
+        pagesSincePublish = 0;
+        await publishMessageHistory(chatMid, entry);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    await publishMessageHistory(chatMid, entry, "complete");
+    void hydrateMedia(
+      await forUiMessages(entry.messages.slice(-200)),
+      chatMid,
+    );
+  }
+
   async function doFetchMessages(
     id: number | string | null,
     chatMid: string,
-    limit = 50,
+    _limit = 50,
     force = false,
   ) {
     const client = runtime.getClient();
@@ -448,150 +882,59 @@ export function createCommandService(runtime: CommandRuntime) {
       return;
     }
 
-    await refreshCachePolicy();
-    await dedupe(`msgs:${chatMid}:${limit}:${force}`, async () => {
-      bumpMediaEpoch(chatMid); // cancel any prior hydrate for this chat
-      const cached = msgCache.get(chatMid);
-      if (!force && cached && Date.now() - cached.at < cachePolicy().memMsg) {
-        const ui = await forUiMessages(cached.messages);
-        ok(id, { messages: ui, cached: true });
-        hydrateMedia(cached.messages, chatMid);
-        return;
+    bumpMediaEpoch(chatMid);
+    try {
+      let entry = msgCache.get(chatMid);
+      if (!entry) {
+        entry = await loadDiskMessages(chatMid) ?? undefined;
+        if (entry) msgCache.set(chatMid, entry);
       }
 
-      // Warm from disk immediately
-      if (!force) {
-        const disk = await loadDiskMessages(chatMid);
-        if (disk?.length) {
-          msgCache.set(chatMid, { at: Date.now(), messages: disk });
-          emitEvent("messages", {
-            chatMid,
-            messages: await forUiMessages(disk),
-            cached: true,
-          });
-          emitEvent("progress", {
-            scope: "messages",
-            chatMid,
-            state: "ready",
-          });
-          hydrateMedia(disk, chatMid);
-          // still refresh below unless memory-fresh
-        }
-      }
-
-      if (!force && cached?.messages?.length) {
-        emitEvent("messages", {
-          chatMid,
-          messages: await forUiMessages(cached.messages),
-          cached: true,
-        });
+      if (!entry) {
         emitEvent("progress", {
           scope: "messages",
           chatMid,
-          state: "ready",
+          state: "loading",
         });
+        entry = await seedMessageHistory(chatMid);
+        msgCache.set(chatMid, entry);
+        await saveDiskMessages(chatMid, entry);
       }
 
-      emitEvent("progress", { scope: "messages", chatMid, state: "loading" });
+      const uiMessages = await forUiMessages(entry.messages);
+      ok(id, {
+        messages: uiMessages,
+        cached: !force,
+        historyComplete: !!entry.historyComplete,
+      });
+      emitEvent("progress", {
+        scope: "messages",
+        chatMid,
+        state: entry.messages.length ? "ready" : "empty",
+      });
+      void hydrateMedia(uiMessages.slice(-200), chatMid);
 
-      try {
-        let out: Json[] = [];
-
-        // Prefer message boxes for DMs/bots (fast + works). Groups try Chat helper first.
-        let usedBoxes = false;
-        try {
-          if (chatMid.startsWith("c")) {
-            const chat = await client!.getChat(chatMid);
-            const messages = await chat.fetchMessages(limit);
-            for (const m of messages) {
-              out.push(await summarizeTalkMessage(m, { withMedia: false }));
-            }
-          } else {
-            usedBoxes = true;
-          }
-        } catch {
-          usedBoxes = true;
-        }
-
-        if (usedBoxes || !out.length) {
-          let cursor = boxCursor.get(chatMid);
-          if (!cursor) {
-            const boxes = await client!.base.talk.getMessageBoxes({
-              messageBoxListRequest: {},
-            });
-            for (const box of boxes.messageBoxes ?? []) {
-              const mid = String(box.id ?? "");
-              storeBoxCursor(mid, box.lastDeliveredMessageId);
-            }
-            cursor = boxCursor.get(chatMid);
-          }
-          if (!cursor) {
-            msgCache.set(chatMid, { at: Date.now(), messages: [] });
-            ok(id, { messages: [] });
-            emitEvent("progress", {
-              scope: "messages",
-              chatMid,
-              state: "empty",
-            });
-            return;
-          }
-          const messages = await client!.base.talk
-            .getPreviousMessagesV2WithRequest({
-              request: {
-                messageBoxId: chatMid,
-                endMessageId: {
-                  messageId: cursor.messageId,
-                  deliveredTime: cursor.deliveredTime,
-                },
-                messagesCount: limit,
-              },
-            });
-          out = [];
-          for (const raw of messages) {
-            try {
-              const meta = (raw as { contentMetadata?: Record<string, string> })
-                .contentMetadata;
-              if (meta?.BOT_CHECK || meta?.BOT_ORIGIN) {
-                const from = String((raw as { from?: string }).from ?? chatMid);
-                const cur = contactIndex.get(from);
-                if (cur) cur.kind = "bot";
-                else {
-                  contactIndex.set(from, {
-                    name: contactIndex.get(from)?.name || from,
-                    picturePath: null,
-                    kind: "bot",
-                    muted: false,
-                  });
-                }
-              }
-              out.push(await summarizeRawMessage(raw, { withMedia: false }));
-            } catch (e) {
-              console.error("[fetch msg skip]", e);
-            }
-          }
-        }
-
-        out.sort((a, b) => Number(a.createdTime) - Number(b.createdTime));
-        msgCache.set(chatMid, { at: Date.now(), messages: out });
-        await saveDiskMessages(chatMid, out);
-        ok(id, { messages: await forUiMessages(out), cached: false });
-        emitEvent("progress", {
-          scope: "messages",
-          chatMid,
-          state: out.length ? "ready" : "empty",
-        });
-
-        hydrateMedia(out, chatMid);
-      } catch (e) {
-        fail(id, e instanceof Error ? e.message : String(e));
+      const sync = squareChatIndex.has(chatMid) || chatMid.startsWith("m")
+        ? () => syncSquareHistory(chatMid, entry!)
+        : () => syncTalkHistory(chatMid, entry!);
+      void dedupe(`history:${chatMid}`, sync).catch((error) => {
+        console.error("[history sync]", chatMid, error);
         emitEvent("progress", {
           scope: "messages",
           chatMid,
           state: "error",
-          error: String(e),
+          error: error instanceof Error ? error.message : String(error),
         });
-      }
-    });
+      });
+    } catch (error) {
+      fail(id, error instanceof Error ? error.message : String(error));
+      emitEvent("progress", {
+        scope: "messages",
+        chatMid,
+        state: "error",
+        error: String(error),
+      });
+    }
   }
 
   async function doSend(
@@ -606,6 +949,28 @@ export function createCommandService(runtime: CommandRuntime) {
     }
     if (!text.trim()) {
       fail(id, "empty_message");
+      return;
+    }
+
+    if (squareChatIndex.has(chatMid) || chatMid.startsWith("m")) {
+      try {
+        squareChatIndex.add(chatMid);
+        const chat = await client.getSquareChat(chatMid);
+        const sent = await chat.sendMessage(text);
+        const squareMessage = SquareMessage.fromRawTalk(
+          sent.createdSquareMessage,
+          client,
+        );
+        const message = await summarizeSquareMessage(squareMessage, {
+          withMedia: false,
+        });
+        await cacheMessageRow(chatMid, message);
+        runtime.setChatCache(null);
+        touchChatPreviewFromMessage(message);
+        ok(id, { message });
+      } catch (e) {
+        fail(id, e instanceof Error ? e.message : String(e));
+      }
       return;
     }
 
@@ -642,7 +1007,7 @@ export function createCommandService(runtime: CommandRuntime) {
                 text,
               )
             );
-          msgCache.delete(chatMid);
+          await cacheMessageRow(chatMid, message);
           runtime.setChatCache(null);
           touchChatPreviewFromMessage(message);
           ok(id, { message });
@@ -663,9 +1028,9 @@ export function createCommandService(runtime: CommandRuntime) {
       }
     }
 
-    msgCache.delete(chatMid);
     runtime.setChatCache(null);
     const message = sentMessagePayload(sent, chatMid, text);
+    await cacheMessageRow(chatMid, message);
     touchChatPreviewFromMessage(message);
     ok(id, { message });
   }

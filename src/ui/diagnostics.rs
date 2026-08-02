@@ -63,7 +63,14 @@ pub fn open(parent: &impl IsA<gtk::Window>, sidecar: Rc<Sidecar>, data_dir: &Pat
     let dependencies = libadwaita::PreferencesGroup::builder()
         .title(crate::i18n::t("diagnostics_dependencies"))
         .build();
-    for program in ["ffmpeg", "ffprobe", "pdftoppm", "pdftotext"] {
+    for program in [
+        "ffmpeg",
+        "ffprobe",
+        "wf-recorder",
+        "slurp",
+        "pdftoppm",
+        "pdftotext",
+    ] {
         dependencies.add(&row(program, &program_version(program)));
     }
     dependencies.add(&row(
@@ -137,7 +144,12 @@ fn row(title: &str, subtitle: &str) -> libadwaita::ActionRow {
 }
 
 fn program_version(program: &str) -> String {
-    command_output(program, &["--version"])
+    let args = if program == "slurp" {
+        &["-h"][..]
+    } else {
+        &["--version"][..]
+    };
+    command_output(program, args)
         .and_then(|output| output.lines().next().map(str::to_string))
         .unwrap_or_else(|| crate::i18n::t("diagnostics_not_found"))
 }

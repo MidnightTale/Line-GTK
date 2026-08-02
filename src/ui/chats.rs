@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bool) {
+    // Removing a selected row makes GtkListBox try to focus a row that has
+    // already been detached. Clear selection before the rebuild.
+    state.chat_list.unselect_all();
     clear_list(&state.chat_list);
     state.chat_avatars.borrow_mut().clear();
     state.chat_previews.borrow_mut().clear();
@@ -10,10 +13,20 @@ pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bo
         if !chat.preview.is_empty() {
             chat.preview = localize_preview(&chat.preview);
         }
+        if state.config.borrow().pinned_chats.contains(&chat.mid) {
+            chat.pinned = true;
+        }
     }
+    chats.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     for chat in &chats {
         let (row, avatar, preview, badge) = build_chat_row(chat, *state.sidebar_compact.borrow());
+        wire_chat_row_context_menu(state, &row, chat);
         state
             .chat_avatars
             .borrow_mut()
@@ -60,8 +73,6 @@ pub(super) fn select_sidebar_chat(state: &AppState, mid: Option<&str>) {
     };
     if let Some(row) = state.chat_list.row_at_index(pos as i32) {
         state.chat_list.select_row(Some(&row));
-        // Ensure the selected row is scrolled into view.
-        row.grab_focus();
     }
 }
 
@@ -94,6 +105,7 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
             if let Some(path) = chat.avatar_path.clone() {
                 cur.avatar_path = Some(path);
             }
+            cur.pinned = chat.pinned;
         }
         if let Some(label) = state.chat_previews.borrow().get(&mid)
             && !chat.preview.is_empty()
@@ -112,13 +124,15 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
                 && std::path::Path::new(path).exists()
                 && let Some(img) = state.chat_avatars.borrow().get(&mid).cloned()
             {
-                attach_texture_async(img, path.to_string(), 72);
+                let px = img.width_request().max(AVATAR_COMPACT_PX);
+                attach_avatar_texture_async(img, path.to_string(), px);
             }
         }
         return;
     }
 
     let (row, avatar, preview, badge) = build_chat_row(&chat, *state.sidebar_compact.borrow());
+    wire_chat_row_context_menu(state, &row, &chat);
     state.chat_avatars.borrow_mut().insert(mid.clone(), avatar);
     state
         .chat_previews
@@ -128,8 +142,16 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
         .chat_unread_badges
         .borrow_mut()
         .insert(mid.clone(), badge);
-    state.chats.borrow_mut().insert(0, chat);
-    state.chat_list.prepend(&row);
+    let insert_at = {
+        let chats = state.chats.borrow();
+        if chat.pinned {
+            0
+        } else {
+            chats.iter().take_while(|item| item.pinned).count()
+        }
+    };
+    state.chats.borrow_mut().insert(insert_at, chat);
+    state.chat_list.insert(&row, insert_at as i32);
     set_side_state(state, "list", None);
     let n = state.chats.borrow().len();
     state.status.set_text(&crate::i18n::tf(
@@ -145,17 +167,31 @@ pub(super) fn promote_chat_to_top(state: &AppState, mid: &str) {
         chats.iter().position(|c| c.mid == mid)
     };
     let Some(pos) = pos else { return };
-    if pos == 0 {
+    let target = {
+        let chats = state.chats.borrow();
+        if chats[pos].pinned {
+            0
+        } else {
+            chats.iter().take_while(|chat| chat.pinned).count()
+        }
+    };
+    if pos == target {
         return;
     }
-    {
+    let target = {
         let mut chats = state.chats.borrow_mut();
         let chat = chats.remove(pos);
-        chats.insert(0, chat);
-    }
+        let target = if chat.pinned {
+            0
+        } else {
+            chats.iter().take_while(|item| item.pinned).count()
+        };
+        chats.insert(target, chat);
+        target
+    };
     if let Some(row) = state.chat_list.row_at_index(pos as i32) {
         state.chat_list.remove(&row);
-        state.chat_list.prepend(&row);
+        state.chat_list.insert(&row, target as i32);
         if state.config.borrow().animations {
             row.add_css_class("line-chat-bump");
             let row_c = row.clone();
@@ -256,6 +292,7 @@ pub(super) fn build_chat_row(
         .valign(gtk::Align::Center)
         .css_classes(["line-avatar-frame"])
         .build();
+    avatar_frame.set_overflow(gtk::Overflow::Hidden);
     let avatar = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .can_shrink(true)
@@ -263,10 +300,11 @@ pub(super) fn build_chat_row(
         .height_request(avatar_px)
         .css_classes(["line-avatar"])
         .build();
+    avatar.set_overflow(gtk::Overflow::Hidden);
     if let Some(path) = chat.avatar_path.as_deref()
         && std::path::Path::new(path).exists()
     {
-        attach_texture_async(avatar.clone(), path.to_string(), avatar_px * 2);
+        attach_avatar_texture_async(avatar.clone(), path.to_string(), avatar_px);
     }
     avatar_frame.append(&avatar);
 
@@ -315,6 +353,16 @@ pub(super) fn build_chat_row(
         .css_classes(["dim-label", "caption"])
         .build();
     top.append(&name);
+    if chat.pinned {
+        top.append(
+            &gtk::Image::builder()
+                .icon_name("starred-symbolic")
+                .pixel_size(14)
+                .tooltip_text(crate::i18n::t("unpin_chat"))
+                .css_classes(["line-chat-pinned"])
+                .build(),
+        );
+    }
     top.append(&time);
 
     let bottom = gtk::Box::builder()
@@ -345,6 +393,82 @@ pub(super) fn build_chat_row(
     box_.append(&text_col);
     row.set_child(Some(&box_));
     (row, avatar, preview, badge)
+}
+
+fn wire_chat_row_context_menu(state: &AppState, row: &gtk::ListBoxRow, chat: &ChatInfo) {
+    let popover = gtk::Popover::builder()
+        .autohide(true)
+        .has_arrow(false)
+        .position(gtk::PositionType::Right)
+        .build();
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .css_classes(["line-chat-context-menu"])
+        .build();
+    let pin = gtk::Button::builder()
+        .halign(gtk::Align::Fill)
+        .css_classes(["flat", "line-chat-context-action"])
+        .build();
+    let pin_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    pin_content.append(
+        &gtk::Image::builder()
+            .icon_name(if chat.pinned {
+                "starred-symbolic"
+            } else {
+                "non-starred-symbolic"
+            })
+            .build(),
+    );
+    pin_content.append(
+        &gtk::Label::builder()
+            .label(crate::i18n::t(if chat.pinned {
+                "unpin_chat"
+            } else {
+                "pin_chat"
+            }))
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    pin.set_child(Some(&pin_content));
+    menu.append(&pin);
+    popover.set_child(Some(&menu));
+    popover.set_parent(row);
+
+    {
+        let state = state.clone();
+        let mid = chat.mid.clone();
+        let popover = popover.clone();
+        pin.connect_clicked(move |_| {
+            popover.popdown();
+            toggle_chat_pin_mid(&state, &mid);
+        });
+    }
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    let popover_click = popover.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        popover_click.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover_click.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    row.add_controller(click);
+
+    let popover_cleanup = popover.clone();
+    row.connect_unrealize(move |_| {
+        if popover_cleanup.parent().is_some() {
+            popover_cleanup.unparent();
+        }
+    });
 }
 
 pub(super) fn format_activity(ts: i64) -> String {
@@ -477,6 +601,152 @@ pub(super) fn toggle_chat_mute(state: &AppState) {
             &crate::i18n::tf("mute_failed", &[("error", &e.to_string())]),
         ),
     }
+}
+
+pub(super) fn update_pin_btn(state: &AppState, pinned: bool) {
+    state.pin_btn.set_icon_name(if pinned {
+        "starred-symbolic"
+    } else {
+        "non-starred-symbolic"
+    });
+    state
+        .pin_btn
+        .set_tooltip_text(Some(&crate::i18n::t(if pinned {
+            "unpin_chat"
+        } else {
+            "pin_chat"
+        })));
+}
+
+pub(super) fn toggle_chat_pin(state: &AppState) {
+    let Some(mid) = state.current_chat.borrow().clone() else {
+        return;
+    };
+    toggle_chat_pin_mid(state, &mid);
+}
+
+pub(super) fn toggle_chat_pin_mid(state: &AppState, mid: &str) {
+    let next = !state
+        .chats
+        .borrow()
+        .iter()
+        .find(|chat| chat.mid == mid)
+        .map(|chat| chat.pinned)
+        .unwrap_or(false);
+    {
+        let mut config = state.config.borrow_mut();
+        config.pinned_chats.retain(|item| item != mid);
+        if next {
+            config.pinned_chats.push(mid.to_string());
+        }
+        config.save(&state.data_dir);
+    }
+    let mut chats = state.chats.borrow().clone();
+    if let Some(chat) = chats.iter_mut().find(|chat| chat.mid == mid) {
+        chat.pinned = next;
+    }
+    apply_chats(state, chats, false);
+    if state.current_chat.borrow().as_deref() == Some(mid) {
+        update_pin_btn(state, next);
+    }
+}
+
+pub(super) fn open_chat_album(state: &AppState) {
+    let mut messages: Vec<MessageInfo> = state
+        .media_msgs
+        .borrow()
+        .values()
+        .filter(|message| {
+            matches!(
+                message.content_type.to_ascii_uppercase().as_str(),
+                "IMAGE" | "VIDEO"
+            ) && message
+                .image_path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).exists())
+        })
+        .cloned()
+        .collect();
+    messages.sort_by_key(|message| std::cmp::Reverse(message.created_time));
+
+    let title = state
+        .current_chat
+        .borrow()
+        .as_ref()
+        .and_then(|mid| {
+            state
+                .chats
+                .borrow()
+                .iter()
+                .find(|chat| &chat.mid == mid)
+                .cloned()
+        })
+        .map(|chat| format!("{} · {}", crate::i18n::t("chat_album"), chat.name))
+        .unwrap_or_else(|| crate::i18n::t("chat_album"));
+    let window = gtk::Window::builder()
+        .transient_for(&state.window)
+        .modal(true)
+        .title(title)
+        .default_width(760)
+        .default_height(620)
+        .build();
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    if messages.is_empty() {
+        scroll.set_child(Some(
+            &gtk::Label::builder()
+                .label(crate::i18n::t("chat_album_empty"))
+                .valign(gtk::Align::Center)
+                .vexpand(true)
+                .css_classes(["dim-label"])
+                .build(),
+        ));
+    } else {
+        let flow = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(2)
+            .max_children_per_line(4)
+            .column_spacing(10)
+            .row_spacing(10)
+            .margin_top(14)
+            .margin_bottom(14)
+            .margin_start(14)
+            .margin_end(14)
+            .build();
+        for message in messages {
+            let Some(path) = message.image_path.clone() else {
+                continue;
+            };
+            let picture = gtk::Picture::builder()
+                .content_fit(gtk::ContentFit::Cover)
+                .can_shrink(true)
+                .width_request(160)
+                .height_request(160)
+                .css_classes(["line-album-thumb"])
+                .build();
+            attach_texture_async(picture.clone(), path.clone(), 360);
+            let button = gtk::Button::builder()
+                .child(&picture)
+                .css_classes(["flat", "line-album-thumb-btn"])
+                .build();
+            let state = state.clone();
+            let content_type = message.content_type.clone();
+            let name = message
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("{}.jpg", message.id));
+            button.connect_clicked(move |_| {
+                open_media_viewer(&state, &path, &content_type, &name);
+            });
+            flow.insert(&button, -1);
+        }
+        scroll.set_child(Some(&flow));
+    }
+    window.set_child(Some(&scroll));
+    window.present();
 }
 
 pub(super) fn apply_peer_read(state: &AppState, chat_mid: &str, message_id: &str) {

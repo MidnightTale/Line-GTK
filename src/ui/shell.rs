@@ -44,6 +44,12 @@ pub struct ShellWidgets {
     pub sticker_btn: gtk::Button,
     pub call_btn: gtk::Button,
     pub mute_btn: gtk::Button,
+    pub pin_btn: gtk::Button,
+    pub album_btn: gtk::Button,
+    pub background_btn: gtk::Button,
+    pub background_popover: gtk::Popover,
+    pub message_background_layer: gtk::Box,
+    pub message_background_picture: gtk::Picture,
     pub jump_banner: gtk::Revealer,
     pub jump_banner_btn: gtk::Button,
     pub jump_banner_label: gtk::Label,
@@ -91,6 +97,7 @@ pub fn build_shell_page() -> ShellWidgets {
         .visible(false)
         .css_classes(["line-title-avatar"])
         .build();
+    profile_avatar.set_overflow(gtk::Overflow::Hidden);
     let profile_label = gtk::Label::builder()
         .label("LINE GTK")
         .css_classes(["heading", "line-title-name"])
@@ -297,7 +304,35 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["flat", "circular"])
         .sensitive(false)
         .build();
+    let pin_btn = gtk::Button::builder()
+        .icon_name("non-starred-symbolic")
+        .tooltip_text("Pin chat")
+        .css_classes(["flat", "circular"])
+        .sensitive(false)
+        .build();
+    let album_btn = gtk::Button::builder()
+        .icon_name("folder-pictures-symbolic")
+        .tooltip_text("Chat album")
+        .css_classes(["flat", "circular"])
+        .sensitive(false)
+        .build();
+    let background_btn = gtk::Button::builder()
+        .icon_name("preferences-desktop-wallpaper-symbolic")
+        .tooltip_text(crate::i18n::t("chat_background"))
+        .css_classes(["flat", "circular"])
+        .sensitive(false)
+        .build();
+    let background_popover = gtk::Popover::builder()
+        .autohide(true)
+        .has_arrow(true)
+        .position(gtk::PositionType::Bottom)
+        .css_classes(["line-chat-background-popover"])
+        .build();
+    background_popover.set_parent(&background_btn);
     chat_bar.append(&title_col);
+    chat_bar.append(&background_btn);
+    chat_bar.append(&album_btn);
+    chat_bar.append(&pin_btn);
     chat_bar.append(&mute_btn);
     chat_bar.append(&call_btn);
 
@@ -349,6 +384,31 @@ pub fn build_shell_page() -> ShellWidgets {
     msg_stack.add_named(&message_scroll, Some("list"));
     msg_stack.add_named(&msg_empty, Some("empty"));
     msg_stack.set_visible_child_name("idle");
+
+    let message_background_layer = gtk::Box::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["line-chat-background-layer", "line-chat-bg-default"])
+        .build();
+    let message_background_picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .can_shrink(true)
+        .hexpand(true)
+        .vexpand(true)
+        .visible(false)
+        .opacity(0.34)
+        .can_target(false)
+        .css_classes(["line-chat-background-picture"])
+        .build();
+    message_background_picture.set_overflow(gtk::Overflow::Hidden);
+    let message_stage = gtk::Overlay::builder()
+        .child(&message_background_layer)
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["line-message-stage"])
+        .build();
+    message_stage.add_overlay(&message_background_picture);
+    message_stage.add_overlay(&msg_stack);
 
     let jump_banner = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideUp)
@@ -519,7 +579,7 @@ pub fn build_shell_page() -> ShellWidgets {
     sticker_popover.set_parent(&sticker_btn);
 
     conversation.append(&chat_bar);
-    conversation.append(&msg_stack);
+    conversation.append(&message_stage);
     conversation.append(&jump_banner);
     conversation.append(&upload_revealer);
     conversation.append(&composer_stack);
@@ -587,6 +647,12 @@ pub fn build_shell_page() -> ShellWidgets {
         sticker_btn,
         call_btn,
         mute_btn,
+        pin_btn,
+        album_btn,
+        background_btn,
+        background_popover,
+        message_background_layer,
+        message_background_picture,
         jump_banner,
         jump_banner_btn,
         jump_banner_label,
@@ -605,13 +671,13 @@ pub fn load_css() {
             background: @window_bg_color;
         }
         .line-app-brand {
-            margin-start: 4px;
+            margin-left: 4px;
         }
         .line-app-brand-label {
             font-weight: 600;
         }
         .line-app-brand-icon {
-            margin-end: 0;
+            margin-right: 0;
         }
         .line-sidebar {
             background: alpha(@window_bg_color, 0.96);
@@ -664,6 +730,93 @@ pub fn load_css() {
               ),
               @window_bg_color;
         }
+        .line-message-stage,
+        .line-chat-background-layer {
+            background: @window_bg_color;
+        }
+        .line-chat-bg-default {
+            background:
+              linear-gradient(
+                180deg,
+                alpha(@accent_bg_color, 0.045) 0%,
+                transparent 140px
+              ),
+              @window_bg_color;
+        }
+        .line-chat-bg-mint {
+            background:
+              linear-gradient(
+                145deg,
+                alpha(@success_bg_color, 0.16),
+                alpha(@accent_bg_color, 0.055)
+              ),
+              @window_bg_color;
+        }
+        .line-chat-bg-ocean {
+            background:
+              linear-gradient(
+                155deg,
+                alpha(@accent_bg_color, 0.18),
+                alpha(@window_bg_color, 0.96) 64%
+              ),
+              @window_bg_color;
+        }
+        .line-chat-bg-dusk {
+            background:
+              linear-gradient(
+                145deg,
+                alpha(@warning_bg_color, 0.13),
+                alpha(@accent_bg_color, 0.09)
+              ),
+              @window_bg_color;
+        }
+        .line-chat-bg-graphite {
+            background:
+              linear-gradient(
+                145deg,
+                alpha(@window_fg_color, 0.10),
+                alpha(@window_fg_color, 0.035)
+              ),
+              @window_bg_color;
+        }
+        .line-chat-background-picture {
+            background: transparent;
+        }
+        .line-chat-background-menu {
+            min-width: 320px;
+        }
+        .line-chat-bg-choice {
+            min-height: 44px;
+            padding: 6px 8px;
+            border-radius: 10px;
+        }
+        .line-chat-bg-choice-selected {
+            background: alpha(@accent_bg_color, 0.16);
+        }
+        .line-chat-bg-swatch {
+            min-width: 36px;
+            min-height: 28px;
+            border-radius: 8px;
+            border: 1px solid alpha(@borders, 0.55);
+        }
+        .line-bg-swatch-default {
+            background: @window_bg_color;
+        }
+        .line-bg-swatch-mint {
+            background: alpha(@success_bg_color, 0.32);
+        }
+        .line-bg-swatch-ocean {
+            background: alpha(@accent_bg_color, 0.34);
+        }
+        .line-bg-swatch-dusk {
+            background: alpha(@warning_bg_color, 0.34);
+        }
+        .line-bg-swatch-graphite {
+            background: alpha(@window_fg_color, 0.18);
+        }
+        .line-chat-background-custom {
+            min-height: 40px;
+        }
         .line-chat-bar {
             background: transparent;
             border-bottom: 1px solid alpha(@borders, 0.35);
@@ -691,7 +844,6 @@ pub fn load_css() {
         }
         .line-title-avatar {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 26px;
             min-height: 26px;
             background: alpha(@borders, 0.35);
@@ -701,7 +853,6 @@ pub fn load_css() {
         }
         .line-avatar-frame {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 48px;
             min-height: 48px;
             background: alpha(@borders, 0.35);
@@ -728,7 +879,6 @@ pub fn load_css() {
         }
         .line-call-avatar {
             border-radius: 999px;
-            overflow: hidden;
             min-width: 96px;
             min-height: 96px;
             background: alpha(@accent_bg_color, 0.35);
@@ -748,7 +898,6 @@ pub fn load_css() {
         }
         .line-voice-card {
             min-width: 180px;
-            max-width: min(340px, 78%);
             padding: 2px 0;
         }
         .line-voice-play {
@@ -810,6 +959,44 @@ pub fn load_css() {
         }
         .line-media-viewer-root {
             background: @window_bg_color;
+        }
+        .line-media-review-window,
+        .line-media-review {
+            background: @window_bg_color;
+        }
+        .line-media-review-grid {
+            padding: 16px;
+            background: @view_bg_color;
+        }
+        .line-media-review-card {
+            padding: 8px;
+            border-radius: 12px;
+            background: alpha(@card_bg_color, 0.96);
+            border: 1px solid alpha(@borders, 0.45);
+        }
+        .line-media-review-preview {
+            border-radius: 9px;
+            background: alpha(@borders, 0.20);
+        }
+        .line-media-review-thumb {
+            border-radius: 9px;
+        }
+        .line-media-review-file-icon {
+            padding: 32px;
+        }
+        .line-media-review-remove {
+            min-width: 30px;
+            min-height: 30px;
+            margin: 6px;
+            color: @window_bg_color;
+            background: alpha(@window_fg_color, 0.76);
+            box-shadow: 0 1px 3px alpha(@window_fg_color, 0.28);
+        }
+        .line-media-review-remove:hover {
+            background: alpha(@window_fg_color, 0.92);
+        }
+        .line-media-review-footer {
+            border-top: 1px solid alpha(@borders, 0.38);
         }
         .line-media-viewer-bar {
             background: alpha(@headerbar_bg_color, 0.96);
@@ -899,10 +1086,20 @@ pub fn load_css() {
             min-height: 42px;
         }
         .line-chat-name { font-weight: 650; }
+        .line-chat-pinned { color: @accent_color; opacity: 0.9; }
         .line-chat-preview { opacity: 0.72; font-size: 0.85em; }
+        .line-album-thumb-btn {
+            padding: 0;
+            border-radius: 14px;
+        }
+        .line-album-thumb {
+            min-width: 160px;
+            min-height: 160px;
+            border-radius: 14px;
+            background: alpha(@borders, 0.22);
+        }
         .line-bubble-image {
             border-radius: 12px;
-            max-width: min(420px, 72%);
         }
         .line-bubble-sticker {
             background: transparent;
@@ -911,7 +1108,6 @@ pub fn load_css() {
             box-shadow: none;
             padding: 0;
             margin: 0;
-            max-width: min(160px, 56%);
         }
         .line-bubble-sticker .line-bubble-image,
         .line-sticker-image {
@@ -920,7 +1116,6 @@ pub fn load_css() {
             border: none;
             box-shadow: none;
             border-radius: 0;
-            max-width: 160px;
         }
         .line-flex-card {
             border-radius: 12px;
@@ -928,7 +1123,6 @@ pub fn load_css() {
             background: alpha(@card_bg_color, 0.98);
             border: 1px solid alpha(@borders, 0.55);
             min-width: 180px;
-            max-width: min(420px, 72%);
         }
         .line-flex-title { font-weight: 700; }
         .line-flex-action { margin-top: 4px; }
@@ -961,7 +1155,6 @@ pub fn load_css() {
             border-radius: 16px;
             padding: 8px 12px;
             box-shadow: 0 1px 2px alpha(@window_fg_color, 0.08);
-            max-width: min(480px, 72%);
         }
         .line-bubble-in {
             background: alpha(@card_bg_color, 0.97);
@@ -987,6 +1180,63 @@ pub fn load_css() {
             margin-bottom: 4px;
             margin-left: 4px;
             margin-right: 4px;
+        }
+        .line-message-reactions {
+            margin-top: 2px;
+        }
+        .line-message-reaction-chip {
+            min-height: 24px;
+            padding: 1px 7px;
+            border-radius: 999px;
+            font-size: 0.78em;
+            background: alpha(@card_bg_color, 0.78);
+            border: 1px solid alpha(@borders, 0.42);
+        }
+        .line-message-reaction-mine {
+            color: @accent_color;
+            background: alpha(@accent_bg_color, 0.18);
+            border-color: alpha(@accent_bg_color, 0.48);
+        }
+        .line-message-reaction-choice {
+            min-width: 38px;
+            min-height: 38px;
+            padding: 2px;
+            font-size: 1.2em;
+        }
+        .line-message-reaction-choice:hover {
+            background: alpha(@accent_bg_color, 0.16);
+        }
+        .line-message-unsend {
+            color: @destructive_color;
+        }
+        .line-msg-sender-name {
+            font-size: 0.78em;
+            font-weight: 650;
+            opacity: 0.78;
+            margin-left: 6px;
+        }
+        .line-msg-avatar-slot {
+            min-width: 38px;
+            min-height: 38px;
+            margin-top: 18px;
+            border-radius: 999px;
+        }
+        .line-msg-avatar,
+        .line-sender-profile-avatar {
+            border-radius: 999px;
+            background: alpha(@borders, 0.25);
+        }
+        .line-msg-avatar-slot:hover {
+            background: alpha(@accent_bg_color, 0.16);
+        }
+        .line-sender-profile {
+            min-width: 280px;
+        }
+        .line-sender-profile-name {
+            font-weight: 750;
+        }
+        .line-sender-profile-status {
+            padding: 4px 12px;
         }
         .line-day-sep-row {
             margin-top: 12px;
@@ -1084,7 +1334,8 @@ pub fn load_css() {
             padding: 0 14px;
         }
         .line-composer-narrow {
-            spacing: 4px;
+            padding-left: 2px;
+            padding-right: 2px;
         }
         .line-composer-narrow .line-send-btn {
             min-width: 34px;

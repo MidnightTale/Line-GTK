@@ -1,5 +1,10 @@
 import type { Client } from "@evex/linejs";
 import type { LineDevice } from "./auth.ts";
+import {
+  AnnexBParser,
+  H264AccessUnitAssembler,
+  packetizeH264AccessUnit,
+} from "./h264.ts";
 
 type Json = Record<string, unknown>;
 type CallRuntime = {
@@ -62,9 +67,17 @@ type ActiveCall = {
       payload: Uint8Array,
       opts?: { timestampStep?: number },
     ) => Promise<void>;
+    videoReady?: () => boolean;
+    sendVideo?: (
+      payload: Uint8Array,
+      opts?: { endOfFrame?: boolean; timestampStep?: number },
+    ) => Promise<void>;
     receive: () => AsyncIterable<Uint8Array>;
   };
   stopAudio?: () => void;
+  stopScreenShare?: () => void;
+  videoCapable: boolean;
+  screenSharing: boolean;
   aborted: boolean;
 };
 
@@ -187,7 +200,11 @@ function logTransportDebug(
   console.error("[call debug]", extras ? { ...ev, ...extras } : ev);
 }
 
-export async function doCallStart(id: number | string | null, peerMid: string) {
+export async function doCallStart(
+  id: number | string | null,
+  peerMid: string,
+  preferVideo = false,
+) {
   const client = runtime.getClient();
   callLog("start requested", {
     peerMid,
@@ -242,6 +259,8 @@ export async function doCallStart(id: number | string | null, peerMid: string) {
     peer: peerMid,
     direction: "out",
     localMid,
+    videoCapable: preferVideo,
+    screenSharing: false,
     aborted: false,
   };
   const call = activeCall;
@@ -259,7 +278,24 @@ export async function doCallStart(id: number | string | null, peerMid: string) {
       fromEnvInfo: LINE_CALL_DEVNAME || "(none)",
       deviceInfo: planetDeviceInfo(),
     });
-    const route = await client.call.acquireRoute({
+    let route: Awaited<ReturnType<typeof client.call.acquireRoute>> | undefined;
+    if (preferVideo) {
+      try {
+        route = await client.call.acquireRoute({
+          to: peerMid,
+          callType: "VIDEO",
+          ...(LINE_CALL_DEVNAME
+            ? { fromEnvInfo: { devname: LINE_CALL_DEVNAME } }
+            : {}),
+        });
+      } catch (error) {
+        call.videoCapable = false;
+        callLog("video route unavailable; falling back to audio", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    route ??= await client.call.acquireRoute({
       to: peerMid,
       callType: "AUDIO",
       ...(LINE_CALL_DEVNAME
@@ -286,6 +322,9 @@ export async function doCallStart(id: number | string | null, peerMid: string) {
       localMid,
       timeoutMs: 10_000,
       mediaKeyMode: "audio-reverse-stage",
+      enableVideo: call.videoCapable,
+      videoBitrateKbps: 800,
+      videoFps: 15,
       deviceInfo: planetDeviceInfo(),
       debug: (ev: Record<string, unknown>) => {
         if (ev.type === "rel_req") {
@@ -436,7 +475,13 @@ export async function doCallStart(id: number | string | null, peerMid: string) {
       );
     }
 
-    emitEvent("call_state", { callId, peer: peerMid, state: "connected" });
+    call.videoCapable = call.videoCapable && !!transport.videoReady?.();
+    emitEvent("call_state", {
+      callId,
+      peer: peerMid,
+      state: "connected",
+      videoCapable: call.videoCapable,
+    });
     callLog("starting audio I/O");
     call.stopAudio = await startCallAudioIO(
       transport,
@@ -512,7 +557,7 @@ export async function doCallAnswer(id: number | string | null) {
   // Answering starts a fresh outgoing audio session to the caller so media
   // can negotiate; hangup still sends REL_REQ to stop their ring.
   ok(id, { answering: true, peer: offer.from, callId: offer.callId });
-  await doCallStart(null, offer.from);
+  await doCallStart(null, offer.from, false);
 }
 
 export async function doCallDecline(id: number | string | null) {
@@ -855,6 +900,190 @@ async function startCallAudioIO(
   };
 }
 
+type ScreenShareControl = {
+  stopped: boolean;
+  selector?: Deno.ChildProcess;
+  recorder?: Deno.ChildProcess;
+};
+
+const SCREEN_SHARE_FPS = 15;
+const SCREEN_SHARE_RTP_STEP = Math.round(90_000 / SCREEN_SHARE_FPS);
+
+export function doCallScreenStart(id: number | string | null) {
+  const call = activeCall;
+  const transport = call?.transport;
+  if (!call || !transport) {
+    fail(id, "call_not_connected");
+    return;
+  }
+  if (!call.videoCapable || !transport.videoReady?.() || !transport.sendVideo) {
+    fail(id, "call_video_not_negotiated");
+    return;
+  }
+  if (call.screenSharing) {
+    ok(id, { state: "active" });
+    return;
+  }
+
+  const control: ScreenShareControl = { stopped: false };
+  call.screenSharing = true;
+  call.stopScreenShare = () => {
+    control.stopped = true;
+    for (const child of [control.selector, control.recorder]) {
+      try {
+        child?.kill("SIGINT");
+      } catch { /* already exited */ }
+    }
+  };
+  ok(id, { state: "selecting" });
+  emitEvent("screen_share_state", { state: "selecting" });
+
+  void runScreenShare(call, control).catch((error) => {
+    if (!control.stopped) {
+      const message = error instanceof Error ? error.message : String(error);
+      callLog("screen share failed", { error: message });
+      emitEvent("screen_share_state", { state: "failed", error: message });
+    }
+  }).finally(() => {
+    try {
+      control.recorder?.kill("SIGINT");
+    } catch { /* already exited */ }
+    if (activeCall === call) {
+      call.screenSharing = false;
+      call.stopScreenShare = undefined;
+      if (control.stopped) {
+        emitEvent("screen_share_state", { state: "stopped" });
+      }
+    }
+  });
+}
+
+export function doCallScreenStop(id: number | string | null) {
+  const call = activeCall;
+  if (!call?.screenSharing) {
+    ok(id, { state: "stopped" });
+    return;
+  }
+  call.stopScreenShare?.();
+  ok(id, { state: "stopping" });
+}
+
+async function runScreenShare(call: ActiveCall, control: ScreenShareControl) {
+  const selector = new Deno.Command("slurp", {
+    args: ["-f", "%x,%y %wx%h"],
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  control.selector = selector;
+  const selected = await selector.output();
+  control.selector = undefined;
+  if (control.stopped) return;
+  const geometry = new TextDecoder().decode(selected.stdout).trim();
+  if (!selected.success || !/^\d+,\d+ \d+x\d+$/.test(geometry)) {
+    throw new Error("screen_share_selection_canceled");
+  }
+
+  emitEvent("screen_share_state", { state: "starting", geometry });
+  const recorder = new Deno.Command("wf-recorder", {
+    args: [
+      "-g",
+      geometry,
+      "-r",
+      String(SCREEN_SHARE_FPS),
+      "-x",
+      "yuv420p",
+      "-c",
+      "libx264",
+      "-m",
+      "h264",
+      "-p",
+      "preset=ultrafast",
+      "-p",
+      "tune=zerolatency",
+      "-p",
+      "profile=baseline",
+      "-p",
+      "crf=28",
+      "-p",
+      "g=30",
+      "-p",
+      "bf=0",
+      "-p",
+      "x264-params=aud=1:repeat-headers=1:slices=1:scenecut=0",
+      "-f",
+      "-",
+    ],
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  control.recorder = recorder;
+  const stderr = readProcessStderr(recorder.stderr);
+  emitEvent("screen_share_state", { state: "active", geometry });
+
+  const annexB = new AnnexBParser();
+  const accessUnits = new H264AccessUnitAssembler();
+  const reader = recorder.stdout.getReader();
+  try {
+    while (!control.stopped && activeCall === call && !call.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+      for (const nal of annexB.push(value)) {
+        for (const unit of accessUnits.push(nal)) {
+          await sendScreenAccessUnit(call, unit);
+        }
+      }
+    }
+    for (const nal of annexB.flush()) {
+      for (const unit of accessUnits.push(nal)) {
+        await sendScreenAccessUnit(call, unit);
+      }
+    }
+    for (const unit of accessUnits.flush()) {
+      await sendScreenAccessUnit(call, unit);
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch { /* ignore */ }
+  }
+
+  const status = await recorder.status;
+  const stderrTail = await stderr;
+  if (!control.stopped && !status.success) {
+    throw new Error(stderrTail || `wf-recorder exited ${status.code}`);
+  }
+}
+
+async function sendScreenAccessUnit(call: ActiveCall, nals: Uint8Array[]) {
+  const sendVideo = call.transport?.sendVideo;
+  if (!sendVideo || !nals.length) return;
+  for (const packet of packetizeH264AccessUnit(nals)) {
+    await sendVideo(packet.payload, {
+      endOfFrame: packet.endOfFrame,
+      timestampStep: SCREEN_SHARE_RTP_STEP,
+    });
+  }
+}
+
+async function readProcessStderr(
+  stream: ReadableStream<Uint8Array>,
+): Promise<string> {
+  const reader = stream.getReader();
+  let tail = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      tail = (tail + new TextDecoder().decode(value)).slice(-4096);
+    }
+  } catch { /* process closed */ }
+  return tail.trim();
+}
+
 async function endActiveCall(opts: { silent?: boolean } = {}) {
   const cur = activeCall;
   if (!cur || cur.aborted) {
@@ -877,6 +1106,9 @@ async function endActiveCall(opts: { silent?: boolean } = {}) {
   resetCallAudioCtl();
   try {
     cur.stopAudio?.();
+  } catch { /* ignore */ }
+  try {
+    cur.stopScreenShare?.();
   } catch { /* ignore */ }
 
   if (cur.transport) {
