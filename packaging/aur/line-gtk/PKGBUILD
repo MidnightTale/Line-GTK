@@ -1,12 +1,12 @@
 # Maintainer: MidnightTale <mntale@pm.me>
 pkgname=line-gtk
 pkgver=0.1.2
-pkgrel=1
+pkgrel=2
 pkgdesc='Unofficial native LINE client for Linux (GTK4 / Libadwaita)'
 arch=('x86_64')
 url='https://github.com/MidnightTale/Line-GTK'
 license=('GPL-3.0-or-later')
-depends=('gtk4' 'libadwaita' 'ffmpeg' 'hicolor-icon-theme')
+depends=('gtk4' 'libadwaita' 'ffmpeg' 'hicolor-icon-theme' 'deno')
 optdepends=(
   'poppler: PDF preview in media viewer'
   'gst-plugins-good: extra video playback codecs'
@@ -25,6 +25,8 @@ package() {
   cp -a protocol "$pkgdir/usr/share/line-gtk/protocol"
   cp -a assets "$pkgdir/usr/share/line-gtk/assets"
 
+  # Use system deno to avoid makepkg strip corrupting deno compile binary
+  rm -f "$pkgdir/usr/share/line-gtk/protocol/line-gtk-protocol"
   rm -rf "$pkgdir/usr/share/line-gtk/protocol/node_modules" \
          "$pkgdir/usr/share/line-gtk/protocol/.deno" 2>/dev/null || true
 
