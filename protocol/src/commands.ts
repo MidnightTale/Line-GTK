@@ -1,11 +1,8 @@
-import {
-  type Client,
-  loginWithAuthToken,
-  loginWithQR,
-  type TalkMessage,
-} from "@evex/linejs";
+import { type Client, loginWithQR, type TalkMessage } from "@evex/linejs";
 import { FileStorage } from "@evex/linejs/storage";
 import { join } from "@std/path";
+import { restoreSession } from "./auth.ts";
+import { authenticateEmail } from "./email_login.ts";
 import { atomicWriteJson } from "./storage.ts";
 import type { CachePolicy } from "./cache_policy.ts";
 import { friendName, picturePathOf } from "./contacts.ts";
@@ -98,6 +95,22 @@ export type CommandRuntime = {
 };
 
 export function createCommandService(runtime: CommandRuntime) {
+  let loginInFlight = false;
+  async function withLogin(
+    id: number | string | null,
+    operation: () => Promise<void>,
+  ) {
+    if (loginInFlight) {
+      runtime.fail(id, "login_in_progress");
+      return;
+    }
+    loginInFlight = true;
+    try {
+      await operation();
+    } finally {
+      loginInFlight = false;
+    }
+  }
   const {
     msgCache,
     contactIndex,
@@ -126,7 +139,6 @@ export function createCommandService(runtime: CommandRuntime) {
     saveAuth,
     loadAuth,
     loadAuthDevice,
-    clearAuth,
     myProfilePayload,
     patchE2eeGuards,
     startListen,
@@ -222,22 +234,8 @@ export function createCommandService(runtime: CommandRuntime) {
       fail(id, "no_auth_token");
       return;
     }
-    const storage = new FileStorage(storagePath);
-    let device = await loadAuthDevice();
-    // Migrate legacy DESKTOPWIN sessions — tokens are device-bound; force re-QR.
-    if (device === "DESKTOPWIN") {
-      await clearAuth();
-      fail(id, "relogin_android_required");
-      return;
-    }
-    if (device !== "ANDROID" && device !== "ANDROIDSECONDARY") {
-      device = "ANDROIDSECONDARY";
-    }
-    client = await loginWithAuthToken(auth, {
-      device: device as "ANDROID" | "ANDROIDSECONDARY",
-      version: LINE_VERSION,
-      storage,
-    });
+    const device = await loadAuthDevice();
+    client = await restoreSession(auth, device, storagePath, LINE_VERSION);
     runtime.setClient(client);
     await saveAuth(client.authToken, device);
     const profile = await client.getMyProfile();
@@ -247,6 +245,26 @@ export function createCommandService(runtime: CommandRuntime) {
       ...(await myProfilePayload(profile)),
       device,
     });
+  }
+
+  async function doLoginEmail(
+    id: number | string | null,
+    email: string,
+    password: string,
+  ) {
+    runtime.setAuthDead(false);
+    const client = await authenticateEmail(
+      email,
+      password,
+      storagePath,
+      (pin) => emitEvent("pin", { pin }),
+    );
+    runtime.setClient(client);
+    const profile = await client.getMyProfile();
+    await saveAuth(client.authToken, "DESKTOPWIN");
+    patchE2eeGuards();
+    await startListen();
+    ok(id, { ...(await myProfilePayload(profile)), device: "DESKTOPWIN" });
   }
 
   async function loadDiskChatCache(): Promise<ChatRow[] | null> {
@@ -672,8 +690,11 @@ export function createCommandService(runtime: CommandRuntime) {
 
   return {
     markRead: doMarkRead,
-    loginQr: doLoginQr,
-    loginToken: doLoginToken,
+    loginQr: (id: number | string | null) => withLogin(id, () => doLoginQr(id)),
+    loginEmail: (id: number | string | null, email: string, password: string) =>
+      withLogin(id, () => doLoginEmail(id, email, password)),
+    loginToken: (id: number | string | null, token?: string) =>
+      withLogin(id, () => doLoginToken(id, token)),
     listChats: doListChats,
     fetchMessages: doFetchMessages,
     sendMessage: doSend,

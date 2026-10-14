@@ -27,14 +27,20 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 // Sidecar is already restoring; keep shell visible (no QR flash).
                 show_shell_restoring(state);
             } else if restarting || !has_auth {
-                show_login(state, &crate::i18n::t("login_qr_hint"));
-                if let Ok(id) = state.sidecar.login_qr() {
-                    state.pending.borrow_mut().insert(id, Pending::Login);
+                login::set_busy(&state.login, false);
+                show_login(state, &login::method_hint(&state.login));
+                if state.login.method.get() == login::LoginMethod::Qr {
+                    if let Ok(id) = state.sidecar.login_qr() {
+                        state.pending.borrow_mut().insert(id, Pending::Login);
+                    } else {
+                        login::show_failure(&state.login, &crate::i18n::t("login_email_failed"));
+                    }
                 }
             }
         }
         ProtocolEvent::Session {
             mid,
+            device,
             display_name,
             status_message,
             picture_path,
@@ -44,6 +50,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             *state.recovery_attempts.borrow_mut() = 0;
             let result = serde_json::json!({
                 "mid": mid,
+                "device": device,
                 "displayName": display_name,
                 "statusMessage": status_message,
                 "picturePath": picture_path,
@@ -65,13 +72,16 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             } else {
                 error.clone()
             };
-            show_login(state, &format!("{msg}\nTap Retry to sign in with QR."));
-            state.login.retry_btn.set_visible(true);
+            show_login(state, &msg);
+            login::show_failure(&state.login, &msg);
             *state.discord_session_start.borrow_mut() = None;
             sync_discord_rpc(state);
             toast(state, &msg);
         }
         ProtocolEvent::Qr { url } => {
+            if state.login.method.get() != login::LoginMethod::Qr {
+                return;
+            }
             show_login(state, &crate::i18n::t("login_qr_hint"));
             login::show_qr_stage(&state.login);
             if let Err(e) = login::set_qr(&state.login.qr_picture, &url) {
@@ -79,6 +89,14 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             }
         }
         ProtocolEvent::Pin { pin } => {
+            if !state
+                .pending
+                .borrow()
+                .values()
+                .any(|request| matches!(request, Pending::Login | Pending::LoginEmail))
+            {
+                return;
+            }
             show_login(state, &crate::i18n::t("login_pin_waiting"));
             login::show_pin_stage(&state.login, &pin);
         }
@@ -479,18 +497,31 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
         } => {
             let pending = state.pending.borrow_mut().remove(&id);
             if !ok {
-                if matches!(pending, Some(Pending::Login)) && *state.restarting.borrow() {
+                if matches!(pending, Some(Pending::Login | Pending::LoginEmail))
+                    && *state.restarting.borrow()
+                {
                     return;
                 }
-                if matches!(pending, Some(Pending::Login)) {
-                    show_login(
-                        state,
-                        error
-                            .as_deref()
-                            .unwrap_or("Login failed. Tap Retry to start over."),
-                    );
-                    login::show_qr_stage(&state.login);
-                    state.login.retry_btn.set_visible(true);
+                if matches!(pending, Some(Pending::Login | Pending::LoginEmail)) {
+                    let code = error.as_deref().unwrap_or("login_email_failed");
+                    let message = if code.starts_with("login_") {
+                        crate::i18n::t(code)
+                    } else if code.contains("timed out") {
+                        crate::i18n::t("login_email_timeout")
+                    } else {
+                        code.into()
+                    };
+                    show_login(state, &message);
+                    login::show_failure(&state.login, &message);
+                    // タイムアウトした通信が後から認証を確定しないようキャンセルする。
+                    if code.contains("timed out") {
+                        *state.restarting.borrow_mut() = true;
+                        if state.sidecar.restart_for_login().is_err() {
+                            *state.restarting.borrow_mut() = false;
+                        }
+                    }
+                    toast(state, &message);
+                    return;
                 }
                 if matches!(pending, Some(Pending::ListChats)) {
                     set_side_state(
@@ -529,7 +560,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 return;
             }
             match pending {
-                Some(Pending::Login) => on_logged_in(state, &result),
+                Some(Pending::Login | Pending::LoginEmail) => on_logged_in(state, &result),
                 Some(Pending::ListChats) => {
                     let chats: Vec<ChatInfo> = result
                         .get("chats")
@@ -664,6 +695,11 @@ pub(super) fn recover_sidecar(state: &AppState) {
 pub(super) fn on_logged_in(state: &AppState, result: &serde_json::Value) {
     match serde_json::from_value::<Profile>(result.clone()) {
         Ok(profile) => {
+            state.login.password_entry.set_text("");
+            login::set_busy(&state.login, false);
+            *state.login.error.borrow_mut() = None;
+            *state.session_device.borrow_mut() = profile.device.clone();
+            refresh_call_controls(state);
             *state.session_ready.borrow_mut() = true;
             apply_self_profile(
                 state,
@@ -728,7 +764,7 @@ pub(super) fn show_shell_restoring(state: &AppState) {
 
 pub(super) fn show_login(state: &AppState, hint: &str) {
     state.stack.set_visible_child_name("login");
-    login::show_qr_stage(&state.login);
+    login::show_method_stage(&state.login);
     state.login.hint.set_text(hint);
     sync_discord_rpc(state);
 }

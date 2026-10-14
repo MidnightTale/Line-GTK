@@ -208,6 +208,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         recording_tick: Rc::new(RefCell::new(None)),
         voice_playback: Rc::new(RefCell::new(None)),
         session_ready: Rc::new(RefCell::new(false)),
+        session_device: Rc::new(RefCell::new(String::new())),
         active_call_peer: Rc::new(RefCell::new(None)),
         incoming_call_from: Rc::new(RefCell::new(None)),
         call_ui: Rc::new(RefCell::new(None)),
@@ -1257,7 +1258,30 @@ fn wire_actions(state: &AppState) {
 
     let s = state.clone();
     state.login.retry_btn.connect_clicked(move |_| {
-        restart_qr_login(&s);
+        restart_login(&s);
+    });
+
+    let s = state.clone();
+    state.login.qr_method_btn.connect_clicked(move |_| {
+        switch_login_method(&s, login::LoginMethod::Qr);
+    });
+    let s = state.clone();
+    state.login.email_method_btn.connect_clicked(move |_| {
+        switch_login_method(&s, login::LoginMethod::Email);
+    });
+    let s = state.clone();
+    state
+        .login
+        .email_submit_btn
+        .connect_clicked(move |_| submit_email_login(&s));
+    let s = state.clone();
+    state
+        .login
+        .password_entry
+        .connect_activate(move |_| submit_email_login(&s));
+    let password = state.login.password_entry.clone();
+    state.login.email_entry.connect_activate(move |_| {
+        password.grab_focus();
     });
 
     let s = state.clone();
@@ -1276,6 +1300,8 @@ fn wire_actions(state: &AppState) {
                     clear_list(&s2.chat_list);
                     clear_messages(&s2);
                     s2.chats.borrow_mut().clear();
+                    login::set_method(&s2.login, login::LoginMethod::Qr);
+                    s2.session_device.borrow_mut().clear();
                     login::show_qr_stage(&s2.login);
                     s2.stack.set_visible_child_name("login");
                     s2.login.hint.set_text(&crate::i18n::t("logged_out_hint"));
@@ -1314,6 +1340,8 @@ fn wire_actions(state: &AppState) {
                     close_active_call_ui(&s2);
                     *s2.active_call_peer.borrow_mut() = None;
                     *s2.incoming_call_from.borrow_mut() = None;
+                    login::set_method(&s2.login, login::LoginMethod::Qr);
+                    s2.session_device.borrow_mut().clear();
                     login::show_qr_stage(&s2.login);
                     s2.stack.set_visible_child_name("login");
                     s2.login
@@ -1551,18 +1579,70 @@ fn open_chat(state: &AppState, chat: &ChatInfo) {
     sync_discord_rpc(state);
 }
 
+fn switch_login_method(state: &AppState, method: login::LoginMethod) {
+    if state.login.method.get() == method {
+        return;
+    }
+    if method == login::LoginMethod::Qr {
+        restart_qr_login(state);
+    } else {
+        login::set_method(&state.login, method);
+        restart_login(state);
+    }
+}
+
+fn submit_email_login(state: &AppState) {
+    if state.login.busy.get()
+        || *state.restarting.borrow()
+        || state.login.method.get() != login::LoginMethod::Email
+    {
+        return;
+    }
+    let email = state.login.email_entry.text();
+    let password = state.login.password_entry.text();
+    if email.trim().is_empty() || password.is_empty() {
+        login::show_failure(&state.login, &crate::i18n::t("login_email_missing"));
+        return;
+    }
+    *state.login.error.borrow_mut() = None;
+    login::set_busy(&state.login, true);
+    state
+        .login
+        .hint
+        .set_text(&crate::i18n::t("login_email_signing_in"));
+    let request = state.sidecar.login_email(email.trim(), password.as_str());
+    // パスワードを画面や設定へ保持しない。
+    state.login.password_entry.set_text("");
+    match request {
+        Ok(id) => {
+            state.pending.borrow_mut().insert(id, Pending::LoginEmail);
+        }
+        Err(_) => login::show_failure(&state.login, &crate::i18n::t("login_email_failed")),
+    }
+}
+
 fn restart_qr_login(state: &AppState) {
+    // 暗号鍵を再取得する操作は、ログイン中の方式によらずQRへ切り替える。
+    login::set_method(&state.login, login::LoginMethod::Qr);
+    restart_login(state);
+}
+
+fn restart_login(state: &AppState) {
     *state.restarting.borrow_mut() = true;
     state.pending.borrow_mut().clear();
-    login::show_qr_stage(&state.login);
+    *state.login.error.borrow_mut() = None;
+    state.login.password_entry.set_text("");
+    login::set_busy(&state.login, true);
+    login::show_method_stage(&state.login);
     state
         .login
         .hint
         .set_text(&crate::i18n::t("restarting_login"));
     state.stack.set_visible_child_name("login");
 
-    if let Err(e) = state.sidecar.restart() {
+    if let Err(e) = state.sidecar.restart_for_login() {
         *state.restarting.borrow_mut() = false;
+        login::set_busy(&state.login, false);
         toast(
             state,
             &crate::i18n::tf("restart_failed_err", &[("error", &e.to_string())]),

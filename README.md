@@ -8,6 +8,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 ## Implementation
 
 - [x] QR login (additional device)
+- [x] メールアドレス・パスワードでログイン（スマホでの認証番号入力に対応）
 - [x] Chats, messages, stickers, friends
 - [x] Photos, video, voice messages, files
 - [x] Paste and drag-and-drop attachments
@@ -20,6 +21,10 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 ---
 
 ## Requirements
+
+メールログインはPCの追加デバイスとして認証します。スマホ側で認証番号の入力が必要になる場合があります。
+パスワードは保存せず、次回はPC用の認証情報でセッションを復元します。
+音声通話の試験機能を使う場合はQRコードでログインしてください。
 
 | Dependency | Notes |
 | --- | --- |

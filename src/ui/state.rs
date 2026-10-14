@@ -41,6 +41,7 @@ pub(super) struct AppState {
     pub send_btn: gtk::Button,
     pub status: gtk::Label,
     pub login: Rc<login::LoginWidgets>,
+    pub session_device: Rc<RefCell<String>>,
     pub profile_label: gtk::Label,
     pub profile_avatar: gtk::Picture,
     pub brand_label: gtk::Label,
@@ -148,6 +149,7 @@ pub(super) struct PendingNotif {
 #[derive(Debug, Clone)]
 pub(super) enum Pending {
     Login,
+    LoginEmail,
     ListChats,
     ListFriends,
     FetchMessages {

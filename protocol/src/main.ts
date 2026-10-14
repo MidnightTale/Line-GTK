@@ -3,11 +3,11 @@
  * NDJSON over stdin/stdout. Heavy I/O is cached + async so GTK stays snappy.
  */
 
-import { Client, loginWithAuthToken, TalkMessage } from "@evex/linejs";
-import { FileStorage } from "@evex/linejs/storage";
+import { Client, TalkMessage } from "@evex/linejs";
 import { fromFileUrl, join } from "@std/path";
 import { atomicWriteJson, ensurePrivateDir } from "./storage.ts";
-import { AuthStore, LineDevice } from "./auth.ts";
+import { AuthStore, LineDevice, restoreSession } from "./auth.ts";
+import { emailLoginError } from "./email_login.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
 import { picturePathOf, profileUrl } from "./contacts.ts";
 import { coerceI64, normalizeRaw } from "./messages.ts";
@@ -1645,6 +1645,31 @@ async function handle(req: Json) {
       case "login_qr":
         await commands.loginQr(id);
         break;
+      case "login_email": {
+        const email = typeof params.email === "string" ? params.email : "";
+        const password = typeof params.password === "string"
+          ? params.password
+          : "";
+        delete params.password;
+        try {
+          await commands.loginEmail(id, email, password);
+        } catch (error) {
+          const code = error instanceof Error ? error.message : "";
+          fail(
+            id,
+            [
+                "login_email_missing",
+                "login_invalid_email",
+                "login_invalid_password",
+                "login_email_failed",
+                "login_email_timeout",
+              ].includes(code)
+              ? code
+              : emailLoginError(error),
+          );
+        }
+        break;
+      }
       case "login_token":
         await commands.loginToken(id, params.token as string | undefined);
         break;
@@ -1933,42 +1958,27 @@ async function handle(req: Json) {
 await stickers.loadIndex();
 await loadDiskContacts();
 
-const bootAuth = await loadAuth();
+const bootAuth = Deno.env.get("LINE_GTK_SKIP_RESTORE") === "1"
+  ? null
+  : await loadAuth();
 const bootDevice = await loadAuthDevice();
-const needsAndroidRelogin = !!bootAuth && bootDevice === "DESKTOPWIN";
 
 emitEvent("ready", {
   dataDir,
   sidecar: fromFileUrl(import.meta.url),
-  hasAuth: !!bootAuth && !needsAndroidRelogin,
-  device: needsAndroidRelogin ? "" : bootDevice,
+  hasAuth: !!bootAuth,
+  device: bootDevice,
 });
 
-// Legacy DESKTOPWIN tokens cannot do reliable PLANET calls (docs require ANDROID*).
-if (needsAndroidRelogin) {
-  console.error(
-    "[auth] DESKTOPWIN session detected — clearing auth. Re-scan QR for ANDROIDSECONDARY (required for voice calls per linejs docs).",
-  );
-  await clearAuth();
-  emitEvent("session_failed", {
-    error: "relogin_android_required",
-  });
-} else if (bootAuth) {
+if (bootAuth) {
   try {
-    const storage = new FileStorage(storagePath);
-    const device = bootDevice === "ANDROID" || bootDevice === "ANDROIDSECONDARY"
-      ? bootDevice
-      : "ANDROIDSECONDARY";
-    client = await loginWithAuthToken(bootAuth, {
-      device,
-      version: LINE_VERSION,
-      storage,
-    });
+    const device = bootDevice;
+    client = await restoreSession(bootAuth, device, storagePath, LINE_VERSION);
     await saveAuth(client.authToken, device);
     const profile = await client.getMyProfile();
     patchE2eeGuards();
     listener.start();
-    emitEvent("session", await myProfilePayload(profile));
+    emitEvent("session", { ...(await myProfilePayload(profile)), device });
   } catch (e) {
     console.error("[boot restore]", e);
     emitEvent("session_failed", {

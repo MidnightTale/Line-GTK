@@ -1,7 +1,40 @@
-import { join } from "@std/path";
-import { readPrivateTextFile, writePrivateTextFile } from "./storage.ts";
+import { dirname, join } from "@std/path";
+import { loginWithAuthToken } from "@evex/linejs";
+import { FileStorage } from "@evex/linejs/storage";
+import {
+  ensurePrivateDir,
+  readPrivateTextFile,
+  writePrivateTextFile,
+} from "./storage.ts";
 
 export type LineDevice = "ANDROID" | "ANDROIDSECONDARY" | "DESKTOPWIN";
+
+// セッションの機種と同じ設定で復元する。PCにはAndroidのバージョンを渡さない。
+export function loginInit(device: LineDevice, androidVersion: string) {
+  return device === "DESKTOPWIN"
+    ? { device }
+    : { device, version: androidVersion };
+}
+
+export async function createAuthStorage(path: string) {
+  await ensurePrivateDir(dirname(path));
+  const storage = new FileStorage(path);
+  if (Deno.build.os !== "windows") await Deno.chmod(path, 0o600);
+  return storage;
+}
+
+export async function restoreSession(
+  token: string,
+  device: LineDevice,
+  storagePath: string,
+  androidVersion: string,
+  authenticate: typeof loginWithAuthToken = loginWithAuthToken,
+) {
+  return await authenticate(token, {
+    ...loginInit(device, androidVersion),
+    storage: await createAuthStorage(storagePath),
+  });
+}
 
 export class AuthStore {
   readonly tokenPath: string;
