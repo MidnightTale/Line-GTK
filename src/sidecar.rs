@@ -13,6 +13,14 @@ use std::time::{Duration, Instant};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn request_timeout(method: &str) -> Duration {
+    if method.starts_with("login_") {
+        Duration::from_secs(420)
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
 pub struct Sidecar {
     child: Arc<Mutex<Option<Child>>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -237,7 +245,9 @@ impl Sidecar {
             }
             return Err(error.into());
         }
-        let _ = self.timeout_tx.send((id, Instant::now()));
+        let _ = self
+            .timeout_tx
+            .send((id, Instant::now() + request_timeout(method)));
         Ok(id)
     }
 
@@ -865,8 +875,8 @@ fn spawn_timeout_worker(
                     deadlines.push(item);
                 }
                 let now = Instant::now();
-                deadlines.retain(|(id, started)| {
-                    if now.duration_since(*started) < REQUEST_TIMEOUT {
+                deadlines.retain(|(id, deadline)| {
+                    if now < *deadline {
                         return true;
                     }
                     let timed_out = pending_ids

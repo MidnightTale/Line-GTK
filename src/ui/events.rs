@@ -133,7 +133,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             handle_call_state(state, &peer, &call_state, error.as_deref());
         }
         ProtocolEvent::Message(msg) => {
-            let peer = if msg.mine {
+            let peer = if msg.mine || msg.to.starts_with('c') {
                 msg.to.clone()
             } else {
                 msg.from.clone()

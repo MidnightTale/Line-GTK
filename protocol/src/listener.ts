@@ -1,5 +1,6 @@
 import type { Client, TalkMessage } from "@evex/linejs";
 import * as calls from "./calls.ts";
+import { conversationMid } from "./messages.ts";
 
 type Json = Record<string, unknown>;
 
@@ -46,7 +47,7 @@ export function createListener(runtime: ListenerRuntime) {
       try {
         const tm = msg as TalkMessage;
         const message = await summarizeTalkMessage(tm, { withMedia: false });
-        const peer = message.mine ? String(message.to) : String(message.from);
+        const peer = conversationMid(message);
         runtime.invalidateMessages(peer);
         // Advance box cursor so later refetch can see this message.
         storeBoxCursor(peer, {

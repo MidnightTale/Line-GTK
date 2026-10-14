@@ -45,6 +45,16 @@ pub fn run(repo_root: PathBuf, data_dir: PathBuf) -> Result<()> {
         .build();
 
     app.connect_activate(move |app| {
+        // 再起動要求は既存の画面を表示する。鍵を共有する通信処理を重複させない。
+        if let Some(window) = app
+            .windows()
+            .into_iter()
+            .find(|w| w.is::<ApplicationWindow>())
+        {
+            window.set_visible(true);
+            window.present();
+            return;
+        }
         if let Err(e) = build_ui(app, repo_root.clone(), data_dir.clone()) {
             eprintln!("failed to start UI: {e:#}");
         }
@@ -610,6 +620,20 @@ fn wire_notification_actions(state: &AppState) {
         recover_sidecar(&s);
     });
     state.app.add_action(&retry);
+    let repair = gio::SimpleAction::new("repair-e2ee", None);
+    let s = state.clone();
+    repair.connect_activate(move |_, _| {
+        if *s.restarting.borrow() {
+            return;
+        }
+        *s.session_ready.borrow_mut() = false;
+        *s.current_chat.borrow_mut() = None;
+        *s.restored_last_chat.borrow_mut() = false;
+        clear_messages(&s);
+        // 既存のQR再認証処理を使う。保存済みの暗号鍵は削除しない。
+        restart_qr_login(&s);
+    });
+    state.app.add_action(&repair);
 }
 /// Composer switches to icon-only send below this conversation width.
 const COMPOSER_NARROW_PX: i32 = 420;
@@ -953,6 +977,7 @@ fn send_current(state: &AppState) {
                     file_path: None,
                     duration_ms: None,
                     flex: None,
+                    decryption_failed: false,
                 },
             );
             state.composer.set_text("");

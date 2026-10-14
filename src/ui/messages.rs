@@ -1,20 +1,13 @@
 use super::*;
 
-pub(super) fn message_list_fingerprint(messages: &[MessageInfo]) -> (usize, String, String) {
-    let first = messages.first().map(|m| m.id.clone()).unwrap_or_default();
-    let last = messages.last().map(|m| m.id.clone()).unwrap_or_default();
-    (messages.len(), first, last)
-}
-
 pub(super) fn same_message_list(
     state: &AppState,
     chat_mid: &str,
     messages: &[MessageInfo],
 ) -> bool {
-    let (len, first, last) = message_list_fingerprint(messages);
     matches!(
         state.msg_list_fp.borrow().as_ref(),
-        Some((mid, l, f, la)) if mid == chat_mid && *l == len && f == &first && la == &last
+        Some((mid, previous)) if mid == chat_mid && previous == messages
     )
 }
 
@@ -24,8 +17,8 @@ pub(super) fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     *state.stick_bottom.borrow_mut() = true;
     messages.sort_by_key(|m| m.created_time);
     if let Some(mid) = state.current_chat.borrow().clone() {
-        let (len, first, last) = message_list_fingerprint(&messages);
-        *state.msg_list_fp.borrow_mut() = Some((mid, len, first, last));
+        // 同じIDの行でも、再取得で復号された本文を画面へ反映する。
+        *state.msg_list_fp.borrow_mut() = Some((mid, messages.clone()));
     } else {
         *state.msg_list_fp.borrow_mut() = None;
     }
@@ -192,7 +185,21 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         .map(|p| std::path::Path::new(p).exists())
         .unwrap_or(false);
 
-    if let Some(flex) = msg.flex.as_ref() {
+    if msg.decryption_failed {
+        let label = gtk::Label::builder()
+            .label(crate::i18n::t("message_decryption_failed"))
+            .wrap(true)
+            .max_width_chars(36)
+            .xalign(0.0)
+            .css_classes(["dim-label"])
+            .build();
+        bubble.append(&label);
+        let repair = gtk::Button::builder()
+            .label(crate::i18n::t("e2ee_repair"))
+            .action_name("app.repair-e2ee")
+            .build();
+        bubble.append(&repair);
+    } else if let Some(flex) = msg.flex.as_ref() {
         append_flex_card(state, &bubble, msg, flex);
     } else if is_audio {
         append_voice_card(state, &bubble, msg, has_audio);
@@ -974,6 +981,7 @@ pub(super) fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &st
         file_path: Some(path.to_string()),
         duration_ms,
         flex: None,
+        decryption_failed: false,
     };
     append_voice_card(state, &bubble, &msg, true);
 }

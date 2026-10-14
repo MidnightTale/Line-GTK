@@ -1131,6 +1131,7 @@ pub(super) fn send_local_image_file(state: &AppState, path: &std::path::Path) ->
                     file_path: Some(path_str),
                     duration_ms: None,
                     flex: None,
+                    decryption_failed: false,
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));

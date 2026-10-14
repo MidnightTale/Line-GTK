@@ -143,7 +143,7 @@ export function createStickerService(runtime: StickerRuntime) {
     }
     try {
       const { ShopService } = await import(
-        "https://jsr.io/@evex/linejs/3.2.1/base/service/shop/mod.ts"
+        "https://jsr.io/@evex/linejs/3.5.0/base/service/shop/mod.ts"
       );
       const shop = new ShopService(client.base as never);
       const res = await shop.getOwnedProductSummaries({

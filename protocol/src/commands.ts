@@ -10,6 +10,8 @@ import { atomicWriteJson } from "./storage.ts";
 import type { CachePolicy } from "./cache_policy.ts";
 import { friendName, picturePathOf } from "./contacts.ts";
 import type { LineDevice } from "./auth.ts";
+import { needsDecryptionRefresh } from "./e2ee_guard.ts";
+import { fetchGroupProfiles } from "./groups.ts";
 
 type Json = Record<string, unknown>;
 type ChatRow = {
@@ -56,6 +58,7 @@ export type CommandRuntime = {
   ) => void;
   existingFile: (path: string) => Promise<string | null>;
   loadDiskContacts: () => Promise<void>;
+  saveDiskContacts: () => Promise<void>;
   refreshContactIndex: (force?: boolean) => Promise<void>;
   hydrateAvatars: (chats: ChatRow[]) => Promise<void>;
   hydratePreviews: (chats: ChatRow[]) => Promise<void>;
@@ -385,22 +388,35 @@ export function createCommandService(runtime: CommandRuntime) {
         }
       }
 
-      // 3) Groups optional (often empty) — don't block naming
+      // グループは専用APIで小分けに取得し、次回起動時にも名前を表示する。
       try {
-        const chats = await client!.fetchJoinedChats();
+        const chats = await fetchGroupProfiles(client!.base.talk, [
+          ...byMid.keys(),
+        ], () => {
+          console.error("[groups] 一部のグループ情報を取得できませんでした。");
+        });
         for (const chat of chats) {
           const prev = byMid.get(chat.mid);
+          const cached = contactIndex.get(chat.mid);
+          const name = chat.name !== chat.mid
+            ? chat.name
+            : prev?.name || cached?.name || chat.mid;
+          const picturePath = chat.picturePath ?? cached?.picturePath ??
+            prev?.picturePath ?? null;
+          contactIndex.set(chat.mid, { ...chat, name, picturePath });
           byMid.set(chat.mid, {
             mid: chat.mid,
-            name: chat.name || chat.raw.chatName || chat.mid,
+            name,
             kind: "group",
             lastActivity: prev?.lastActivity ?? 0,
             unread: prev?.unread ?? 0,
             preview: prev?.preview ?? "",
-            picturePath: prev?.picturePath ?? null,
+            picturePath,
             avatarPath: prev?.avatarPath ?? null,
+            muted: chat.muted,
           });
         }
+        await runtime.saveDiskContacts();
       } catch (e) {
         console.error("[list_chats] groups", e);
       }
@@ -452,7 +468,10 @@ export function createCommandService(runtime: CommandRuntime) {
     await dedupe(`msgs:${chatMid}:${limit}:${force}`, async () => {
       bumpMediaEpoch(chatMid); // cancel any prior hydrate for this chat
       const cached = msgCache.get(chatMid);
-      if (!force && cached && Date.now() - cached.at < cachePolicy().memMsg) {
+      if (
+        !force && cached && Date.now() - cached.at < cachePolicy().memMsg &&
+        !cached.messages.some(needsDecryptionRefresh)
+      ) {
         const ui = await forUiMessages(cached.messages);
         ok(id, { messages: ui, cached: true });
         hydrateMedia(cached.messages, chatMid);

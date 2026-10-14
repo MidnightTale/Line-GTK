@@ -866,6 +866,19 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
     let session = libadwaita::PreferencesGroup::builder()
         .title(i18n::t("session"))
         .build();
+    let repair_row = libadwaita::ActionRow::builder()
+        .title(i18n::t("e2ee_repair"))
+        .subtitle(i18n::t("e2ee_repair_hint"))
+        .build();
+    let repair_btn = gtk::Button::builder()
+        .label(i18n::t("e2ee_repair"))
+        .valign(gtk::Align::Center)
+        .action_name("app.repair-e2ee")
+        .build();
+    let win2 = win.clone();
+    repair_btn.connect_clicked(move |_| win2.close());
+    repair_row.add_suffix(&repair_btn);
+    session.add(&repair_row);
     let logout_row = libadwaita::ActionRow::builder()
         .title(i18n::t("logout"))
         .subtitle(i18n::t("logout_subtitle"))

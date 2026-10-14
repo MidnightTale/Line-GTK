@@ -10,7 +10,13 @@ import { atomicWriteJson, ensurePrivateDir } from "./storage.ts";
 import { AuthStore, LineDevice } from "./auth.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
 import { picturePathOf, profileUrl } from "./contacts.ts";
-import { coerceI64, normalizeRaw } from "./messages.ts";
+import { coerceI64, conversationMid, normalizeRaw } from "./messages.ts";
+import { groupProfile } from "./groups.ts";
+import {
+  DECRYPTION_FAILED,
+  guardedDecrypt,
+  restoreCachedMessages,
+} from "./e2ee_guard.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
 import { createMediaCache } from "./media_cache.ts";
@@ -315,6 +321,7 @@ const commands = createCommandService({
   storeBoxCursor,
   existingFile,
   loadDiskContacts,
+  saveDiskContacts,
   refreshContactIndex,
   hydrateAvatars,
   hydratePreviews,
@@ -426,15 +433,11 @@ function patchE2eeGuards() {
     ) => Promise<Record<string, unknown>>;
   };
   const orig = e2ee.decryptE2EEMessage.bind(e2ee);
-  e2ee.decryptE2EEMessage = async (messageObj) => {
-    const msg = normalizeRaw(messageObj);
-    try {
-      return await orig(msg);
-    } catch (e) {
-      console.error("[e2ee decrypt fallback]", e);
-      return msg;
-    }
-  };
+  e2ee.decryptE2EEMessage = guardedDecrypt(orig, () => {
+    console.error(
+      "[e2ee] メッセージを復号できません。暗号鍵の再取得が必要です。",
+    );
+  });
 }
 
 async function refetchMessageData(
@@ -618,7 +621,9 @@ async function loadDiskMessages(chatMid: string): Promise<Json[] | null> {
       await Deno.readTextFile(join(msgDiskDir, `${chatMid}.json`)),
     );
     if (Date.now() - Number(raw.at || 0) > cachePolicy().diskMsg) return null;
-    if (Array.isArray(raw.messages)) return raw.messages as Json[];
+    if (Array.isArray(raw.messages)) {
+      return restoreCachedMessages(raw.messages as Json[]);
+    }
   } catch { /* miss */ }
   return null;
 }
@@ -714,6 +719,19 @@ async function summarizeTalkMessage(
   };
   const contentType = normType(raw.contentType);
   const meta = raw.contentMetadata ?? {};
+  if (meta[DECRYPTION_FAILED] === "1") {
+    return {
+      id: String(raw.id ?? ""),
+      text: "",
+      from: raw.from ?? "",
+      to: raw.to ?? "",
+      mine: isMineFrom(raw.from),
+      createdTime: Number(raw.createdTime ?? 0),
+      contentType,
+      decryptionFailed: true,
+      needsMedia: false,
+    };
+  }
   let text = tm.text || meta.ALT_TEXT || meta.STKTXT || "";
   let imagePath: string | null = null;
   let imageUrl: string | null = meta.PREVIEW_URL || meta.DOWNLOAD_URL || null;
@@ -1375,6 +1393,19 @@ async function resolveContactInfo(mid: string): Promise<{
     };
   }
   try {
+    if (mid.startsWith("c")) {
+      const raw = await client.base.talk.getChat({
+        chatMid: mid,
+        withMembers: false,
+        withInvitees: false,
+      });
+      const info = groupProfile(raw);
+      if (info) {
+        contactIndex.set(mid, info);
+        await saveDiskContacts();
+        return info;
+      }
+    }
     const c = await client.base.talk.getContact({ mid });
     const type = String(c.type ?? "");
     const info = {
@@ -1397,7 +1428,7 @@ async function resolveContactInfo(mid: string): Promise<{
 }
 
 async function upsertChatFromMessage(message: Json) {
-  const peer = message.mine ? String(message.to) : String(message.from);
+  const peer = conversationMid(message);
   if (!peer) return;
   const preview = previewLine(message);
   const activity = Number(message.createdTime ?? 0);

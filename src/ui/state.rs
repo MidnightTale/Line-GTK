@@ -23,7 +23,7 @@ pub(super) struct VoicePlayback {
     pub tick: Option<glib::SourceId>,
 }
 
-pub(super) type MessageListFingerprint = (String, usize, String, String);
+pub(super) type MessageListFingerprint = (String, Vec<MessageInfo>);
 
 #[derive(Clone)]
 pub(super) struct AppState {

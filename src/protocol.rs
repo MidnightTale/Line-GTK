@@ -53,7 +53,7 @@ pub struct ChatInfo {
     pub muted: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FlexAction {
     #[serde(default)]
     pub label: String,
@@ -65,7 +65,7 @@ pub struct FlexAction {
     pub uri: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FlexInfo {
     #[serde(rename = "altText", default)]
     pub alt_text: String,
@@ -75,7 +75,7 @@ pub struct FlexInfo {
     pub actions: Vec<FlexAction>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct MessageInfo {
     #[serde(default)]
     pub id: String,
@@ -91,6 +91,8 @@ pub struct MessageInfo {
     pub created_time: i64,
     #[serde(rename = "contentType", default)]
     pub content_type: String,
+    #[serde(rename = "decryptionFailed", default)]
+    pub decryption_failed: bool,
     #[serde(rename = "imagePath", default)]
     pub image_path: Option<String>,
     #[serde(rename = "audioPath", default)]
