@@ -42,6 +42,29 @@ export function createMessageView(runtime: MessageViewRuntime) {
 
   function previewLang() {
     const code = (Deno.env.get("LINE_GTK_LANG") || "th").toLowerCase();
+    if (code === "ja" || code === "ja-jp" || code === "ja_jp") {
+      return {
+        you: "自分",
+        callIncoming: "着信がありました",
+        callOutgoing: "発信しました",
+        callMissed: "不在着信",
+        callUnanswered: "応答なし",
+        videoIncoming: "ビデオ通話の着信",
+        videoOutgoing: "ビデオ通話の発信",
+        videoMissed: "ビデオ通話の不在着信",
+        videoUnanswered: "ビデオ通話の応答なし",
+        they: "相手",
+        photo: "写真",
+        video: "動画",
+        sticker: "スタンプ",
+        voice: "ボイスメッセージ",
+        file: "ファイル",
+        flex: "Flexメッセージ",
+        message: "メッセージ",
+        encrypted: "暗号鍵の再取得が必要です",
+        tap: "タップして開く",
+      };
+    }
     const th = code === "th" || code === "thai";
     return th
       ? {
@@ -54,6 +77,7 @@ export function createMessageView(runtime: MessageViewRuntime) {
         file: "ไฟล์",
         flex: "ข้อความ Flex",
         message: "ข้อความ",
+        encrypted: "ต้องรับคีย์เข้ารหัสใหม่",
         tap: "แตะเพื่อเปิด",
       }
       : {
@@ -66,6 +90,7 @@ export function createMessageView(runtime: MessageViewRuntime) {
         file: "File",
         flex: "Flex message",
         message: "Message",
+        encrypted: "Retrieve encryption keys again",
         tap: "Tap to open",
       };
   }

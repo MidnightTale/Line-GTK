@@ -416,7 +416,7 @@ pub(super) fn format_day_separator(ts_ms: i64) -> String {
     } else if day == today - chrono::Duration::days(1) {
         crate::i18n::t("day_yesterday")
     } else {
-        local.format("%a, %b %-d").to_string()
+        local.format(&crate::i18n::t("date_format")).to_string()
     }
 }
 
@@ -432,7 +432,7 @@ pub(super) fn format_msg_time(ts_ms: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|d| {
             d.with_timezone(&chrono::Local)
-                .format("%-I:%M %p")
+                .format(&crate::i18n::t("time_format"))
                 .to_string()
         })
         .unwrap_or_default()
@@ -1299,6 +1299,8 @@ pub(super) fn localize_preview(preview: &str) -> String {
         ("They: ", "they"),
         ("คุณ: ", "you"),
         ("เขา: ", "they"),
+        ("自分: ", "you"),
+        ("相手: ", "they"),
     ];
     for (prefix, key) in pairs {
         if let Some(rest) = s.strip_prefix(prefix) {
@@ -1329,6 +1331,16 @@ pub(super) fn localize_preview(preview: &str) -> String {
         ("แตะเพื่อเปิด", "tap_open"),
         ("กำลังโหลดข้อความล่าสุด…", "loading_last"),
         ("ไม่มีข้อความล่าสุด", "no_recent"),
+        ("写真", "preview_photo"),
+        ("動画", "preview_video"),
+        ("スタンプ", "preview_sticker"),
+        ("ボイスメッセージ", "voice_message"),
+        ("ファイル", "preview_file"),
+        ("Flexメッセージ", "preview_flex"),
+        ("メッセージ", "preview_message"),
+        ("タップして開く", "tap_open"),
+        ("最新のメッセージを読み込み中…", "loading_last"),
+        ("最近のメッセージはありません", "no_recent"),
     ];
     if let Some((who, body)) = s.split_once(": ") {
         let mut body = body.to_string();
@@ -1498,5 +1510,34 @@ pub(super) fn jump_to_latest(state: &AppState) {
     if let Some(mid) = state.current_chat.borrow().clone() {
         mark_chat_read(state, &mid);
         clear_unread_badge(state, &mid);
+    }
+}
+
+#[cfg(test)]
+mod localization_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn cached_previews_and_dates_follow_japanese() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate::i18n::set_lang(root, "ja");
+        assert_eq!(localize_preview("You: Photo"), "自分: 写真");
+        assert_eq!(localize_preview("เขา: สติกเกอร์"), "相手: スタンプ");
+        assert_eq!(
+            localize_preview("You: 日本語の本文です"),
+            "自分: 日本語の本文です"
+        );
+        let timestamp = chrono::Local
+            .with_ymd_and_hms(2020, 1, 2, 13, 5, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(format_day_separator(timestamp), "2020年1月2日");
+        assert_eq!(format_msg_time(timestamp), "13:05");
+        crate::i18n::set_lang(root, "en");
+        assert_eq!(localize_preview("自分: 写真"), "You: Photo");
+        assert_eq!(localize_preview("相手: スタンプ"), "They: Sticker");
+        assert_eq!(format_msg_time(timestamp), "1:05 PM");
     }
 }

@@ -1642,6 +1642,15 @@ async function handle(req: Json) {
       case "ping":
         ok(id, { pong: true, version: "0.2.0" });
         break;
+      case "set_language": {
+        const language = String(params.language ?? "");
+        if (!["en", "th", "ja"].includes(language)) {
+          throw new Error("表示言語が不正です");
+        }
+        Deno.env.set("LINE_GTK_LANG", language);
+        ok(id, { language });
+        break;
+      }
       case "login_qr":
         await commands.loginQr(id);
         break;

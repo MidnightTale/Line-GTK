@@ -72,10 +72,15 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
         .title(i18n::t("language"))
         .subtitle(i18n::t("language_subtitle"))
         .build();
-    let langs = gtk::StringList::new(&[&i18n::t("lang_thai"), &i18n::t("lang_english")]);
+    let langs = gtk::StringList::new(&[
+        &i18n::t("lang_thai"),
+        &i18n::t("lang_english"),
+        &i18n::t("lang_japanese"),
+    ]);
     lang_row.set_model(Some(&langs));
     lang_row.set_selected(match deps.config.borrow().language.as_str() {
         "en" | "eng" => 1,
+        "ja" => 2,
         _ => 0,
     });
     {
@@ -83,8 +88,13 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
         let data_dir = deps.data_dir.clone();
         let on_lang = deps.on_lang.clone();
         lang_row.connect_selected_notify(move |row| {
-            let language = if row.selected() == 1 { "en" } else { "th" };
-            cfg.borrow_mut().language = language.into();
+            let language = match row.selected() {
+                1 => "en",
+                2 => "ja",
+                _ => "th",
+            };
+            cfg.borrow_mut().set_language(language);
+            apply_font(&cfg.borrow().font_family, cfg.borrow().font_scale);
             cfg.borrow().save(&data_dir);
             on_lang();
         });
@@ -297,6 +307,13 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
         .text(deps.config.borrow().font_family.as_str())
         .build();
     font_entry.set_show_apply_button(true);
+    {
+        let cfg = deps.config.clone();
+        let font_entry = font_entry.clone();
+        lang_row.connect_selected_notify(move |_| {
+            font_entry.set_text(&cfg.borrow().font_family);
+        });
+    }
     {
         let cfg = deps.config.clone();
         let data_dir = deps.data_dir.clone();
@@ -822,7 +839,8 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
             };
             cfg.borrow_mut().cache_retention = retention.into();
             cfg.borrow().save(&data_dir);
-            toast(&i18n::tf("cache_retention_saved", &[("mode", retention)]));
+            let mode = i18n::t(&format!("cache_ret_{retention}"));
+            toast(&i18n::tf("cache_retention_saved", &[("mode", &mode)]));
         });
     }
     retention_grp.add(&retention_row);
@@ -840,8 +858,12 @@ pub fn open_settings(parent: &impl IsA<gtk::Window>, deps: SettingsDeps) {
         let sidecar = deps.sidecar.clone();
         let toast = deps.toast.clone();
         let kind = kind.to_string();
+        let title_key = title_key.to_string();
         btn.connect_clicked(move |_| match sidecar.clear_cache(&kind) {
-            Ok(_) => toast(&i18n::tf("cleared_cache", &[("kind", &kind)])),
+            Ok(_) => toast(&i18n::tf(
+                "cleared_cache",
+                &[("kind", &i18n::t(&title_key))],
+            )),
             Err(e) => toast(&i18n::tf("clear_failed", &[("error", &e.to_string())])),
         });
         row.add_suffix(&btn);

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct AppConfig {
     pub theme: String,    // system | dark | light
-    pub language: String, // en | th
+    pub language: String, // en | th | ja
     pub font_scale: f64,  // UI scale 0.60 .. 1.40 (1.0 = 100%)
     /// Any installed font family name, e.g. "Noto Sans Thai", "Inter", "Sarasa Gothic"
     pub font_family: String,
@@ -100,6 +100,24 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn set_language(&mut self, language: &str) {
+        // 標準フォントだけを言語に合わせる。利用者が指定したフォントは維持する。
+        let previous_default = if self.language == "ja" {
+            "Noto Sans CJK JP"
+        } else {
+            "Noto Sans Thai"
+        };
+        if self.font_family == previous_default {
+            self.font_family = if language == "ja" {
+                "Noto Sans CJK JP"
+            } else {
+                "Noto Sans Thai"
+            }
+            .into();
+        }
+        self.language = language.into();
+    }
+
     pub fn path(data_dir: &std::path::Path) -> PathBuf {
         data_dir.join("settings.json")
     }
@@ -154,8 +172,11 @@ impl AppConfig {
         if !matches!(self.theme.as_str(), "system" | "dark" | "light") {
             self.theme = "system".into();
         }
-        if !matches!(self.language.as_str(), "en" | "th") {
+        if !matches!(self.language.as_str(), "en" | "th" | "ja") {
             self.language = "en".into();
+        }
+        if self.language == "ja" && self.font_family == "Noto Sans Thai" {
+            self.font_family = "Noto Sans CJK JP".into();
         }
         if !matches!(
             self.cache_retention.as_str(),
@@ -256,6 +277,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn japanese_font_follows_language_and_preserves_custom_fonts() {
+        let mut cfg = AppConfig::default();
+        cfg.set_language("ja");
+        assert_eq!(cfg.font_family, "Noto Sans CJK JP");
+        cfg.set_language("th");
+        assert_eq!(cfg.font_family, "Noto Sans Thai");
+        for family in ["Sarasa Gothic J", ""] {
+            cfg.font_family = family.into();
+            cfg.set_language("ja");
+            cfg.normalize();
+            assert_eq!(cfg.font_family, family);
+        }
+        let mut old = AppConfig {
+            language: "ja".into(),
+            ..AppConfig::default()
+        };
+        old.normalize();
+        assert_eq!(old.font_family, "Noto Sans CJK JP");
+    }
+
+    #[test]
     fn normalize_rejects_invalid_values() {
         let mut cfg = AppConfig {
             theme: "purple".into(),
@@ -280,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn normalize_preserves_japanese() {
+        let mut cfg = AppConfig {
+            language: "ja".into(),
+            ..AppConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.language, "ja");
+    }
+
+    #[test]
     fn save_is_atomic_and_private() {
         let dir = std::env::temp_dir().join(format!(
             "line-gtk-config-test-{}-{}",
@@ -287,7 +339,10 @@ mod tests {
             std::thread::current().name().unwrap_or("unnamed")
         ));
         let _ = fs::remove_dir_all(&dir);
-        let cfg = AppConfig::default();
+        let cfg = AppConfig {
+            language: "ja".into(),
+            ..AppConfig::default()
+        };
         cfg.save_atomic(&dir).expect("save settings");
         assert_eq!(AppConfig::load(&dir).language, cfg.language);
         assert!(!dir.join(".settings.json.tmp").exists());

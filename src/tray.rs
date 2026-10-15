@@ -52,7 +52,7 @@ fn tray_icon() -> ksni::Icon {
         .expect("bundled tray icon");
         let (width, height) = img.dimensions();
         let mut data = img.into_rgba8().into_vec();
-        for pixel in data.chunks_exact_mut(4) {
+        for pixel in data.as_chunks_mut::<4>().0 {
             pixel.rotate_right(1); // rgba -> argb
         }
         ksni::Icon {
@@ -122,7 +122,7 @@ impl ksni::Tray for LineTray {
         let tx_show = self.tx.clone();
         items.push(
             StandardItem {
-                label: "Show window".into(),
+                label: crate::i18n::t("tray_show"),
                 icon_name: "view-restore-symbolic".into(),
                 activate: Box::new(move |_| {
                     let _ = tx_show.send_blocking(TrayAction::Show);
@@ -139,7 +139,7 @@ impl ksni::Tray for LineTray {
         if self.recent.is_empty() {
             chat_items.push(
                 StandardItem {
-                    label: "No recent chats".into(),
+                    label: crate::i18n::t("tray_no_recent"),
                     enabled: false,
                     ..Default::default()
                 }
@@ -172,7 +172,7 @@ impl ksni::Tray for LineTray {
         }
         items.push(
             SubMenu {
-                label: "Recent chats".into(),
+                label: crate::i18n::t("tray_recent"),
                 icon_name: "user-available-symbolic".into(),
                 submenu: chat_items,
                 ..Default::default()
@@ -186,27 +186,30 @@ impl ksni::Tray for LineTray {
             let left = (self.muted_until_epoch - now_epoch()).max(0);
             let mins = (left + 59) / 60;
             if mins >= 60 {
-                format!("Mute notifications ({}h left)", (mins + 59) / 60)
+                crate::i18n::tf(
+                    "tray_muted_hours",
+                    &[("n", &((mins + 59) / 60).to_string())],
+                )
             } else {
-                format!("Mute notifications ({mins}m left)")
+                crate::i18n::tf("tray_muted_minutes", &[("n", &mins.to_string())])
             }
         } else {
-            "Mute notifications".into()
+            crate::i18n::t("tray_mute")
         };
 
-        let mute_opts: &[(u64, &str)] = &[
-            (15 * 60, "15 minutes"),
-            (60 * 60, "1 hour"),
-            (3 * 60 * 60, "3 hours"),
-            (8 * 60 * 60, "8 hours"),
-            (24 * 60 * 60, "24 hours"),
+        let mute_opts: &[(u64, &str, &str)] = &[
+            (15 * 60, "tray_mute_for_minutes", "15"),
+            (60 * 60, "tray_mute_for_hours", "1"),
+            (3 * 60 * 60, "tray_mute_for_hours", "3"),
+            (8 * 60 * 60, "tray_mute_for_hours", "8"),
+            (24 * 60 * 60, "tray_mute_for_hours", "24"),
         ];
         let mut mute_items: Vec<ksni::MenuItem<Self>> = Vec::new();
         if muted {
             let tx = self.tx.clone();
             mute_items.push(
                 StandardItem {
-                    label: "Unmute now".into(),
+                    label: crate::i18n::t("tray_unmute"),
                     icon_name: "audio-volume-high-symbolic".into(),
                     activate: Box::new(move |_| {
                         let _ = tx.send_blocking(TrayAction::MuteFor { secs: 0 });
@@ -217,11 +220,11 @@ impl ksni::Tray for LineTray {
             );
             mute_items.push(ksni::MenuItem::Separator);
         }
-        for &(secs, label) in mute_opts {
+        for &(secs, key, duration) in mute_opts {
             let tx = self.tx.clone();
             mute_items.push(
                 StandardItem {
-                    label: format!("Mute for {label}"),
+                    label: crate::i18n::tf(key, &[("n", duration)]),
                     icon_name: "audio-volume-muted-symbolic".into(),
                     activate: Box::new(move |_| {
                         let _ = tx.send_blocking(TrayAction::MuteFor { secs });
@@ -248,7 +251,7 @@ impl ksni::Tray for LineTray {
         let tx_rpc = self.tx.clone();
         items.push(
             CheckmarkItem {
-                label: "Discord Rich Presence".into(),
+                label: crate::i18n::t("discord_rpc"),
                 icon_name: "network-workgroup-symbolic".into(),
                 checked: self.discord_rpc,
                 activate: Box::new(move |tray: &mut LineTray| {
@@ -265,7 +268,7 @@ impl ksni::Tray for LineTray {
         let tx_quit = self.tx.clone();
         items.push(
             StandardItem {
-                label: "Quit".into(),
+                label: crate::i18n::t("tray_quit"),
                 icon_name: "application-exit-symbolic".into(),
                 activate: Box::new(move |_| {
                     let _ = tx_quit.send_blocking(TrayAction::Quit);

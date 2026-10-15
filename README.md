@@ -12,7 +12,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 - [x] Photos, video, voice messages, files
 - [x] Paste and drag-and-drop attachments
 - [x] In-app viewers (image, video, PDF, text)
-- [x] Downloads, tray, Thai / English, themes
+- [x] Downloads, tray, Thai / English / Japanese, themes
 - [x] Discord RPC
 - [ ] Voice call (WIP)
 - [ ] Account switcher
@@ -50,6 +50,10 @@ flatpak run dev.linegtk.LineGtk
 ```
 
 ## Build and run
+
+設定の表示言語で「日本語」を選択できます。標準フォントを使用している場合は
+「Noto Sans CJK JP」に切り替え、指定済みの独自フォントは維持します。
+Arch Linuxでは `noto-fonts-cjk` をインストールしてください。
 
 ```bash
 git clone https://github.com/MidnightTale/Line-GTK.git

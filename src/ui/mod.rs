@@ -1008,6 +1008,13 @@ fn begin_optimistic_send(state: &AppState, req_id: u64, chat_mid: &str, mut msg:
 
 fn apply_ui_language(state: &AppState) {
     crate::i18n::set_lang(&state.repo_root, &state.config.borrow().language);
+    // 再ログインせず、プレビュー生成側にも選択した言語を反映する。
+    if let Err(error) = state.sidecar.request(
+        "set_language",
+        Some(serde_json::json!({ "language": state.config.borrow().language })),
+    ) {
+        tracing::warn!(%error, "プレビューの言語を更新できませんでした");
+    }
     state.side_title.set_text(&crate::i18n::t("chats"));
     state
         .composer
@@ -1074,7 +1081,7 @@ fn apply_ui_language(state: &AppState) {
     state.brand_label.set_text(&crate::i18n::t("app_name"));
     apply_brand_icon(&state.brand_icon, &state.repo_root);
 
-    // Relocalize chat list previews (cached English → Thai/English).
+    // キャッシュされたプレビューを現在の表示言語に合わせる。
     for chat in state.chats.borrow_mut().iter_mut() {
         if chat.preview.is_empty() {
             continue;
@@ -1084,6 +1091,7 @@ fn apply_ui_language(state: &AppState) {
             label.set_text(&chat.preview);
         }
     }
+    refresh_tray_menu(state);
     sync_discord_rpc(state);
 }
 

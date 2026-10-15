@@ -150,7 +150,9 @@ export function createStickerService(runtime: StickerRuntime) {
         shopId: "stickershop",
         offset: 0,
         limit: 80,
-        locale: { language: "en", country: "TH" },
+        locale: Deno.env.get("LINE_GTK_LANG") === "ja"
+          ? { language: "ja", country: "JP" }
+          : { language: "en", country: "TH" },
       } as never) as Record<string, unknown>;
       const list = (res.productList ?? res["1"] ?? []) as Record<
         string,
@@ -193,12 +195,15 @@ export function createStickerService(runtime: StickerRuntime) {
       };
       const lang = (Deno.env.get("LINE_GTK_LANG") || "th").toLowerCase();
       const preferEn = lang === "en" || lang === "eng";
+      const preferJa = lang === "ja" || lang === "ja-jp" || lang === "ja_jp";
       let name = pkg.name || pkg.id;
       if (typeof meta.title === "string" && meta.title.trim()) {
         name = meta.title.trim();
       } else if (meta.title && typeof meta.title === "object") {
         name = String(
-          (preferEn
+          (preferJa
+            ? meta.title.ja
+            : preferEn
             ? meta.title.en
             : meta.title.th || meta.title.en || meta.title.ja) ||
             meta.title.en ||
