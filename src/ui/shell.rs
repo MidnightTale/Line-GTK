@@ -6,6 +6,10 @@ pub struct ShellWidgets {
     pub message_list: super::virtual_list::VirtualMessageList,
     pub message_scroll: gtk::ScrolledWindow,
     pub composer: gtk::Entry,
+    pub reply_preview: gtk::Revealer,
+    pub reply_title: gtk::Label,
+    pub reply_text: gtk::Label,
+    pub reply_cancel: gtk::Button,
     pub composer_row: gtk::Box,
     pub composer_stack: gtk::Stack,
     pub record_cancel_btn: gtk::Button,
@@ -522,6 +526,43 @@ pub fn build_shell_page() -> ShellWidgets {
     conversation.append(&msg_stack);
     conversation.append(&jump_banner);
     conversation.append(&upload_revealer);
+    let reply_title = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(40)
+        .xalign(0.0)
+        .css_classes(["heading", "caption"])
+        .build();
+    let reply_text = gtk::Label::builder()
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .hexpand(true)
+        .build();
+    let reply_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(3)
+        .hexpand(true)
+        .build();
+    reply_column.append(&reply_title);
+    reply_column.append(&reply_text);
+    let reply_cancel = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build();
+    let reply_bar = gtk::Box::builder()
+        .spacing(10)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["line-reply-preview"])
+        .build();
+    reply_bar.append(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
+    reply_bar.append(&reply_column);
+    reply_bar.append(&reply_cancel);
+    let reply_preview = gtk::Revealer::builder()
+        .child(&reply_bar)
+        .reveal_child(false)
+        .build();
+    conversation.append(&reply_preview);
     conversation.append(&composer_stack);
 
     let sidebar_paned = gtk::Paned::builder()
@@ -549,6 +590,10 @@ pub fn build_shell_page() -> ShellWidgets {
         message_list,
         message_scroll,
         composer,
+        reply_preview,
+        reply_title,
+        reply_text,
+        reply_cancel,
         composer_row,
         composer_stack,
         record_cancel_btn,
@@ -601,6 +646,10 @@ pub fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
         r#"
+.line-reply-quote { border-left: 3px solid @accent_bg_color; padding: 4px 8px; background: alpha(@accent_bg_color, 0.08); border-radius: 4px; }
+.line-reply-preview { border-left: 3px solid @accent_bg_color; padding: 8px 10px; background: alpha(@accent_bg_color, 0.10); border-radius: 8px; }
+.line-reply-button { min-width: 28px; min-height: 28px; padding: 0; color: @accent_color; }
+
         .line-shell {
             background: @window_bg_color;
         }
@@ -952,7 +1001,7 @@ pub fn load_css() {
             background: transparent;
         }
         .line-msg-list { background: transparent; }
-        .line-msg-list row {
+        .line-msg-list row, .line-message-row {
             background: transparent;
             margin: 2px 4px;
             padding: 0;

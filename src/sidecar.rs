@@ -257,10 +257,15 @@ impl Sidecar {
     }
 
     pub fn send_message(&self, chat_mid: &str, text: &str) -> Result<u64> {
-        self.request(
-            "send_message",
-            Some(json!({ "chatMid": chat_mid, "text": text })),
-        )
+        self.send_reply(chat_mid, text, None)
+    }
+
+    pub fn send_reply(&self, chat_mid: &str, text: &str, reply_to: Option<&str>) -> Result<u64> {
+        let mut params = json!({ "chatMid": chat_mid, "text": text });
+        if let Some(message_id) = reply_to {
+            params["replyToMessageId"] = json!(message_id);
+        }
+        self.request("send_message", Some(params))
     }
 
     pub fn send_audio(
@@ -545,7 +550,7 @@ fn read_loop<R: std::io::Read>(
                         "message" => {
                             if let Some(msg) = resp.extra.get("message") {
                                 match serde_json::from_value(msg.clone()) {
-                                    Ok(m) => ProtocolEvent::Message(m),
+                                    Ok(m) => ProtocolEvent::Message(Box::new(m)),
                                     Err(e) => ProtocolEvent::Error(e.to_string()),
                                 }
                             } else {

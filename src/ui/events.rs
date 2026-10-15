@@ -516,9 +516,17 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                             .unwrap_or(&crate::i18n::t("friends_load_failed")),
                     );
                 }
-                if let Some(Pending::Send { placeholder_id, .. }) = pending.as_ref() {
+                if let Some(Pending::Send {
+                    placeholder_id,
+                    reply_draft,
+                    ..
+                }) = pending.as_ref()
+                {
                     hide_upload_progress(state);
                     remove_pending_placeholder(state, placeholder_id);
+                    if let Some(draft) = reply_draft {
+                        replies::restore_failed(state, draft);
+                    }
                 }
                 let err = error.as_deref().unwrap_or("request failed");
                 if err.contains("sticker_not_owned") || err.contains("USER_NOT_STICKER_OWNER") {
@@ -567,6 +575,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 Some(Pending::Send {
                     placeholder_id,
                     chat_mid,
+                    ..
                 }) => {
                     remove_pending_placeholder(state, &placeholder_id);
                     if state.current_chat.borrow().as_deref() != Some(chat_mid.as_str()) {

@@ -9,6 +9,7 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 
 - [x] QR login (additional device)
 - [x] Chats, messages, stickers, friends
+- [x] メッセージ横の矢印ボタン・右クリックから引用付きのテキスト返信（リプライ）
 - [x] Photos, video, voice messages, files
 - [x] Paste and drag-and-drop attachments
 - [x] In-app viewers (image, video, PDF, text)
@@ -16,6 +17,8 @@ Unofficial native LINE client for Linux. GTK4 / Libadwaita UI with a Deno protoc
 - [x] Discord RPC
 - [ ] Voice call (WIP)
 - [ ] Account switcher
+
+メッセージ横の矢印ボタンを押すと引用元が選ばれ、そのまま入力欄で返信を書けます。右クリックの「リプライ」からも選べます。×ボタンまたはEscで取り消せます。別のトークへ移ると引用元を解除します。
 
 ---
 

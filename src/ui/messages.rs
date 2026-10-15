@@ -1,31 +1,28 @@
 use super::*;
 
-pub(super) fn message_list_fingerprint(messages: &[MessageInfo]) -> (usize, String, String) {
-    let first = messages.first().map(|m| m.id.clone()).unwrap_or_default();
-    let last = messages.last().map(|m| m.id.clone()).unwrap_or_default();
-    (messages.len(), first, last)
-}
-
 pub(super) fn same_message_list(
     state: &AppState,
     chat_mid: &str,
     messages: &[MessageInfo],
 ) -> bool {
-    let (len, first, last) = message_list_fingerprint(messages);
     matches!(
         state.msg_list_fp.borrow().as_ref(),
-        Some((mid, l, f, la)) if mid == chat_mid && *l == len && f == &first && la == &last
+        Some((mid, previous)) if mid == chat_mid && previous == messages
     )
 }
 
 pub(super) fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     clear_messages(state);
+    state
+        .reply_messages
+        .borrow_mut()
+        .extend(messages.iter().map(|m| (m.id.clone(), m.clone())));
     state.media_queue.borrow_mut().clear();
     *state.stick_bottom.borrow_mut() = true;
     messages.sort_by_key(|m| m.created_time);
     if let Some(mid) = state.current_chat.borrow().clone() {
-        let (len, first, last) = message_list_fingerprint(&messages);
-        *state.msg_list_fp.borrow_mut() = Some((mid, len, first, last));
+        // 引用元の本文が補完された場合も、同じIDの行を更新する。
+        *state.msg_list_fp.borrow_mut() = Some((mid, messages.clone()));
     } else {
         *state.msg_list_fp.borrow_mut() = None;
     }
@@ -56,6 +53,10 @@ pub(super) fn apply_messages(state: &AppState, mut messages: Vec<MessageInfo>) {
     let state_c = state.clone();
     let batch = Rc::new(RefCell::new(messages));
     glib::idle_add_local(move || {
+        // トーク変更後に、前の履歴や引用候補を挿入しない。
+        if *state_c.current_chat.borrow() != chat_mid {
+            return glib::ControlFlow::Break;
+        }
         let mut left = batch.borrow_mut();
         let take = left.len().min(14);
         if take == 0 {
@@ -111,6 +112,10 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         msg
     };
 
+    state
+        .reply_messages
+        .borrow_mut()
+        .insert(msg.id.clone(), msg.clone());
     let list = &state.message_list;
 
     // Date separator like mobile LINE (Today / Yesterday / Fri, Jul 24).
@@ -119,22 +124,24 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         let need_sep = state.last_msg_day.borrow().as_deref() != Some(day.as_str());
         if need_sep {
             *state.last_msg_day.borrow_mut() = Some(day);
-            let sep_row = gtk::ListBoxRow::builder()
-                .selectable(false)
-                .activatable(false)
-                .css_classes(["line-day-sep-row"])
+            let sep_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .css_classes(["line-message-row", "line-day-sep-row"])
                 .build();
             let sep = gtk::Label::builder()
                 .label(format_day_separator(msg.created_time))
                 .halign(gtk::Align::Center)
                 .css_classes(["line-day-sep"])
                 .build();
-            sep_row.set_child(Some(&sep));
+            sep_row.append(&sep);
             list.append(&sep_row);
         }
     }
 
-    let row = gtk::ListBoxRow::new();
+    // ListViewが行のフォーカスを管理するため、ListBox専用の行を入れ子にしない。
+    let row = gtk::Box::builder()
+        .css_classes(["line-message-row"])
+        .build();
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -192,6 +199,11 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         .map(|p| std::path::Path::new(p).exists())
         .unwrap_or(false);
 
+    if let Some(quote) = msg.reply_to.as_ref() {
+        replies::append_quote(state, &bubble, quote);
+    }
+    replies::wire_context(&bubble, msg);
+
     if let Some(flex) = msg.flex.as_ref() {
         append_flex_card(state, &bubble, msg, flex);
     } else if is_audio {
@@ -215,6 +227,7 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
                 .max_width_chars(42)
                 .css_classes(["line-bubble-text"])
                 .build();
+            label.set_extra_menu(Some(&replies::menu(msg)));
             bubble.append(&label);
             append_link_chips(state, &bubble, &msg.text);
         } else if !has_image && !waiting_visual {
@@ -302,7 +315,18 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             .halign(gtk::Align::End)
             .hexpand(true)
             .build();
-        col.append(&bubble);
+        if let Some(reply) = replies::button(msg) {
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .halign(gtk::Align::End)
+                .build();
+            content.append(&reply);
+            content.append(&bubble);
+            col.append(&content);
+        } else {
+            col.append(&bubble);
+        }
 
         let read = state
             .current_chat
@@ -342,11 +366,14 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             .css_classes(["line-msg-time"])
             .build();
         outer.append(&bubble);
+        if let Some(reply) = replies::button(msg) {
+            outer.append(&reply);
+        }
         outer.append(&time);
         outer.append(&gtk::Box::builder().hexpand(true).build());
     }
 
-    row.set_child(Some(&outer));
+    row.append(&outer);
     if is_pending {
         row.add_css_class("line-msg-pending-row");
         state
@@ -959,6 +986,13 @@ pub(super) fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &st
     while let Some(child) = bubble.first_child() {
         bubble.remove(&child);
     }
+    let original = state.reply_messages.borrow().get(message_id).cloned();
+    if let Some(quote) = original
+        .as_ref()
+        .and_then(|message| message.reply_to.as_ref())
+    {
+        replies::append_quote(state, &bubble, quote);
+    }
     let duration_ms = ffprobe_duration_ms(std::path::Path::new(path)).map(|v| v as i64);
     let msg = MessageInfo {
         id: message_id.to_string(),
@@ -974,6 +1008,8 @@ pub(super) fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &st
         file_path: Some(path.to_string()),
         duration_ms,
         flex: None,
+        decryption_failed: false,
+        reply_to: None,
     };
     append_voice_card(state, &bubble, &msg, true);
 }
@@ -1208,6 +1244,13 @@ pub(super) fn append_link_chips(_state: &AppState, bubble: &gtk::Box, text: &str
 }
 
 pub(super) fn clear_messages(state: &AppState) {
+    let changed_chat = state.reply_target.borrow().as_ref().is_some_and(|target| {
+        state.current_chat.borrow().as_deref() != Some(target.chat_mid.as_str())
+    });
+    if changed_chat {
+        replies::cancel(state);
+    }
+    state.reply_messages.borrow_mut().clear();
     stop_voice_playback(state);
     state.message_list.clear();
     state.media_slots.borrow_mut().clear();
@@ -1439,10 +1482,9 @@ pub(super) fn ensure_new_message_separator(state: &AppState) {
     if state.new_sep_row.borrow().is_some() {
         return;
     }
-    let sep_row = gtk::ListBoxRow::builder()
-        .selectable(false)
-        .activatable(false)
-        .css_classes(["line-new-sep-row"])
+    let sep_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["line-message-row", "line-new-sep-row"])
         .build();
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1464,7 +1506,7 @@ pub(super) fn ensure_new_message_separator(state: &AppState) {
         .build();
     row_box.append(&line);
     row_box.append(&badge);
-    sep_row.set_child(Some(&row_box));
+    sep_row.append(&row_box);
     state.message_list.append(&sep_row);
     *state.new_sep_row.borrow_mut() = Some(sep_row);
 }

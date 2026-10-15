@@ -11,6 +11,7 @@ import { AuthStore, LineDevice } from "./auth.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
 import { picturePathOf, profileUrl } from "./contacts.ts";
 import { coerceI64, normalizeRaw } from "./messages.ts";
+import { replyToOf } from "./replies.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
 import { createMediaCache } from "./media_cache.ts";
@@ -711,7 +712,11 @@ async function summarizeTalkMessage(
     createdTime?: number | string | bigint;
     contentType?: string | number;
     contentMetadata?: Record<string, string>;
+    relatedMessageId?: unknown;
+    messageRelationType?: unknown;
+    relatedMessageServiceCode?: unknown;
   };
+  const replyTo = replyToOf(raw);
   const contentType = normType(raw.contentType);
   const meta = raw.contentMetadata ?? {};
   let text = tm.text || meta.ALT_TEXT || meta.STKTXT || "";
@@ -770,6 +775,7 @@ async function summarizeTalkMessage(
     }
     const flex = null;
     return {
+      replyTo,
       id,
       text: duration
         ? `Voice message (${Math.round(Number(duration) / 1000)}s)`
@@ -886,6 +892,7 @@ async function summarizeTalkMessage(
   const flex = contentType === "FLEX" ? extractFlex(meta) : null;
 
   return {
+    replyTo,
     id,
     text,
     from: raw.from ?? "",
@@ -934,6 +941,7 @@ async function summarizeRawMessage(
       else if (contentType !== "NONE") text = `[${contentType}]`;
     }
     return {
+      replyTo: replyToOf(r),
       id: String(r.id ?? ""),
       text,
       from: String(r.from ?? ""),
@@ -1664,6 +1672,7 @@ async function handle(req: Json) {
           id,
           String(params.chatMid ?? ""),
           String(params.text ?? ""),
+          params.replyToMessageId,
         );
         break;
       case "send_audio":

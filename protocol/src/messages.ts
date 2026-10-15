@@ -41,3 +41,13 @@ export function coerceI64(value: unknown): bigint | number {
     `cannot coerce thrift i64 from ${typeof value}: ${value}`,
   );
 }
+
+// 返信元の検索では、個人トークとグループの履歴を混ぜない。
+export function conversationMid(message: Record<string, unknown>): string {
+  const to = String(message.to ?? "");
+  return to.startsWith("c")
+    ? to
+    : message.mine
+    ? to
+    : String(message.from ?? "");
+}

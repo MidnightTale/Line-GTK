@@ -1,3 +1,4 @@
+import { withReplyPreviews } from "./replies.ts";
 import { isMediaType } from "./messages.ts";
 import { join } from "@std/path";
 
@@ -130,7 +131,8 @@ export function createMessageView(runtime: MessageViewRuntime) {
 
   /** Serve disk-cached stickers/thumbs immediately; only hydrate misses. */
   async function forUiMessages(messages: Json[]): Promise<Json[]> {
-    return await Promise.all(messages.map(async (m) => {
+    const prepared = withReplyPreviews(messages);
+    return await Promise.all(prepared.map(async (m) => {
       const ct = normType(m.contentType);
       const id = String(m.id ?? "");
       let imagePath: string | null = (m.imagePath as string) || null;
