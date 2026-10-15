@@ -75,6 +75,16 @@ pub struct FlexInfo {
     pub actions: Vec<FlexAction>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CallHistory {
+    #[serde(default)]
+    pub video: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(rename = "durationMs", default)]
+    pub duration_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageInfo {
     #[serde(default)]
@@ -101,6 +111,8 @@ pub struct MessageInfo {
     pub file_path: Option<String>,
     #[serde(rename = "durationMs", default)]
     pub duration_ms: Option<i64>,
+    #[serde(rename = "callHistory", default)]
+    pub call_history: Option<CallHistory>,
     #[serde(default)]
     pub flex: Option<FlexInfo>,
 }
@@ -128,7 +140,7 @@ pub enum ProtocolEvent {
         pin: String,
     },
     Listening,
-    Message(MessageInfo),
+    Message(Box<MessageInfo>),
     Chats {
         chats: Vec<ChatInfo>,
         cached: bool,

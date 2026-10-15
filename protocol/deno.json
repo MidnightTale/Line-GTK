@@ -2,7 +2,7 @@
   "tasks": {
     "sidecar": "deno run --no-prompt --allow-read --allow-write --allow-net --allow-run=ffmpeg,ffprobe --allow-sys --allow-env src/main.ts",
     "dev": "deno run --no-prompt --watch --allow-read --allow-write --allow-net --allow-run=ffmpeg,ffprobe --allow-sys --allow-env src/main.ts",
-    "check": "deno fmt --check && deno lint && deno check src/main.ts && deno test --allow-read --allow-write tests/"
+    "check": "deno fmt --check && deno lint && deno check src/main.ts && deno test --allow-read --allow-write --allow-env=LINE_GTK_LANG,Q_DEBUG,NODE_DEBUG,NO_COLOR tests/"
   },
   "lint": {
     "exclude": ["vendor/"],

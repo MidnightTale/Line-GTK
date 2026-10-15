@@ -18,6 +18,7 @@ import { createStickerService } from "./stickers.ts";
 import { createCommandService } from "./commands.ts";
 import { createListener } from "./listener.ts";
 import { createMessageView } from "./message_view.ts";
+import { callHistoryOf, isLegacyCallPreview } from "./call_history.ts";
 
 type Json = Record<string, unknown>;
 
@@ -715,6 +716,26 @@ async function summarizeTalkMessage(
   const contentType = normType(raw.contentType);
   const meta = raw.contentMetadata ?? {};
   let text = tm.text || meta.ALT_TEXT || meta.STKTXT || "";
+  const callHistory = callHistoryOf({
+    contentType,
+    text,
+    contentMetadata: meta,
+  });
+  if (callHistory) {
+    return {
+      id: String(raw.id ?? ""),
+      from: raw.from ?? "",
+      to: raw.to ?? "",
+      mine: isMineFrom(raw.from),
+      createdTime: Number(raw.createdTime ?? 0),
+      contentType: "CALL",
+      text: "",
+      callHistory,
+      durationMs: callHistory.durationMs,
+      needsMedia: false,
+    };
+  }
+
   let imagePath: string | null = null;
   let imageUrl: string | null = meta.PREVIEW_URL || meta.DOWNLOAD_URL || null;
   const id = String(raw.id ?? "");
@@ -924,6 +945,11 @@ async function summarizeRawMessage(
     const meta = (r.contentMetadata ?? {}) as Record<string, string>;
     const contentType = normType(r.contentType);
     let text = String(r.text ?? meta.ALT_TEXT ?? meta.STKTXT ?? "");
+    const callHistory = callHistoryOf({
+      contentType,
+      text,
+      contentMetadata: meta,
+    });
     if (!text) {
       if (contentType === "AUDIO") text = "Voice message";
       else if (contentType === "IMAGE") text = "[Image]";
@@ -935,12 +961,13 @@ async function summarizeRawMessage(
     }
     return {
       id: String(r.id ?? ""),
-      text,
+      text: callHistory ? "" : text,
+      callHistory,
       from: String(r.from ?? ""),
       to: String(r.to ?? ""),
       mine: isMineFrom(r.from),
       createdTime: Number(r.createdTime ?? 0),
-      contentType,
+      contentType: callHistory ? "CALL" : contentType,
       imagePath: null,
       imageUrl: meta.PREVIEW_URL || meta.DOWNLOAD_URL || null,
       audioPath: null,
@@ -949,7 +976,8 @@ async function summarizeRawMessage(
       stickerId: meta.STKID || null,
       stickerPackageId: meta.STKPKGID || null,
       flex: contentType === "FLEX" ? extractFlex(meta) : null,
-      durationMs: meta.DURATION ? Number(meta.DURATION) : null,
+      durationMs: callHistory?.durationMs ??
+        (meta.DURATION ? Number(meta.DURATION) : null),
       needsMedia: contentType === "IMAGE" || contentType === "VIDEO" ||
         contentType === "STICKER" || contentType === "AUDIO",
     };
@@ -1203,7 +1231,8 @@ async function hydratePreviews(chats: ChatRow[]) {
     .filter((c) => {
       const L = previewLang();
       return c.lastActivity > 0 &&
-        (!c.preview || c.preview === "Tap to open" || c.preview === L.tap);
+        (!c.preview || isLegacyCallPreview(c.preview) ||
+          c.preview === "Tap to open" || c.preview === L.tap);
     })
     .slice(0, PREVIEW_TOP);
   if (!need.length) return;

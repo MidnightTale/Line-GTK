@@ -192,7 +192,9 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
         .map(|p| std::path::Path::new(p).exists())
         .unwrap_or(false);
 
-    if let Some(flex) = msg.flex.as_ref() {
+    if msg.content_type.eq_ignore_ascii_case("CALL") {
+        call_history::append_history_card(&bubble, msg);
+    } else if let Some(flex) = msg.flex.as_ref() {
         append_flex_card(state, &bubble, msg, flex);
     } else if is_audio {
         append_voice_card(state, &bubble, msg, has_audio);
@@ -974,6 +976,7 @@ pub(super) fn attach_audio_to_slot(state: &AppState, message_id: &str, path: &st
         file_path: Some(path.to_string()),
         duration_ms,
         flex: None,
+        call_history: None,
     };
     append_voice_card(state, &bubble, &msg, true);
 }
@@ -1259,6 +1262,9 @@ pub(super) fn set_msg_state(state: &AppState, name: &str, empty_text: Option<&st
 }
 
 pub(super) fn preview_body_ui(msg: &MessageInfo) -> String {
+    if let Some(preview) = call_history::history_preview(msg) {
+        return preview;
+    }
     let ct = msg.content_type.to_ascii_uppercase();
     match ct.as_str() {
         "IMAGE" => crate::i18n::t("preview_photo"),

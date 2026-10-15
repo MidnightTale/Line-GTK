@@ -746,6 +746,26 @@ pub fn load_css() {
         .line-call-vol-row {
             margin-top: 4px;
         }
+        .line-history-card {
+            min-width: 196px;
+            padding: 6px 2px;
+        }
+        .line-history-icon {
+            background: alpha(@accent_bg_color, 0.14);
+            color: @accent_color;
+            border-radius: 999px;
+            padding: 12px;
+        }
+        .line-history-title { font-weight: 700; }
+        .line-history-duration {
+            opacity: 0.8;
+            font-feature-settings: "tnum";
+        }
+        .line-history-missed .line-history-icon,
+        .line-history-missed .line-history-title { color: @error_color; }
+        .line-history-missed .line-history-icon {
+            background: alpha(@error_color, 0.10);
+        }
         .line-voice-card {
             min-width: 180px;
             max-width: min(340px, 78%);
