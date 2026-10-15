@@ -68,7 +68,7 @@ pub(super) struct AppState {
     pub last_msg_day: Rc<RefCell<Option<String>>>,
     pub seen_msg_ids: Rc<RefCell<HashSet<String>>>,
     pub last_incoming_id: Rc<RefCell<Option<String>>>,
-    pub read_upto: Rc<RefCell<HashMap<String, String>>>,
+    pub peer_reads: Rc<RefCell<crate::read_receipts::ReadReceipts>>,
     pub restored_last_chat: Rc<RefCell<bool>>,
     pub media_queue: Rc<RefCell<VecDeque<(String, String)>>>,
     pub media_pumping: Rc<RefCell<bool>>,

@@ -973,12 +973,13 @@ pub fn load_css() {
         }
         .line-bubble-text { font-size: 0.98em; }
         .line-msg-status {
-            font-size: 0.72em;
+            font-size: 0.78em;
             opacity: 0.65;
             margin-top: 1px;
         }
         .line-msg-status-read {
-            opacity: 0.95;
+            opacity: 1;
+            font-weight: 600;
             color: @accent_color;
         }
         .line-msg-time {

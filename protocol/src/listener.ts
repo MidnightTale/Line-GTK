@@ -1,5 +1,6 @@
 import type { Client, TalkMessage } from "@evex/linejs";
 import * as calls from "./calls.ts";
+import type { ReadOperation } from "./read_receipts.ts";
 
 type Json = Record<string, unknown>;
 
@@ -24,6 +25,7 @@ export type ListenerRuntime = {
   ) => Promise<void>;
   upsertChatFromContact: (mid: string) => Promise<void>;
   emitEvent: (event: string, payload?: Json) => void;
+  handleReadReceipt: (operation: ReadOperation) => boolean;
 };
 
 export function createListener(runtime: ListenerRuntime) {
@@ -73,12 +75,8 @@ export function createListener(runtime: ListenerRuntime) {
     }) => {
       try {
         const type = String(op?.type ?? "");
-        if (type === "NOTIFIED_READ_MESSAGE") {
-          emitEvent("read_receipt", {
-            chatMid: String(op.param1 ?? ""),
-            userMid: String(op.param2 ?? ""),
-            messageId: String(op.param3 ?? ""),
-          });
+        if (runtime.handleReadReceipt(op)) {
+          return;
         } else if (
           type.includes("ADD_CONTACT") ||
           type.includes("ACCEPT_CONTACT") ||

@@ -52,7 +52,7 @@ fn tray_icon() -> ksni::Icon {
         .expect("bundled tray icon");
         let (width, height) = img.dimensions();
         let mut data = img.into_rgba8().into_vec();
-        for pixel in data.chunks_exact_mut(4) {
+        for pixel in data.as_chunks_mut::<4>().0 {
             pixel.rotate_right(1); // rgba -> argb
         }
         ksni::Icon {

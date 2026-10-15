@@ -18,6 +18,7 @@ import { createStickerService } from "./stickers.ts";
 import { createCommandService } from "./commands.ts";
 import { createListener } from "./listener.ts";
 import { createMessageView } from "./message_view.ts";
+import { createReadReceipts } from "./read_receipts.ts";
 
 type Json = Record<string, unknown>;
 
@@ -273,6 +274,12 @@ type BoxCursor = {
 };
 const boxCursor = new Map<string, BoxCursor>();
 
+const readReceipts = createReadReceipts({
+  getClient: () => client,
+  selfMid: myMid,
+  emit: emitEvent,
+});
+
 const listener = createListener({
   getClient: () => client,
   isListening: () => listening,
@@ -285,6 +292,7 @@ const listener = createListener({
   upsertChatFromMessage,
   hydrateLiveMedia,
   upsertChatFromContact,
+  handleReadReceipt: readReceipts.handleOperation,
   emitEvent,
 });
 
@@ -318,6 +326,7 @@ const commands = createCommandService({
   refreshContactIndex,
   hydrateAvatars,
   hydratePreviews,
+  refreshReadReceipts: readReceipts.refresh,
   bumpMediaEpoch,
   loadDiskMessages,
   saveDiskMessages,

@@ -163,6 +163,8 @@
   "chat_prefix": "แชท · {name}",
   "status_sent": "ส่งแล้ว",
   "status_read": "อ่านแล้ว",
+  "status_read_count": "อ่านแล้ว {n}",
+  "status_read_unconfirmed": "ส่งแล้ว ยังไม่ได้ยืนยันการอ่าน",
   "search": "ค้นหา",
   "voice_message": "ข้อความเสียง",
   "play_voice": "เล่น",

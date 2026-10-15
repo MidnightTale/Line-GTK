@@ -375,13 +375,6 @@ pub(super) fn clear_list(list: &gtk::ListBox) {
     }
 }
 
-pub(super) fn msg_id_le(a: &str, b: &str) -> bool {
-    match (a.parse::<u128>(), b.parse::<u128>()) {
-        (Ok(x), Ok(y)) => x <= y,
-        _ => a <= b,
-    }
-}
-
 pub(super) fn mark_chat_read(state: &AppState, chat_mid: &str) {
     if !state.config.borrow().auto_mark_read {
         return;
@@ -479,31 +472,42 @@ pub(super) fn toggle_chat_mute(state: &AppState) {
     }
 }
 
-pub(super) fn apply_peer_read(state: &AppState, chat_mid: &str, message_id: &str) {
-    if chat_mid.is_empty() || message_id.is_empty() {
-        return;
-    }
-    let prev = state.read_upto.borrow().get(chat_mid).cloned();
-    if let Some(p) = prev.as_deref()
-        && msg_id_le(message_id, p)
-    {
-        return;
-    }
-    state
-        .read_upto
-        .borrow_mut()
-        .insert(chat_mid.to_string(), message_id.to_string());
-
-    if state.current_chat.borrow().as_deref() != Some(chat_mid) {
-        return;
-    }
-    let times = state.msg_created.borrow().clone();
+// 表示している行だけを更新し、スクロール位置と本文は維持する。
+pub(super) fn refresh_read_labels(state: &AppState) {
+    let times = state.msg_created.borrow();
     for (id, label) in state.receipt_slots.borrow().iter() {
-        if msg_id_le(id, message_id) {
-            let ts = times.get(id).copied().unwrap_or(0);
-            label.set_text(&format_outgoing_status(true, ts));
-            label.set_tooltip_text(Some(&crate::i18n::t("status_read")));
+        let (text, tooltip, read) = receipt_status(state, id, times.get(id).copied().unwrap_or(0));
+        label.set_text(&text);
+        label.set_tooltip_text(Some(&tooltip));
+        if read {
             label.add_css_class("line-msg-status-read");
+        } else {
+            label.remove_css_class("line-msg-status-read");
         }
     }
+}
+
+pub(super) fn receipt_status(
+    state: &AppState,
+    id: &str,
+    created_time: i64,
+) -> (String, String, bool) {
+    if id.starts_with("pending-") {
+        let text = crate::i18n::t("media_sending");
+        return (text.clone(), text, false);
+    }
+    let mid = state.current_chat.borrow().clone().unwrap_or_default();
+    let self_mid = state.self_mid.borrow().clone().unwrap_or_default();
+    let count = state.peer_reads.borrow().count(&mid, id, &self_mid);
+    let group = mid.starts_with('c') || mid.starts_with('r');
+    let tooltip = if count > 0 {
+        outgoing_read_label(count, group)
+    } else {
+        crate::i18n::t("status_read_unconfirmed")
+    };
+    (
+        format_outgoing_status(count, group, created_time),
+        tooltip,
+        count > 0,
+    )
 }

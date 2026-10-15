@@ -59,6 +59,7 @@ export type CommandRuntime = {
   refreshContactIndex: (force?: boolean) => Promise<void>;
   hydrateAvatars: (chats: ChatRow[]) => Promise<void>;
   hydratePreviews: (chats: ChatRow[]) => Promise<void>;
+  refreshReadReceipts: (chatMid: string) => Promise<void>;
   bumpMediaEpoch: (chatMid: string) => number;
   loadDiskMessages: (chatMid: string) => Promise<Json[] | null>;
   saveDiskMessages: (chatMid: string, messages: Json[]) => Promise<void>;
@@ -449,6 +450,8 @@ export function createCommandService(runtime: CommandRuntime) {
     }
 
     await refreshCachePolicy();
+    // 本文の取得元にかかわらず、サーバーの既読情報を背景で同期する。
+    void runtime.refreshReadReceipts(chatMid);
     await dedupe(`msgs:${chatMid}:${limit}:${force}`, async () => {
       bumpMediaEpoch(chatMid); // cancel any prior hydrate for this chat
       const cached = msgCache.get(chatMid);

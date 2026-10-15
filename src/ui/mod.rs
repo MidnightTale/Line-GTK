@@ -157,7 +157,7 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         last_msg_day: Rc::new(RefCell::new(None)),
         seen_msg_ids: Rc::new(RefCell::new(HashSet::new())),
         last_incoming_id: Rc::new(RefCell::new(None)),
-        read_upto: Rc::new(RefCell::new(HashMap::new())),
+        peer_reads: Rc::new(RefCell::new(crate::read_receipts::ReadReceipts::default())),
         restored_last_chat: Rc::new(RefCell::new(false)),
         media_queue: Rc::new(RefCell::new(VecDeque::new())),
         media_pumping: Rc::new(RefCell::new(false)),
@@ -1084,6 +1084,8 @@ fn apply_ui_language(state: &AppState) {
             label.set_text(&chat.preview);
         }
     }
+    refresh_read_labels(state);
+    refresh_tray_menu(state);
     sync_discord_rpc(state);
 }
 

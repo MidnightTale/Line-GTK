@@ -75,6 +75,21 @@ pub struct FlexInfo {
     pub actions: Vec<FlexAction>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct MessageReadRange {
+    #[serde(rename = "startMessageId")]
+    pub start_message_id: String,
+    #[serde(rename = "endMessageId")]
+    pub end_message_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReaderRanges {
+    #[serde(rename = "userMid")]
+    pub user_mid: String,
+    pub ranges: Vec<MessageReadRange>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageInfo {
     #[serde(default)]
@@ -181,7 +196,12 @@ pub enum ProtocolEvent {
     },
     ReadReceipt {
         chat_mid: String,
+        user_mid: String,
         message_id: String,
+    },
+    ReadRanges {
+        chat_mid: String,
+        readers: Vec<ReaderRanges>,
     },
     CallIncoming {
         call_id: String,

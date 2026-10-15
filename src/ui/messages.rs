@@ -304,28 +304,23 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
             .build();
         col.append(&bubble);
 
-        let read = state
-            .current_chat
-            .borrow()
-            .as_ref()
-            .and_then(|mid| state.read_upto.borrow().get(mid).cloned())
-            .map(|upto| msg_id_le(&msg.id, &upto))
-            .unwrap_or(false);
+        let tracks_receipt = !msg.content_type.eq_ignore_ascii_case("CALL");
+        let (text, tooltip, read) = if tracks_receipt {
+            receipt_status(state, &msg.id, msg.created_time)
+        } else {
+            (time_txt.clone(), String::new(), false)
+        };
         let status = gtk::Label::builder()
-            .label(format_outgoing_status(read, msg.created_time))
+            .label(text)
             .halign(gtk::Align::End)
-            .tooltip_text(if read {
-                crate::i18n::t("status_read")
-            } else {
-                crate::i18n::t("status_sent")
-            })
+            .tooltip_text(tooltip)
             .css_classes(if read {
                 vec!["line-msg-status", "line-msg-status-read"]
             } else {
                 vec!["line-msg-status"]
             })
             .build();
-        if !msg.id.is_empty() {
+        if tracks_receipt && !msg.id.is_empty() {
             state
                 .receipt_slots
                 .borrow_mut()
@@ -368,19 +363,23 @@ pub(super) fn append_message(state: &AppState, msg: &MessageInfo, live: bool) {
     list.append(&row);
 }
 
-pub(super) fn format_outgoing_status(read: bool, created_ms: i64) -> String {
-    let t = format_msg_time(created_ms);
-    if read {
-        // Mobile LINE style: "Read 4:34 PM" (+ ✓✓ cue)
-        if t.is_empty() {
-            format!("✓✓ {}", crate::i18n::t("status_read"))
-        } else {
-            format!("✓✓ {} {}", crate::i18n::t("status_read"), t)
-        }
-    } else if t.is_empty() {
-        "✓".into()
+pub(super) fn outgoing_read_label(read_count: usize, group: bool) -> String {
+    if read_count == 0 {
+        crate::i18n::t("status_sent")
+    } else if group {
+        crate::i18n::tf("status_read_count", &[("n", &read_count.to_string())])
     } else {
-        format!("✓ {t}")
+        crate::i18n::t("status_read")
+    }
+}
+
+pub(super) fn format_outgoing_status(read_count: usize, group: bool, created_ms: i64) -> String {
+    let status = outgoing_read_label(read_count, group);
+    let time = format_msg_time(created_ms);
+    if time.is_empty() {
+        status
+    } else {
+        format!("{status} · {time}")
     }
 }
 
