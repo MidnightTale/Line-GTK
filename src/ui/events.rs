@@ -285,6 +285,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     chat.last_activity = last_activity;
                 }
             }
+            chat_filter::refresh(state);
         }
         ProtocolEvent::ChatMute { mid, muted } => {
             if let Some(chat) = state.chats.borrow_mut().iter_mut().find(|c| c.mid == mid) {
@@ -384,9 +385,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     "ready" => {
                         state.side_spinner.set_spinning(false);
                         state.side_spinner.set_visible(false);
-                        if !state.chats.borrow().is_empty() {
-                            set_side_state(state, "list", None);
-                        }
+                        chat_filter::refresh(state);
                     }
                     "empty" => {
                         state.side_spinner.set_spinning(false);

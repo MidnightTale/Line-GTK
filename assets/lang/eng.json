@@ -1,4 +1,10 @@
 {
+  "chat_filter_all": "All",
+  "chat_filter_friends": "Friends",
+  "chat_filter_groups": "Groups",
+  "chat_filter_official": "Official accounts",
+  "chat_filter_current": "Chat category: {category}",
+  "chat_filter_empty": "No chats match these filters",
   "app_title": "LINE GTK",
   "app_name": "LINE GTK",
   "chats": "Chats",

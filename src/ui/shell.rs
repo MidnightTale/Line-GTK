@@ -37,6 +37,9 @@ pub struct ShellWidgets {
     pub friends_btn: gtk::Button,
     pub side_title: gtk::Label,
     pub search_entry: gtk::SearchEntry,
+    pub chat_filter_bar: gtk::Box,
+    pub chat_filter_buttons: [gtk::ToggleButton; 4],
+    pub compact_filter_btn: gtk::MenuButton,
     pub compact_search_btn: gtk::Button,
     pub compact_search_entry: gtk::SearchEntry,
     pub mic_btn: gtk::Button,
@@ -199,6 +202,35 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["line-search"])
         .build();
 
+    let chat_filter_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_bottom(8)
+        .css_classes(["linked", "line-chat-filters"])
+        .build();
+    let chat_filter_buttons = super::chat_filter::ChatCategory::ITEMS.map(|(_, id, key)| {
+        gtk::ToggleButton::builder()
+            .label(crate::i18n::t(key))
+            .action_target(&id.to_variant())
+            .action_name("win.chat-category")
+            .hexpand(true)
+            .build()
+    });
+    for button in &chat_filter_buttons[1..] {
+        button.set_group(Some(&chat_filter_buttons[0]));
+    }
+    for button in &chat_filter_buttons {
+        chat_filter_bar.append(button);
+    }
+    let compact_filter_btn = gtk::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .css_classes(["flat", "circular"])
+        .halign(gtk::Align::Center)
+        .visible(false)
+        .build();
+
     let side_stack = gtk::Stack::builder()
         .vexpand(true)
         .hexpand(true)
@@ -247,6 +279,8 @@ pub fn build_shell_page() -> ShellWidgets {
     sidebar.append(&side_header);
     sidebar.append(&compact_search_btn);
     sidebar.append(&search_entry);
+    sidebar.append(&chat_filter_bar);
+    sidebar.append(&compact_filter_btn);
     sidebar.append(&side_stack);
 
     // ---- Conversation ----
@@ -580,6 +614,9 @@ pub fn build_shell_page() -> ShellWidgets {
         friends_btn,
         side_title,
         search_entry,
+        chat_filter_bar,
+        chat_filter_buttons,
+        compact_filter_btn,
         compact_search_btn,
         compact_search_entry,
         mic_btn,
@@ -716,6 +753,7 @@ pub fn load_css() {
             min-width: 40px;
             min-height: 40px;
         }
+        .line-chat-filters button { padding: 5px 6px; font-size: 0.85em; }
         .line-search {
             border-radius: 12px;
             margin-bottom: 4px;

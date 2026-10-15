@@ -1,4 +1,10 @@
 {
+  "chat_filter_all": "ทั้งหมด",
+  "chat_filter_friends": "เพื่อน",
+  "chat_filter_groups": "กลุ่ม",
+  "chat_filter_official": "บัญชีทางการ",
+  "chat_filter_current": "ประเภทแชท: {category}",
+  "chat_filter_empty": "ไม่มีแชทที่ตรงกับตัวกรอง",
   "app_title": "LINE GTK",
   "app_name": "LINE GTK",
   "chats": "แชท",

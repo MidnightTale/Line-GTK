@@ -9,7 +9,7 @@ import { fromFileUrl, join } from "@std/path";
 import { atomicWriteJson, ensurePrivateDir } from "./storage.ts";
 import { AuthStore, LineDevice } from "./auth.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
-import { picturePathOf, profileUrl } from "./contacts.ts";
+import { contactKind, picturePathOf, profileUrl } from "./contacts.ts";
 import { coerceI64, normalizeRaw } from "./messages.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
@@ -260,6 +260,16 @@ const outgoingMedia = createOutgoingMedia({
 });
 
 let chatCache: { at: number; chats: ChatRow[] } | null = null;
+let chatCacheWrite = Promise.resolve();
+function saveChatCache(): Promise<void> {
+  const write = chatCacheWrite.then(async () => {
+    if (chatCache) await atomicWriteJson(chatCachePath, chatCache);
+  });
+  // 1回の保存失敗で、後続の更新まで停止しないようにする。
+  chatCacheWrite = write.catch(() => {});
+  return write;
+}
+
 const msgCache = new Map<string, { at: number; messages: Json[] }>();
 const inFlight = new Map<string, Promise<unknown>>();
 const contactIndex = new Map<
@@ -306,6 +316,7 @@ const commands = createCommandService({
   boxCursor,
   avatarDir,
   chatCachePath,
+  saveChatCache,
   storagePath,
   lineDevice: LINE_DEVICE,
   lineVersion: LINE_VERSION,
@@ -315,6 +326,7 @@ const commands = createCommandService({
   storeBoxCursor,
   existingFile,
   loadDiskContacts,
+  saveDiskContacts,
   refreshContactIndex,
   hydrateAvatars,
   hydratePreviews,
@@ -594,7 +606,9 @@ async function loadDiskContacts() {
       });
     }
     const at = Number(raw.at || 0);
-    if (Number.isFinite(at) && at > 0) contactsAt = at;
+    if (raw.classificationVersion === 1 && Number.isFinite(at) && at > 0) {
+      contactsAt = at;
+    }
   } catch { /* miss */ }
 }
 
@@ -605,7 +619,11 @@ async function saveDiskContacts() {
   > = {};
   for (const [mid, c] of contactIndex) contacts[mid] = c;
   try {
-    await atomicWriteJson(contactCachePath, { at: Date.now(), contacts });
+    await atomicWriteJson(contactCachePath, {
+      at: Date.now(),
+      contacts,
+      classificationVersion: contactsAt > 0 ? 1 : 0,
+    });
   } catch (error) {
     console.error("[contacts-cache]", error);
   }
@@ -666,8 +684,7 @@ async function refreshContactIndex(force = false) {
       for (const c of contacts ?? []) {
         const mid = String(c.mid ?? "");
         if (!mid) continue;
-        const type = String(c.type ?? "");
-        const kind = /BOT/i.test(type) ? "bot" : "dm";
+        const kind = contactKind(c, contactIndex.get(mid)?.kind);
         contactIndex.set(mid, {
           name: c.displayName || mid,
           picturePath: c.picturePath ?? null,
@@ -681,11 +698,10 @@ async function refreshContactIndex(force = false) {
       for (const mid of slice) {
         try {
           const c = await client.base.talk.getContact({ mid });
-          const type = String(c.type ?? "");
           contactIndex.set(mid, {
             name: c.displayName || mid,
             picturePath: c.picturePath ?? null,
-            kind: /BOT/i.test(type) ? "bot" : "dm",
+            kind: contactKind(c, contactIndex.get(mid)?.kind),
             muted: !!(c as { notificationDisabled?: boolean })
               .notificationDisabled,
           });
@@ -1267,7 +1283,7 @@ async function hydratePreviews(chats: ChatRow[]) {
 
   if (chatCache) {
     try {
-      await atomicWriteJson(chatCachePath, chatCache);
+      await saveChatCache();
     } catch (error) {
       console.error("[chat-preview-cache]", error);
     }
@@ -1347,7 +1363,7 @@ async function hydrateAvatars(chats: ChatRow[]) {
   });
   if (chatCache) {
     try {
-      await atomicWriteJson(chatCachePath, chatCache);
+      await saveChatCache();
     } catch (error) {
       console.error("[chat-avatar-cache]", error);
     }
@@ -1376,11 +1392,10 @@ async function resolveContactInfo(mid: string): Promise<{
   }
   try {
     const c = await client.base.talk.getContact({ mid });
-    const type = String(c.type ?? "");
     const info = {
       name: c.displayName || mid,
       picturePath: c.picturePath ?? null,
-      kind: /BOT/i.test(type) ? "bot" : mid.startsWith("c") ? "group" : "dm",
+      kind: mid.startsWith("c") ? "group" : contactKind(c, cached?.kind),
       muted: !!(c as { notificationDisabled?: boolean }).notificationDisabled,
     };
     contactIndex.set(mid, info);
@@ -1432,7 +1447,7 @@ async function upsertChatFromMessage(message: Json) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== peer)];
   chatCache.at = Date.now();
   try {
-    await atomicWriteJson(chatCachePath, chatCache);
+    await saveChatCache();
   } catch (error) {
     console.error("[chat-message-cache]", peer, error);
   }
@@ -1469,7 +1484,7 @@ async function upsertChatFromContact(mid: string) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== mid)];
   chatCache.at = Date.now();
   try {
-    await atomicWriteJson(chatCachePath, chatCache);
+    await saveChatCache();
   } catch (error) {
     console.error("[chat-contact-cache]", mid, error);
   }

@@ -31,6 +31,7 @@ pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bo
 
     let n = chats.len();
     *state.chats.borrow_mut() = chats;
+    chat_filter::refresh(state);
 
     if n == 0 {
         set_side_state(state, "empty", Some(&crate::i18n::t("no_chats")));
@@ -48,6 +49,7 @@ pub(super) fn apply_chats(state: &AppState, mut chats: Vec<ChatInfo>, cached: bo
         select_sidebar_chat(state, state.current_chat.borrow().as_deref());
         maybe_restore_last_chat(state);
     }
+    chat_filter::refresh(state);
     refresh_tray_menu(state);
 }
 
@@ -58,7 +60,9 @@ pub(super) fn select_sidebar_chat(state: &AppState, mid: Option<&str>) {
     let Some(pos) = state.chats.borrow().iter().position(|c| c.mid == mid) else {
         return;
     };
-    if let Some(row) = state.chat_list.row_at_index(pos as i32) {
+    if let Some(row) = state.chat_list.row_at_index(pos as i32)
+        && row.is_visible()
+    {
         state.chat_list.select_row(Some(&row));
         // Ensure the selected row is scrolled into view.
         row.grab_focus();
@@ -115,6 +119,7 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
                 attach_texture_async(img, path.to_string(), 72);
             }
         }
+        chat_filter::refresh(state);
         return;
     }
 
@@ -136,6 +141,7 @@ pub(super) fn upsert_chat_row(state: &AppState, chat: ChatInfo) {
         "status_chats_live",
         &[("n", &n.to_string())],
     ));
+    chat_filter::refresh(state);
     refresh_tray_menu(state);
 }
 
@@ -146,6 +152,7 @@ pub(super) fn promote_chat_to_top(state: &AppState, mid: &str) {
     };
     let Some(pos) = pos else { return };
     if pos == 0 {
+        chat_filter::refresh(state);
         return;
     }
     {
@@ -164,6 +171,7 @@ pub(super) fn promote_chat_to_top(state: &AppState, mid: &str) {
             });
         }
     }
+    chat_filter::refresh(state);
     // Keep selection on the open chat after row reorder.
     select_sidebar_chat(state, state.current_chat.borrow().as_deref());
     refresh_tray_menu(state);

@@ -3,6 +3,24 @@ export function friendName(user: { mid: string; raw: unknown }): string {
   return raw.contact?.displayName || user.mid;
 }
 
+export function contactKind(
+  contact: unknown,
+  previousKind?: string,
+): "bot" | "dm" {
+  const raw = contact && typeof contact === "object"
+    ? contact as Record<string, unknown>
+    : {};
+  // 追加方法の列挙値だけでなく、公式アカウントの能力フラグも確認する。
+  const type = String(raw.type ?? "").toUpperCase();
+  const attributes = Number(raw.attributes ?? 0);
+  return previousKind === "bot" || type === "8" || type.includes("BOT") ||
+      raw.capableBuddy === true ||
+      (Number.isSafeInteger(attributes) && attributes >= 0 &&
+        (attributes & 32) !== 0)
+    ? "bot"
+    : "dm";
+}
+
 export function profileUrl(picturePath?: string | null): string | null {
   if (!picturePath) return null;
   if (picturePath.startsWith("http")) return picturePath;
