@@ -18,6 +18,7 @@ import { createStickerService } from "./stickers.ts";
 import { createCommandService } from "./commands.ts";
 import { createListener } from "./listener.ts";
 import { createMessageView } from "./message_view.ts";
+import { createChatPreviews } from "./chat_previews.ts";
 
 type Json = Record<string, unknown>;
 
@@ -85,8 +86,6 @@ function cachePolicy(): CachePolicy {
 }
 const AVATAR_CONCURRENCY = 3;
 const MEDIA_CONCURRENCY = 1;
-const PREVIEW_CONCURRENCY = 2;
-const PREVIEW_TOP = 28;
 const MEDIA_FIRST_BATCH = 5;
 const THUMB_MAX = 440;
 const THUMB_BYTES = 220_000;
@@ -260,6 +259,16 @@ const outgoingMedia = createOutgoingMedia({
 });
 
 let chatCache: { at: number; chats: ChatRow[] } | null = null;
+let chatCacheWrite = Promise.resolve();
+function saveChatCache(): Promise<void> {
+  const write = chatCacheWrite.then(async () => {
+    if (chatCache) await atomicWriteJson(chatCachePath, chatCache);
+  });
+  // 1回の保存失敗で、後続の更新まで停止しないようにする。
+  chatCacheWrite = write.catch(() => {});
+  return write;
+}
+
 const msgCache = new Map<string, { at: number; messages: Json[] }>();
 const inFlight = new Map<string, Promise<unknown>>();
 const contactIndex = new Map<
@@ -272,6 +281,24 @@ type BoxCursor = {
   deliveredTime: bigint | number;
 };
 const boxCursor = new Map<string, BoxCursor>();
+
+const chatPreviews = createChatPreviews({
+  getChats: () => chatCache?.chats ?? [],
+  previewLine,
+  fallback: () => previewLang().tap,
+  emit: (chat) => emitEvent("chat_preview", chat),
+  save: async () => {
+    if (chatCache) {
+      try {
+        await saveChatCache();
+      } catch {
+        console.error(
+          "[chat-preview-cache] プレビューを保存できませんでした。",
+        );
+      }
+    }
+  },
+});
 
 const listener = createListener({
   getClient: () => client,
@@ -306,6 +333,7 @@ const commands = createCommandService({
   boxCursor,
   avatarDir,
   chatCachePath,
+  saveChatCache,
   storagePath,
   lineDevice: LINE_DEVICE,
   lineVersion: LINE_VERSION,
@@ -318,6 +346,7 @@ const commands = createCommandService({
   refreshContactIndex,
   hydrateAvatars,
   hydratePreviews,
+  updateChatPreview: chatPreviews.updateFromMessages,
   bumpMediaEpoch,
   loadDiskMessages,
   saveDiskMessages,
@@ -1199,79 +1228,44 @@ async function hydrateMedia(
 async function hydratePreviews(chats: ChatRow[]) {
   if (!client || !stdoutAlive) return;
   const gen = workGen;
-  const need = chats
-    .filter((c) => {
-      const L = previewLang();
-      return c.lastActivity > 0 &&
-        (!c.preview || c.preview === "Tap to open" || c.preview === L.tap);
-    })
-    .slice(0, PREVIEW_TOP);
-  if (!need.length) return;
+  const currentClient = client;
+  const active = () =>
+    client === currentClient && stdoutAlive && workGen === gen;
+  await chatPreviews.hydrate(chats, async (chat) => {
+    const cached = msgCache.get(chat.mid)?.messages ??
+      await loadDiskMessages(chat.mid);
+    if (!active()) return [];
+    if (
+      cached?.some((message) =>
+        Number(message.createdTime ?? 0) >= chat.lastActivity
+      )
+    ) return cached;
 
-  await mapPool(need, PREVIEW_CONCURRENCY, async (c) => {
-    if (!client || !stdoutAlive || workGen !== gen) return;
-    try {
-      let cursor = boxCursor.get(c.mid);
-      if (!cursor) {
-        // refresh cursors cheaply only when missing
-        const boxes = await client.base.talk.getMessageBoxes({
-          messageBoxListRequest: {},
-        });
-        if (!client || workGen !== gen) return;
-        for (const box of boxes.messageBoxes ?? []) {
-          const mid = String(box.id ?? "");
-          storeBoxCursor(mid, box.lastDeliveredMessageId);
-        }
-        cursor = boxCursor.get(c.mid);
+    let cursor = boxCursor.get(chat.mid);
+    if (!cursor) {
+      const boxes = await currentClient.base.talk.getMessageBoxes({
+        messageBoxListRequest: {},
+      });
+      if (!active()) return [];
+      for (const box of boxes.messageBoxes ?? []) {
+        storeBoxCursor(String(box.id ?? ""), box.lastDeliveredMessageId);
       }
-      if (!cursor) return;
-
-      const messages = await client.base.talk.getPreviousMessagesV2WithRequest({
+      cursor = boxCursor.get(chat.mid);
+    }
+    if (!cursor) return [];
+    const messages = await currentClient.base.talk
+      .getPreviousMessagesV2WithRequest({
         request: {
-          messageBoxId: c.mid,
-          endMessageId: {
-            messageId: cursor.messageId,
-            deliveredTime: cursor.deliveredTime,
-          },
+          messageBoxId: chat.mid,
+          endMessageId: cursor,
           messagesCount: 1,
         },
       });
-      if (!client || workGen !== gen || !stdoutAlive) return;
-      const raw = messages?.[messages.length - 1] ?? messages?.[0];
-      if (!raw) return;
-      const summary = await summarizeRawMessage(raw, { withMedia: false });
-      if (workGen !== gen || !stdoutAlive) return;
-      const preview = previewLine(summary);
-      c.preview = preview;
-      if (chatCache) {
-        const row = chatCache.chats.find((x) => x.mid === c.mid);
-        if (row) row.preview = preview;
-      }
-      emitEvent("chat_preview", {
-        mid: c.mid,
-        preview,
-        lastActivity: c.lastActivity,
-      });
-    } catch (e) {
-      console.error("[hydratePreviews]", c.mid, e);
-      if (!c.preview) {
-        c.preview = previewLang().tap;
-        emitEvent("chat_preview", {
-          mid: c.mid,
-          preview: c.preview,
-          lastActivity: c.lastActivity,
-        });
-      }
-    }
-  });
-
-  if (chatCache) {
-    try {
-      await atomicWriteJson(chatCachePath, chatCache);
-    } catch (error) {
-      console.error("[chat-preview-cache]", error);
-    }
-  }
+    if (!active()) return [];
+    return await Promise.all(
+      messages.map((raw) => summarizeRawMessage(raw, { withMedia: false })),
+    );
+  }, active);
 }
 
 async function buildFriendsList(): Promise<ChatRow[]> {
@@ -1347,7 +1341,7 @@ async function hydrateAvatars(chats: ChatRow[]) {
   });
   if (chatCache) {
     try {
-      await atomicWriteJson(chatCachePath, chatCache);
+      await saveChatCache();
     } catch (error) {
       console.error("[chat-avatar-cache]", error);
     }
@@ -1432,7 +1426,7 @@ async function upsertChatFromMessage(message: Json) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== peer)];
   chatCache.at = Date.now();
   try {
-    await atomicWriteJson(chatCachePath, chatCache);
+    await saveChatCache();
   } catch (error) {
     console.error("[chat-message-cache]", peer, error);
   }
@@ -1469,7 +1463,7 @@ async function upsertChatFromContact(mid: string) {
   chatCache.chats = [row, ...chatCache.chats.filter((c) => c.mid !== mid)];
   chatCache.at = Date.now();
   try {
-    await atomicWriteJson(chatCachePath, chatCache);
+    await saveChatCache();
   } catch (error) {
     console.error("[chat-contact-cache]", mid, error);
   }
