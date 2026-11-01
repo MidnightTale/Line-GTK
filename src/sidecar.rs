@@ -589,6 +589,31 @@ impl Sidecar {
         )
     }
 
+    pub fn poll_get(&self, chat_mid: &str, poll_id: &str) -> Result<u64> {
+        self.request(
+            "poll_get",
+            Some(json!({ "chatMid": chat_mid, "pollId": poll_id })),
+        )
+    }
+
+    pub fn poll_create(&self, chat_mid: &str, poll: Value) -> Result<u64> {
+        self.request(
+            "poll_create",
+            Some(json!({ "chatMid": chat_mid, "poll": poll })),
+        )
+    }
+
+    pub fn poll_vote(&self, chat_mid: &str, poll_id: &str, choice_ids: &[String]) -> Result<u64> {
+        self.request(
+            "poll_vote",
+            Some(json!({
+                "chatMid": chat_mid,
+                "pollId": poll_id,
+                "choiceIds": choice_ids,
+            })),
+        )
+    }
+
     pub fn clear_cache(&self, kind: &str) -> Result<u64> {
         self.request("clear_cache", Some(json!({ "kind": kind })))
     }

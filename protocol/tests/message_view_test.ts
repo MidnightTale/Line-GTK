@@ -90,3 +90,54 @@ Deno.test("cached history placeholders become system rows without message action
   assertEquals(notice.replyTo, null);
   assertEquals(notice.reactions, []);
 });
+
+Deno.test("LINE poll flex card uses box text for generic 'action' labels", () => {
+  const view = createMessageView({
+    normType: (value) => String(value ?? "NONE"),
+    existingFullImage: () => Promise.resolve(null),
+    existingImage: () => Promise.resolve(null),
+    mediaDest: () => "",
+    thumbDest: () => "",
+    isValidAudioFile: () => Promise.resolve(false),
+    uiMediaPath: () => Promise.resolve(null),
+    stickerDir: "",
+  });
+  const uri = "https://liff.line.me/1477715170-Pl2JnXpR/view/1?chatId=C1";
+  const flex = view.extractFlex({
+    ALT_TEXT: "[Cuộc thăm dò ý kiến] Test",
+    FLEX_JSON: JSON.stringify({
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          { type: "text", text: "[Cuộc thăm dò ý kiến] Test" },
+          {
+            type: "box",
+            layout: "vertical",
+            contents: [{ type: "text", text: "Bầu chọn ngay" }],
+            action: { type: "uri", label: "action", uri },
+          },
+          {
+            type: "box",
+            layout: "horizontal",
+            contents: [{
+              type: "box",
+              layout: "horizontal",
+              contents: [
+                { type: "image", url: "https://x/y.png" },
+                { type: "text", text: "Cuộc thăm dò ý kiến" },
+              ],
+            }],
+            action: { type: "uri", label: "action", uri: uri + "&b" },
+          },
+        ],
+      },
+    }),
+  }) as { actions: { label: string; kind: string }[] };
+  assertEquals(flex.actions.map((a) => a.label), [
+    "Bầu chọn ngay",
+    "Cuộc thăm dò ý kiến",
+  ]);
+  assertEquals(flex.actions.map((a) => a.kind), ["uri", "uri"]);
+});

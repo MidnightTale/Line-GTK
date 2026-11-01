@@ -1495,6 +1495,11 @@ pub(super) fn append_flex_card(
     msg: &MessageInfo,
     flex: &crate::protocol::FlexInfo,
 ) {
+    if let Some(uri) = line_polls::poll_uri(flex)
+        && line_polls::append_card(state, bubble, flex, uri)
+    {
+        return;
+    }
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -1518,7 +1523,7 @@ pub(super) fn append_flex_card(
         );
     }
     for t in flex.texts.iter().take(6) {
-        if *t == title {
+        if *t == title || flex.actions.iter().any(|a| a.label == *t) {
             continue;
         }
         card.append(

@@ -128,6 +128,7 @@ pub(super) struct AppState {
     pub message_search_btn: gtk::Button,
     pub message_search_ui: Rc<RefCell<Option<Rc<super::message_search::SearchUi>>>>,
     pub shared_media_btn: gtk::Button,
+    pub poll_create_btn: gtk::Button,
     pub shared_media_ui: Rc<RefCell<Option<Rc<super::shared_media::SharedMediaUi>>>>,
     pub album_ui: Rc<RefCell<Option<Rc<super::albums::AlbumUi>>>>,
     pub hidden_chats_ui: Rc<RefCell<Option<super::hidden_chats::HiddenChatsUi>>>,
@@ -260,6 +261,13 @@ pub(super) enum Pending {
         generation: u64,
         account: String,
         chat_mid: Option<String>,
+    },
+    Poll {
+        card: std::rc::Weak<super::line_polls::PollCard>,
+        vote: bool,
+    },
+    PollCreate {
+        ui: std::rc::Weak<super::poll_create::CreateUi>,
     },
     Album {
         ui: std::rc::Weak<super::albums::AlbumUi>,

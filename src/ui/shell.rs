@@ -53,6 +53,7 @@ pub struct ShellWidgets {
     pub album_btn: gtk::Button,
     pub message_search_btn: gtk::Button,
     pub shared_media_btn: gtk::Button,
+    pub poll_create_btn: gtk::Button,
     pub side_title: gtk::Label,
     pub search_entry: gtk::SearchEntry,
     pub chat_filter_bar: gtk::Box,
@@ -444,11 +445,21 @@ pub fn build_shell_page() -> ShellWidgets {
         .tooltip_text(crate::i18n::t("shared_media"))
         .css_classes(["flat"])
         .build();
+    let poll_create_btn = gtk::Button::builder()
+        .label(crate::i18n::t("poll_create"))
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let menu_items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_items.append(&shared_media_btn);
+    menu_items.append(&poll_create_btn);
     let menu = gtk::Popover::new();
-    menu.set_child(Some(&shared_media_btn));
+    menu.set_child(Some(&menu_items));
     conversation_menu.set_popover(Some(&menu));
-    let popover = menu.clone();
-    shared_media_btn.connect_clicked(move |_| popover.popdown());
+    for button in [&shared_media_btn, &poll_create_btn] {
+        let popover = menu.clone();
+        button.connect_clicked(move |_| popover.popdown());
+    }
     chat_bar.append(&conversation_menu);
     chat_bar.append(&mute_btn);
     chat_bar.append(&call_btn);
@@ -848,6 +859,7 @@ pub fn build_shell_page() -> ShellWidgets {
         album_btn,
         message_search_btn,
         shared_media_btn,
+        poll_create_btn,
         side_title,
         search_entry,
         chat_filter_bar,
@@ -1308,6 +1320,7 @@ pub fn load_css() {
         }
         .line-flex-title { font-weight: 700; }
         .line-flex-action { margin-top: 4px; }
+        .line-poll-choice progressbar trough, .line-poll-choice progressbar progress { min-height: 4px; }
         .line-link-preview { border-radius: 10px; padding: 8px; background: alpha(@card_bg_color, 0.75); border: 1px solid alpha(@borders, 0.5); max-width: 360px; }
         .line-link-preview-thumbnail { padding: 0; margin: 0; border-radius: 6px; }
         .line-link-preview-title { font-weight: 700; }

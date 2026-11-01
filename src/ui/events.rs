@@ -756,6 +756,14 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                 );
                 return;
             }
+            if let Some(Pending::PollCreate { ui }) = pending {
+                poll_create::response(state, &ui, ok, error.as_deref());
+                return;
+            }
+            if let Some(Pending::Poll { card, vote }) = pending {
+                line_polls::response(state, &card, vote, ok, &result, error.as_deref());
+                return;
+            }
             if let Some(Pending::UserProfile {
                 account,
                 mid,
@@ -1072,6 +1080,8 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     | Pending::MessageSearch { .. }
                     | Pending::SharedMessageContext { .. }
                     | Pending::Unsend { .. }
+                    | Pending::Poll { .. }
+                    | Pending::PollCreate { .. }
                     | Pending::UserProfile { .. }
                     | Pending::React { .. }
                     | Pending::ReactionEmojis { .. }
@@ -1256,6 +1266,8 @@ pub(super) fn show_login(state: &AppState, hint: &str) {
     read_position::reset(state);
     cache_boot::abort(state);
     state.shared_media_btn.set_sensitive(false);
+    state.poll_create_btn.set_sensitive(false);
+    poll_create::close();
     chat_snapshots::clear();
     *state.unread_sync.borrow_mut() = unread_sync::UnreadSync::default();
     state.notif_pending.borrow_mut().clear();

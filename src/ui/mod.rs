@@ -20,6 +20,7 @@ mod events;
 mod friends;
 mod hidden_chats;
 mod history;
+mod line_polls;
 mod link_previews;
 mod login;
 mod markdown;
@@ -31,6 +32,7 @@ mod message_senders;
 mod messages;
 mod notifications;
 mod pinned_chats;
+mod poll_create;
 mod reactions;
 mod read_pause;
 mod read_position;
@@ -279,6 +281,7 @@ fn build_ui(
         message_search_btn: shell.message_search_btn,
         message_search_ui: Rc::new(RefCell::new(None)),
         shared_media_btn: shell.shared_media_btn,
+        poll_create_btn: shell.poll_create_btn,
         shared_media_ui: Rc::new(RefCell::new(None)),
         hidden_chats_ui: Rc::new(RefCell::new(None)),
         friends_ui: Rc::new(RefCell::new(None)),
@@ -355,6 +358,7 @@ fn build_ui(
             .connect_clicked(move |_| shared_media::open(&s));
     }
     message_search::wire(&state);
+    poll_create::wire(&state);
     chat_filter::wire(&state);
     hidden_chats::wire(&state);
     contact_blocks::wire(&state);
@@ -1257,6 +1261,9 @@ fn apply_ui_language(state: &AppState) {
         .shared_media_btn
         .set_label(&crate::i18n::t("shared_media"));
     state
+        .poll_create_btn
+        .set_label(&crate::i18n::t("poll_create"));
+    state
         .album_btn
         .set_tooltip_text(Some(&crate::i18n::t("albums")));
     state.side_title.set_text(&crate::i18n::t("chats"));
@@ -1873,6 +1880,7 @@ fn prepare_chat_header(state: &AppState, chat: &ChatInfo) {
     update_mute_btn(state, chat.muted);
     state.media_queue.borrow_mut().clear();
     state.shared_media_btn.set_sensitive(true);
+    state.poll_create_btn.set_sensitive(true);
 }
 
 fn open_chat(state: &AppState, chat: &ChatInfo) {

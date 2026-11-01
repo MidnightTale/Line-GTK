@@ -167,6 +167,23 @@ export function createMessageView(runtime: MessageViewRuntime) {
         root = null;
       }
     }
+    const firstText = (node: unknown, depth = 0): string => {
+      if (!node || typeof node !== "object" || depth > 12) return "";
+      if (Array.isArray(node)) {
+        for (const n of node) {
+          const t = firstText(n, depth + 1);
+          if (t) return t;
+        }
+        return "";
+      }
+      const o = node as Record<string, unknown>;
+      if (typeof o.text === "string" && o.text.trim()) return o.text.trim();
+      for (const v of Object.values(o)) {
+        const t = firstText(v, depth + 1);
+        if (t) return t;
+      }
+      return "";
+    };
     const texts: string[] = [];
     const actions: Json[] = [];
     const seen = new Set<string>();
@@ -185,7 +202,15 @@ export function createMessageView(runtime: MessageViewRuntime) {
       }
       if (o.action && typeof o.action === "object") {
         const a = o.action as Record<string, unknown>;
-        const label = String(a.label || o.text || a.data || a.uri || "Action");
+        // LINE's own templates (e.g. polls) set the literal label "action";
+        // show the text inside the tapped box instead.
+        const explicit = typeof a.label === "string" &&
+            a.label.trim().toLowerCase() !== "action"
+          ? a.label.trim()
+          : "";
+        const label = String(
+          explicit || o.text || firstText(o) || a.data || a.uri || "Action",
+        );
         const kind = String(a.type || "postback").toLowerCase();
         const data = a.data != null ? String(a.data) : null;
         const uri = a.uri != null

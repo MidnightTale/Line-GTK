@@ -38,6 +38,7 @@ import {
 } from "./e2ee_guard.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
+import { createLinePollService, type PollClient } from "./line_polls.ts";
 import { patchMediaDecryption } from "./media_crypto.ts";
 import { patchGroupKeyRecovery } from "./group_key_recovery.ts";
 import { createMediaCache } from "./media_cache.ts";
@@ -331,6 +332,9 @@ const stickers = createStickerService({
   fail,
 });
 
+const linePolls = createLinePollService(() =>
+  client as unknown as PollClient | null
+);
 const outgoingMedia = createOutgoingMedia({
   getClient: () => client,
   mediaDir,
@@ -2359,6 +2363,7 @@ async function handle(req: Json) {
         "send_media",
         "send_sticker",
         "send_postback",
+        "poll_create",
         "react_message",
         "call_start",
       ].includes(method) &&
@@ -2875,6 +2880,60 @@ async function handle(req: Json) {
         break;
       case "call_set_audio": {
         ok(id, calls.updateCallAudio(params));
+        break;
+      }
+      case "poll_get": {
+        try {
+          ok(
+            id,
+            await linePolls.get(
+              String(params.chatMid ?? ""),
+              String(params.pollId ?? ""),
+            ),
+          );
+        } catch (e) {
+          fail(id, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "poll_create": {
+        try {
+          const draft = (params.poll ?? {}) as Record<string, unknown>;
+          ok(
+            id,
+            await linePolls.create(String(params.chatMid ?? ""), {
+              title: String(draft.title ?? ""),
+              choices: Array.isArray(draft.choices)
+                ? draft.choices.map(String)
+                : [],
+              multiple: draft.multiple === true,
+              anonymous: draft.anonymous === true,
+              allowNewChoices: draft.allowNewChoices === true,
+              closeDate: typeof draft.closeDate === "number"
+                ? draft.closeDate
+                : null,
+            }),
+          );
+        } catch (e) {
+          fail(id, e instanceof Error ? e.message : String(e));
+        }
+        break;
+      }
+      case "poll_vote": {
+        try {
+          ok(
+            id,
+            await linePolls.vote(
+              String(params.chatMid ?? ""),
+              String(params.pollId ?? ""),
+              Array.isArray(params.choiceIds)
+                ? params.choiceIds.map(String)
+                : [],
+            ),
+          );
+        } catch (e) {
+          fail(id, e instanceof Error ? e.message : String(e));
+        }
         break;
       }
       case "send_postback": {
