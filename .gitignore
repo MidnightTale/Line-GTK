@@ -5,9 +5,16 @@
 # Local session / secrets
 /data
 protocol/linejs-storage.json
+protocol/line-gtk-protocol
 
 # OS
 .DS_Store
 *~
 protocol/vendor/linejs-call/README.md
+# Downloaded dependencies; keep the pinned verification manifest in Git.
+/protocol/vendor/deps/*
+!/protocol/vendor/deps/manifest.json
 packaging/aur/README.md
+
+# Python helper caches
+__pycache__/

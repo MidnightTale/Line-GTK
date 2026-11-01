@@ -1,0 +1,54 @@
+pkgname=line-gtk-local
+pkgver=0.1.2.r98.gd7f0b94
+pkgrel=${LINE_GTK_PKGREL:-1}
+pkgdesc='LINE GTK with documented fork features, Vietnamese defaults and paged message history'
+arch=('x86_64')
+url='https://github.com/MidnightTale/Line-GTK'
+license=('GPL-3.0-or-later')
+depends=('gtk4' 'libadwaita' 'ffmpeg' 'hicolor-icon-theme')
+makedepends=('cargo' 'deno' 'python' 'rsync')
+optdepends=(
+  'libsecret: save automatic login credentials in the system keyring'
+  'poppler: PDF preview in media viewer'
+  'gst-plugins-good: extra video playback codecs'
+  'gst-libav: extra video playback codecs'
+)
+provides=('line-gtk=0.1.2')
+conflicts=('line-gtk' 'line-gtk-git')
+options=('!strip' '!debug' '!lto')
+SRC="${LINE_GTK_SRC:?set LINE_GTK_SRC}"
+
+prepare() {
+  rsync -a --delete --exclude target --exclude .git "$SRC/" "$srcdir/Line-GTK/"
+}
+
+build() {
+  cd Line-GTK
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$SRC/target"
+  cargo build --release
+  ./scripts/build-sidecar.sh
+}
+
+package() {
+  cd Line-GTK
+  install -Dm755 "$SRC/target/release/line-gtk" "$pkgdir/usr/bin/line-gtk"
+  install -d "$pkgdir/usr/share/line-gtk"
+  cp -a protocol "$pkgdir/usr/share/line-gtk/protocol"
+  cp -a assets "$pkgdir/usr/share/line-gtk/assets"
+  rm -rf "$pkgdir/usr/share/line-gtk/protocol/node_modules" \
+         "$pkgdir/usr/share/line-gtk/protocol/.deno" 2>/dev/null || true
+  install -Dm644 packaging/dev.linegtk.LineGtk.desktop \
+    "$pkgdir/usr/share/applications/dev.linegtk.LineGtk.desktop"
+  for size in 48x48 64x64 128x128 256x256; do
+    install -Dm644 "assets/icons/hicolor/${size}/apps/line-gtk.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}/apps/line-gtk.png"
+  done
+  install -Dm644 assets/icons/hicolor/scalable/apps/line-gtk.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/line-gtk.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  for doc in docs/*.md; do
+    install -Dm644 "$doc" "$pkgdir/usr/share/doc/$pkgname/docs/${doc##*/}"
+  done
+}

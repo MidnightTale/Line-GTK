@@ -1,290 +1,7 @@
 use super::*;
 
 pub(super) fn open_sticker_picker(state: &AppState) {
-    if state.current_chat.borrow().is_none() {
-        toast(state, &crate::i18n::t("select_chat_first"));
-        return;
-    }
-    if !*state.session_ready.borrow() {
-        toast(state, &crate::i18n::t("still_restoring"));
-        return;
-    }
-    // Show a loading placeholder while the sidecar lists / caches thumbs.
-    let loading = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .margin_top(24)
-        .margin_bottom(24)
-        .margin_start(28)
-        .margin_end(28)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .build();
-    let spin = gtk::Spinner::builder().spinning(true).build();
-    spin.set_size_request(28, 28);
-    let label = gtk::Label::builder()
-        .label(crate::i18n::t("loading_stickers"))
-        .css_classes(["dim-label"])
-        .build();
-    loading.append(&spin);
-    loading.append(&label);
-    state.sticker_popover.set_child(Some(&loading));
-    state.sticker_popover.popup();
-
-    match state.sidecar.list_stickers() {
-        Ok(id) => {
-            state.pending.borrow_mut().insert(id, Pending::ListStickers);
-        }
-        Err(e) => {
-            state.sticker_popover.popdown();
-            toast(
-                state,
-                &crate::i18n::tf("sticker_send_failed", &[("error", &e.to_string())]),
-            );
-        }
-    }
-}
-
-pub(super) fn fill_sticker_popover(state: &AppState, result: &serde_json::Value) {
-    let packs = result
-        .get("packs")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    if packs.is_empty() {
-        let empty = gtk::Label::builder()
-            .label(crate::i18n::t("stickers_empty"))
-            .css_classes(["dim-label"])
-            .margin_top(24)
-            .margin_bottom(24)
-            .margin_start(20)
-            .margin_end(20)
-            .build();
-        state.sticker_popover.set_child(Some(&empty));
-        return;
-    }
-
-    let root = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(0)
-        .css_classes(["line-sticker-chooser"])
-        .build();
-
-    let title = gtk::Label::builder()
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .css_classes(["heading", "line-sticker-pack-title"])
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(10)
-        .margin_bottom(6)
-        .build();
-
-    let pages = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .transition_duration(120)
-        .vexpand(true)
-        .hexpand(true)
-        .css_classes(["line-sticker-pages"])
-        .build();
-
-    let tab_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .hexpand(true)
-        .css_classes(["line-sticker-tabs-scroll"])
-        .build();
-    let tabs = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(4)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_top(6)
-        .margin_bottom(8)
-        .css_classes(["line-sticker-tabs"])
-        .build();
-    tab_scroll.set_child(Some(&tabs));
-
-    let tab_buttons: Rc<RefCell<Vec<gtk::ToggleButton>>> = Rc::new(RefCell::new(Vec::new()));
-
-    for (idx, pack) in packs.iter().enumerate() {
-        let pack_id = pack
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let pack_name = pack
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Stickers")
-            .to_string();
-        let is_recent = pack
-            .get("recent")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || pack_id == "__recent__";
-        let display_name = if is_recent {
-            crate::i18n::t("stickers_recent")
-        } else {
-            pack_name.clone()
-        };
-
-        let scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .vexpand(true)
-            .hexpand(true)
-            .css_classes(["line-sticker-scroll"])
-            .build();
-        let grid = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .max_children_per_line(5)
-            .min_children_per_line(4)
-            .row_spacing(4)
-            .column_spacing(4)
-            .homogeneous(true)
-            .valign(gtk::Align::Start)
-            .css_classes(["line-sticker-grid"])
-            .build();
-
-        let stickers = pack
-            .get("stickers")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        // Lazy-decode: only the first pack loads immediately; others wait until selected.
-        let pending_thumbs: Rc<RefCell<Vec<(gtk::Picture, String)>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let pack_loaded = Rc::new(RefCell::new(idx == 0));
-        for item in stickers {
-            let sticker_id = item
-                .get("stickerId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let package_id = item
-                .get("packageId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let version = item
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if sticker_id.is_empty() || package_id.is_empty() {
-                continue;
-            }
-
-            let btn = gtk::Button::builder()
-                .css_classes(["flat", "line-sticker-cell"])
-                .tooltip_text(&display_name)
-                .build();
-            let pic = gtk::Picture::builder()
-                .content_fit(gtk::ContentFit::Contain)
-                .can_shrink(true)
-                .css_classes(["line-sticker-thumb"])
-                .build();
-            pic.set_size_request(64, 64);
-            let path = item
-                .get("imagePath")
-                .and_then(|v| v.as_str())
-                .filter(|p| !p.is_empty())
-                .map(|s| s.to_string());
-            if idx == 0
-                && let Some(path) = path.clone()
-            {
-                attach_texture_async(pic.clone(), path, 96);
-            }
-            btn.set_child(Some(&pic));
-
-            let s = state.clone();
-            let pop = state.sticker_popover.clone();
-            let image_path = path.clone();
-            btn.connect_clicked(move |_| {
-                pop.popdown();
-                send_sticker_now(
-                    &s,
-                    &sticker_id,
-                    &package_id,
-                    version.as_deref(),
-                    image_path.as_deref(),
-                );
-            });
-            grid.append(&btn);
-            if idx != 0
-                && let Some(path) = path
-            {
-                pending_thumbs.borrow_mut().push((pic, path));
-            }
-        }
-        scroll.set_child(Some(&grid));
-        let page_name = format!("pack-{idx}");
-        pages.add_named(&scroll, Some(&page_name));
-
-        let tab = gtk::ToggleButton::builder()
-            .css_classes(["flat", "circular", "line-sticker-tab"])
-            .tooltip_text(&display_name)
-            .build();
-        if is_recent {
-            tab.set_icon_name("document-open-recent-symbolic");
-        } else {
-            let pic = gtk::Picture::builder()
-                .content_fit(gtk::ContentFit::Contain)
-                .can_shrink(true)
-                .css_classes(["line-sticker-tab-icon"])
-                .build();
-            pic.set_size_request(28, 28);
-            if let Some(path) = pack.get("iconPath").and_then(|v| v.as_str())
-                && !path.is_empty()
-            {
-                attach_texture_async(pic.clone(), path.to_string(), 48);
-            }
-            tab.set_child(Some(&pic));
-        }
-        if idx == 0 {
-            tab.set_active(true);
-            title.set_text(&display_name);
-            pages.set_visible_child_name(&page_name);
-        }
-
-        let pages_c = pages.clone();
-        let title_c = title.clone();
-        let tabs_c = tab_buttons.clone();
-        let page_name_c = page_name.clone();
-        let display_name_c = display_name.clone();
-        let pending_c = pending_thumbs.clone();
-        let loaded_c = pack_loaded.clone();
-        tab.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            for other in tabs_c.borrow().iter() {
-                if other != btn && other.is_active() {
-                    other.set_active(false);
-                }
-            }
-            title_c.set_text(&display_name_c);
-            pages_c.set_visible_child_name(&page_name_c);
-            // Decode this pack's thumbs only the first time it is opened.
-            if !*loaded_c.borrow() {
-                *loaded_c.borrow_mut() = true;
-                for (pic, path) in pending_c.borrow_mut().drain(..) {
-                    attach_texture_async(pic, path, 96);
-                }
-            }
-        });
-
-        tab_buttons.borrow_mut().push(tab.clone());
-        tabs.append(&tab);
-    }
-
-    root.append(&title);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    root.append(&pages);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    root.append(&tab_scroll);
-    state.sticker_popover.set_child(Some(&root));
+    sticker_library::open(state);
 }
 
 pub(super) fn send_sticker_now(
@@ -308,6 +25,10 @@ pub(super) fn send_sticker_now(
                 id,
                 &chat_mid,
                 MessageInfo {
+                    chat_event: None,
+                    emojis: Vec::new(),
+                    mentions: Vec::new(),
+                    reactions: Vec::new(),
                     id: String::new(),
                     text: "[Sticker]".into(),
                     from: String::new(),
@@ -321,6 +42,9 @@ pub(super) fn send_sticker_now(
                     file_path: None,
                     duration_ms: None,
                     flex: None,
+                    call_history: None,
+                    decryption_failed: false,
+                    reply_to: None,
                 },
             );
             dismiss_new_marker(state);
@@ -405,6 +129,7 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
         return false;
     }
 
+    let scope = composer_drafts::scope(state);
     let clipboard = state.composer.clipboard();
     let formats = clipboard.formats();
     let has_files = formats.contains_type(gdk::FileList::static_type())
@@ -429,18 +154,18 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
                             if let Some(path) = file.path()
                                 && path.is_file()
                             {
-                                send_local_media_path(&s, path);
+                                composer_drafts::stage(&s, &scope, path);
                                 any = true;
                             }
                         }
                         if !any {
-                            paste_clipboard_uri_list(&s);
+                            paste_clipboard_uri_list(&s, &scope);
                         }
                     } else {
-                        paste_clipboard_uri_list(&s);
+                        paste_clipboard_uri_list(&s, &scope);
                     }
                 }
-                Err(_) => paste_clipboard_uri_list(&s),
+                Err(_) => paste_clipboard_uri_list(&s, &scope),
             },
         );
         return true;
@@ -450,13 +175,13 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
         let s = state.clone();
         clipboard.read_texture_async(None::<&gio::Cancellable>, move |res| match res {
             Ok(Some(tex)) => match save_clipboard_texture_png(&s, &tex) {
-                Ok(path) => send_local_media_path(&s, path),
+                Ok(path) => composer_drafts::stage(&s, &scope, path),
                 Err(e) => toast(
                     &s,
                     &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
                 ),
             },
-            _ => paste_clipboard_image_bytes(&s),
+            _ => paste_clipboard_image_bytes(&s, &scope),
         });
         return true;
     }
@@ -464,7 +189,8 @@ pub(super) fn try_paste_clipboard_attachment(state: &AppState) -> bool {
     false
 }
 
-pub(super) fn paste_clipboard_uri_list(state: &AppState) {
+fn paste_clipboard_uri_list(state: &AppState, scope: &composer_drafts::Scope) {
+    let scope = scope.clone();
     let clipboard = state.composer.clipboard();
     let s = state.clone();
     clipboard.read_async(
@@ -490,14 +216,15 @@ pub(super) fn paste_clipboard_uri_list(state: &AppState) {
                 if let Some(path) = file.path()
                     && path.is_file()
                 {
-                    send_local_media_path(&s, path);
+                    composer_drafts::stage(&s, &scope, path);
                 }
             }
         },
     );
 }
 
-pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
+fn paste_clipboard_image_bytes(state: &AppState, scope: &composer_drafts::Scope) {
+    let scope = scope.clone();
     let clipboard = state.composer.clipboard();
     let s = state.clone();
     clipboard.read_async(
@@ -524,7 +251,7 @@ pub(super) fn paste_clipboard_image_bytes(state: &AppState) {
                 "png"
             };
             match write_clipboard_bytes(&s, &bytes, ext) {
-                Ok(path) => send_local_media_path(&s, path),
+                Ok(path) => composer_drafts::stage(&s, &scope, path),
                 Err(e) => toast(
                     &s,
                     &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
@@ -572,20 +299,24 @@ pub(super) fn write_clipboard_bytes(
 }
 
 pub(super) fn send_local_media_path(state: &AppState, path: PathBuf) {
+    try_send_local_media_path(state, path);
+}
+
+pub(super) fn try_send_local_media_path(state: &AppState, path: PathBuf) -> bool {
     let Some(chat_mid) = state.current_chat.borrow().clone() else {
         toast(state, &crate::i18n::t("select_chat_first"));
-        return;
+        return false;
     };
     if !*state.session_ready.borrow() {
         toast(state, &crate::i18n::t("still_restoring"));
-        return;
+        return false;
     }
     if !path.is_file() {
         toast(
             state,
             &crate::i18n::tf("media_send_failed", &[("error", "not a file")]),
         );
-        return;
+        return false;
     }
 
     let o_type = guess_media_o_type(&path);
@@ -601,7 +332,7 @@ pub(super) fn send_local_media_path(state: &AppState, path: PathBuf) {
                 state,
                 &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
             );
-            return;
+            return false;
         }
     };
     let path_str = cached.to_string_lossy().to_string();
@@ -650,6 +381,10 @@ pub(super) fn send_local_media_path(state: &AppState, path: PathBuf) {
                 id,
                 &chat_mid,
                 MessageInfo {
+                    chat_event: None,
+                    emojis: Vec::new(),
+                    mentions: Vec::new(),
+                    reactions: Vec::new(),
                     id: String::new(),
                     text,
                     from: String::new(),
@@ -663,16 +398,23 @@ pub(super) fn send_local_media_path(state: &AppState, path: PathBuf) {
                     file_path,
                     duration_ms: duration_ms.map(|v| v as i64),
                     flex: None,
+                    call_history: None,
+                    decryption_failed: false,
+                    reply_to: None,
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));
             dismiss_new_marker(state);
             pin_messages_to_latest(state);
+            true
         }
-        Err(e) => toast(
-            state,
-            &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
-        ),
+        Err(e) => {
+            toast(
+                state,
+                &crate::i18n::tf("media_send_failed", &[("error", &e.to_string())]),
+            );
+            false
+        }
     }
 }
 
@@ -864,6 +606,10 @@ pub(super) fn finish_voice_record(state: &AppState, send: bool) {
                 id,
                 &chat_mid,
                 MessageInfo {
+                    chat_event: None,
+                    emojis: Vec::new(),
+                    mentions: Vec::new(),
+                    reactions: Vec::new(),
                     id: String::new(),
                     text: "Voice message".into(),
                     from: String::new(),
@@ -877,6 +623,9 @@ pub(super) fn finish_voice_record(state: &AppState, send: bool) {
                     file_path: Some(path_str),
                     duration_ms: Some(duration_ms as i64),
                     flex: None,
+                    call_history: None,
+                    decryption_failed: false,
+                    reply_to: None,
                 },
             );
             show_upload_progress(state, 0.02, &crate::i18n::t("media_uploading"));

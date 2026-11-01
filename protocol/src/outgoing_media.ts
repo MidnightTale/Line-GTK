@@ -1,8 +1,38 @@
 import type { Client } from "@evex/linejs";
 import { join } from "@std/path";
 import { Buffer } from "node:buffer";
+import {
+  needsGroupKeyRecreation,
+  recreateGroupKey,
+} from "./group_key_recovery.ts";
 
 type Json = Record<string, unknown>;
+
+// プレビュー画像やHTMLを動画として保存せず、コンテナの先頭で判別する。
+export function videoContainer(bytes: Uint8Array): "mp4" | "webm" | null {
+  if (bytes.length < 32) return null;
+  if (String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp") return "mp4";
+  if (
+    bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf &&
+    bytes[3] === 0xa3
+  ) return "webm";
+  return null;
+}
+
+async function cachedVideo(path: string): Promise<boolean> {
+  try {
+    const file = await Deno.open(path);
+    try {
+      const header = new Uint8Array(32);
+      const size = await file.read(header);
+      return size === 32 && videoContainer(header) !== null;
+    } finally {
+      file.close();
+    }
+  } catch {
+    return false;
+  }
+}
 
 export type OutgoingMediaRuntime = {
   getClient: () => Client | null;
@@ -138,7 +168,13 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
 
   async function makeImagePreviewBlob(filePath: string): Promise<Blob | null> {
     try {
-      const dest = join(mediaDir, `preview-${Date.now()}.jpg`);
+      // GIF previews must retain alpha too: recipients may display this still
+      // before downloading the original animation.
+      const transparent = /\.(png|gif)$/i.test(filePath);
+      const dest = join(
+        mediaDir,
+        `preview-${Date.now()}.${transparent ? "png" : "jpg"}`,
+      );
       const p = new Deno.Command("ffmpeg", {
         args: [
           "-y",
@@ -147,7 +183,7 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
           "-i",
           filePath,
           "-vf",
-          "scale=640:640:force_original_aspect_ratio=decrease",
+          "scale=w='min(iw,640)':h='min(ih,640)':force_original_aspect_ratio=decrease",
           "-frames:v",
           "1",
           "-q:v",
@@ -163,7 +199,9 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
       try {
         await Deno.remove(dest);
       } catch { /* ignore */ }
-      return new Blob([buf], { type: "image/jpeg" });
+      return new Blob([buf], {
+        type: transparent ? "image/png" : "image/jpeg",
+      });
     } catch {
       return null;
     }
@@ -208,7 +246,9 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
     if (isImageBytes(buf)) {
       return await writeImageFile(thumbDest(messageId), buf);
     }
-    const vdest = mediaDest(messageId, "mp4");
+    const ext = videoContainer(buf);
+    if (!ext) return null;
+    const vdest = mediaDest(messageId, ext);
     try {
       await Deno.writeFile(vdest, buf);
     } catch (e) {
@@ -364,13 +404,6 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
       }
     }
 
-    report(0.78, "Sending…");
-    const chunks = await e2ee.encryptE2EEMessage(
-      opts.to,
-      { keyMaterial, fileName: opts.filename || `line.${ext}` },
-      contentTypeNum,
-    );
-
     const meta: Record<string, string> = {
       SID: obsNamespace,
       OID: objId,
@@ -396,14 +429,34 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
       });
     }
 
-    report(0.92, "Finishing…");
-    return await client.base.talk.sendMessage({
-      to: opts.to,
-      chunks,
-      // deno-lint-ignore no-explicit-any
-      contentType: contentTypeNum as any,
-      contentMetadata: meta,
-    }) as { id?: unknown; createdTime?: unknown; contentType?: unknown };
+    for (let attempt = 0;; attempt++) {
+      report(0.78, "Sending…");
+      // Fetch the current group key on each encryption. If membership changed
+      // during the send, recreate the key and rebuild only the envelope.
+      const chunks = await e2ee.encryptE2EEMessage(
+        opts.to,
+        { keyMaterial, fileName: opts.filename || `line.${ext}` },
+        contentTypeNum,
+      );
+      report(0.92, "Finishing…");
+      try {
+        return await client.base.talk.sendMessage({
+          to: opts.to,
+          chunks,
+          // deno-lint-ignore no-explicit-any
+          contentType: contentTypeNum as any,
+          contentMetadata: meta,
+          // Suppress linejs's implicit retry with these same encrypted chunks.
+          e2ee: true,
+        }) as { id?: unknown; createdTime?: unknown; contentType?: unknown };
+      } catch (error) {
+        if (
+          attempt !== 0 || !opts.to.startsWith("c") ||
+          !needsGroupKeyRecreation(error)
+        ) throw error;
+        await recreateGroupKey(client.base, opts.to);
+      }
+    }
   }
 
   async function doSendMedia(
@@ -481,52 +534,18 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
       let sent:
         | { id?: unknown; createdTime?: unknown; contentType?: unknown }
         | null = null;
-      let lastErr: unknown = null;
-
       if (supportsE2EEMedia(chatMid)) {
-        try {
-          sent = await sendE2EEMedia({
-            to: chatMid,
-            oType,
-            data: blob,
-            filename: name,
-            durationMs: dur,
-            preview,
-            onProgress: report,
-          });
-        } catch (e1) {
-          lastErr = e1;
-          console.error("[send_media e2ee]", e1);
-          report(0.4, "Retrying upload…");
-          try {
-            sent = await client.base.obs.uploadMediaByE2EE({
-              to: chatMid,
-              oType,
-              data: blob,
-              filename: name,
-              preview,
-            }) as typeof sent;
-            report(0.9, "Finishing…");
-          } catch (e2) {
-            lastErr = e2;
-            console.error("[send_media uploadMediaByE2EE]", e2);
-          }
-        }
-        if (!sent) {
-          emitEvent("upload_progress", {
-            chatMid,
-            progress: 0,
-            label: "",
-            done: true,
-          });
-          fail(
-            id,
-            lastErr instanceof Error
-              ? lastErr.message
-              : String(lastErr ?? "e2ee_media_failed"),
-          );
-          return;
-        }
+        // A timeout may arrive after LINE accepted the message. Starting a
+        // second upload here can send a duplicate, so propagate uncertain errors.
+        sent = await sendE2EEMedia({
+          to: chatMid,
+          oType,
+          data: blob,
+          filename: name,
+          durationMs: dur,
+          preview,
+          onProgress: report,
+        });
       } else {
         try {
           report(0.4, "Uploading…");
@@ -670,14 +689,83 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
     return "bin";
   }
 
+  // Downloads share one patched `fetch`, so they run one at a time to keep
+  // byte counts attributed to the right message.
+  let downloadChain: Promise<unknown> = Promise.resolve();
+
+  /** Count response bytes of the client's fetches and emit download_progress. */
+  async function withDownloadProgress<T>(
+    chatMid: string,
+    messageId: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const base = runtime.getClient()?.base as
+      | { fetch: typeof fetch }
+      | undefined;
+    if (!base) return await run();
+    const original = base.fetch;
+    let lastEmit = 0;
+    const emit = (progress: number) => {
+      emitEvent("download_progress", { chatMid, messageId, progress });
+    };
+    base.fetch = async (...args: Parameters<typeof fetch>) => {
+      const res = await original(...args);
+      const total = Number(res.headers.get("content-length") ?? 0);
+      if (!res.body || !res.ok || !(total > 0)) return res;
+      let received = 0;
+      const counted = res.body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            received += chunk.length;
+            const now = Date.now();
+            if (now - lastEmit >= 100) {
+              lastEmit = now;
+              emit(Math.min(received / total, 0.99));
+            }
+            controller.enqueue(chunk);
+          },
+        }),
+      );
+      return new Response(counted, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
+    };
+    try {
+      emit(0);
+      return await run();
+    } finally {
+      base.fetch = original;
+    }
+  }
+
   /**
    * Download full media bytes for a message (E2EE-aware) into the local cache.
    * Used for save-as / full-view video / file open.
    */
-  async function doDownloadMedia(
+  function doDownloadMedia(
     id: number | string | null,
     chatMid: string,
     messageId: string,
+    contentTypeHint = "",
+  ) {
+    const job = downloadChain.then(() =>
+      withDownloadProgress(
+        chatMid,
+        messageId,
+        () => downloadMediaNow(id, chatMid, messageId, contentTypeHint),
+      )
+    );
+    downloadChain = job.catch(() => {});
+    return job;
+  }
+
+  async function downloadMediaNow(
+    id: number | string | null,
+    chatMid: string,
+    messageId: string,
+    contentTypeHint = "",
   ) {
     const client = runtime.getClient();
     if (!client) {
@@ -689,7 +777,9 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
       return;
     }
     try {
-      let hintCt = "FILE";
+      let hintCt = ["IMAGE", "VIDEO", "AUDIO", "FILE"].includes(contentTypeHint)
+        ? contentTypeHint
+        : "FILE";
       let fileName: string | null = null;
       try {
         const cached = getCachedMessages(chatMid)?.find((m) =>
@@ -711,6 +801,7 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
         fullDest(messageId, "webp"),
         fullDest(messageId, "gif"),
         mediaDest(messageId, "mp4"),
+        mediaDest(messageId, "webm"),
         mediaDest(messageId, "m4a"),
         mediaDest(messageId, "mp3"),
         mediaDest(messageId, "jpg"),
@@ -720,7 +811,9 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
         mediaDest(messageId, "bin"),
       ];
       if (fileName) {
-        localCandidates.unshift(join(mediaDir, `${messageId}.${fileName}`));
+        localCandidates.unshift(
+          join(mediaDir, `${messageId}.${fileName.replace(/[\/\\]/g, "_")}`),
+        );
       }
       for (const p of localCandidates) {
         const hit = await existingFile(p);
@@ -729,12 +822,7 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
         if (hit.includes(".thumb.")) continue;
         try {
           const st = await Deno.stat(hit);
-          if (
-            hintCt === "VIDEO" && /\.(jpe?g|png|webp)$/i.test(hit) &&
-            st.size < 200_000
-          ) {
-            continue;
-          }
+          if (hintCt === "VIDEO" && !await cachedVideo(hit)) continue;
           if (hintCt === "IMAGE") {
             // Skip polluted preview files that were cached into mediaDest.
             if (await isPreviewOrThumbImage(hit)) continue;
@@ -759,6 +847,10 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
         fail(id, "download_failed");
         return;
       }
+      if (hintCt === "VIDEO" && !videoContainer(got.buf)) {
+        fail(id, "video_original_unavailable");
+        return;
+      }
       let dest: string;
       if (hintCt === "IMAGE" && isImageBytes(got.buf)) {
         const written = await writeFullImage(messageId, got.buf, got.mime);
@@ -768,7 +860,8 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
         }
         dest = written;
       } else {
-        const ext = sniffMediaExt(got.buf, hintCt, fileName);
+        const ext = (hintCt === "VIDEO" ? videoContainer(got.buf) : null) ??
+          sniffMediaExt(got.buf, hintCt, fileName);
         dest = join(
           mediaDir,
           fileName && fileName.includes(".")

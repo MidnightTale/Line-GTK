@@ -35,17 +35,22 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
+      - name: Download and verify pinned protocol sources
+        working-directory: .
+        run: python3 scripts/vendor-protocol.py --ensure
+      - name: Test dependency preparation
+        working-directory: .
+        run: python3 -m unittest discover -s scripts/tests -p '*_test.py'
+      - name: Install image conversion tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: deno task check
       - name: Compile offline sidecar
         working-directory: .
-        run: ./scripts/build-sidecar.sh
-      - name: Verify compiled sidecar starts without network access
+        run: DENO_OFFLINE=1 ./scripts/build-sidecar.sh
+      - name: Verify compiled sidecar with an empty session and cache
         working-directory: .
         run: |
-          data_dir="$RUNNER_TEMP/line-gtk-offline"
-          mkdir -p "$data_dir"
-          timeout 3 env LINE_GTK_DATA="$data_dir" protocol/line-gtk-protocol > "$RUNNER_TEMP/sidecar.out" || test $? = 124
-          grep -q '"event":"ready"' "$RUNNER_TEMP/sidecar.out"
+          python3 scripts/check-sidecar.py protocol/line-gtk-protocol
 
   package:
     runs-on: ubuntu-24.04
@@ -60,6 +65,30 @@ jobs:
       - name: Install runtime and build libraries
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev ffmpeg
       - run: ./packaging/make-prebuild.sh
+
+  aur-package:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Arch build dependencies
+        run: pacman -Syu --noconfirm --needed rust deno git python gtk4 libadwaita ffmpeg
+      - name: Build the current checkout through makepkg
+        run: |
+          useradd --create-home builder
+          mkdir -p /tmp/line-gtk-aur/src
+          cp packaging/aur/line-gtk-git/PKGBUILD /tmp/line-gtk-aur/
+          cp -a "$GITHUB_WORKSPACE" /tmp/line-gtk-aur/src/Line-GTK
+          chown -R builder:builder /tmp/line-gtk-aur
+          runuser -u builder -- bash -c '
+            set -e
+            cd /tmp/line-gtk-aur/src/Line-GTK
+            cargo fetch --locked
+            cd /tmp/line-gtk-aur
+            makepkg --noextract --noprepare --holdver --noconfirm
+          '
+      - name: Test the final Arch package after makepkg post-processing
+        run: ./packaging/check-package.sh /tmp/line-gtk-aur/*.pkg.tar.zst
 
   flatpak:
     runs-on: ubuntu-24.04

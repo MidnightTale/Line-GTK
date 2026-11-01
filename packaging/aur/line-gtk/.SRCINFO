@@ -1,7 +1,7 @@
 pkgbase = line-gtk
 	pkgdesc = Unofficial native LINE client for Linux (GTK4 / Libadwaita)
 	pkgver = 0.1.2
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/MidnightTale/Line-GTK
 	arch = x86_64
 	license = GPL-3.0-or-later
@@ -9,10 +9,14 @@ pkgbase = line-gtk
 	depends = libadwaita
 	depends = ffmpeg
 	depends = hicolor-icon-theme
+	optdepends = libsecret: save automatic login credentials in the system keyring
 	optdepends = poppler: PDF preview in media viewer
 	optdepends = gst-plugins-good: extra video playback codecs
 	optdepends = gst-libav: extra video playback codecs
 	conflicts = line-gtk-git
+	options = !strip
+	options = !debug
+	options = !lto
 	source = line-gtk-0.1.2-x86_64.tar.gz::https://github.com/MidnightTale/Line-GTK/releases/download/v0.1.2/line-gtk-0.1.2-x86_64.tar.gz
 	sha256sums = 28575f4db2543079b034898c326f78623a6c679e5a6f6024f0abc9ae63e774ed
 

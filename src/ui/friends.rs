@@ -51,7 +51,7 @@ pub fn open_friends(parent: &impl IsA<gtk::Window>, deps: FriendsDeps) -> Friend
         .orientation(gtk::Orientation::Vertical)
         .spacing(0)
         .build();
-    root.append(&header);
+    window.set_titlebar(Some(&header));
 
     let search = gtk::SearchEntry::builder()
         .placeholder_text(i18n::t("friends_search"))

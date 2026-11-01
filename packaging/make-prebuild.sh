@@ -23,6 +23,7 @@ echo "==> compiling offline protocol sidecar"
 ./scripts/build-sidecar.sh "$OUT_DIR/protocol/line-gtk-protocol"
 cp -a packaging/dev.linegtk.LineGtk.desktop "$OUT_DIR/" 2>/dev/null || true
 cp -a README.md LICENSE "$OUT_DIR/" 2>/dev/null || true
+cp -a docs "$OUT_DIR/"
 rm -rf "$OUT_DIR/protocol/node_modules" "$OUT_DIR/protocol/.deno" 2>/dev/null || true
 
 echo "==> packing ${OUT_TAR}"

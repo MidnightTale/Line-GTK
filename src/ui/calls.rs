@@ -9,6 +9,14 @@ pub(super) fn refresh_call_controls(state: &AppState) {
         state.call_btn.set_tooltip_text(None);
         return;
     }
+    if state.session_device.borrow().as_str() == "DESKTOPWIN" {
+        state.call_btn.set_visible(true);
+        state.call_btn.set_sensitive(false);
+        state
+            .call_btn
+            .set_tooltip_text(Some(&crate::i18n::t("login_email_calls_note")));
+        return;
+    }
     state.call_btn.set_visible(true);
     state.call_btn.remove_css_class("line-call-locked");
     let can_call = state
@@ -38,6 +46,7 @@ pub(super) fn refresh_call_controls(state: &AppState) {
 
 pub(super) fn calls_experimental_enabled(state: &AppState) -> bool {
     state.config.borrow().experimental_calls
+        && state.session_device.borrow().as_str() != "DESKTOPWIN"
 }
 
 pub(super) fn call_error_toast(state: &AppState, err: &str) {

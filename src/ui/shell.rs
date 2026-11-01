@@ -5,7 +5,14 @@ pub struct ShellWidgets {
     pub chat_list: gtk::ListBox,
     pub message_list: super::virtual_list::VirtualMessageList,
     pub message_scroll: gtk::ScrolledWindow,
-    pub composer: gtk::Entry,
+    pub composer: gtk::TextView,
+    pub composer_placeholder: gtk::Label,
+    pub composer_emoji: gtk::Button,
+    pub attachment_preview: gtk::Box,
+    pub reply_preview: gtk::Revealer,
+    pub reply_title: gtk::Label,
+    pub reply_text: gtk::Label,
+    pub reply_cancel: gtk::Button,
     pub composer_row: gtk::Box,
     pub composer_stack: gtk::Stack,
     pub record_cancel_btn: gtk::Button,
@@ -18,12 +25,20 @@ pub struct ShellWidgets {
     pub conversation: gtk::Box,
     pub send_btn: gtk::Button,
     pub status: gtk::Label,
+    pub read_pause_switch: gtk::Switch,
+    pub read_pause_label: gtk::Label,
+    pub read_pause_box: gtk::Box,
+    pub read_once_btn: gtk::Button,
+    pub last_read_btn: gtk::Button,
     pub profile_label: gtk::Label,
     pub profile_avatar: gtk::Picture,
     pub brand_label: gtk::Label,
     pub brand_icon: gtk::Image,
+    pub chat_header: gtk::Box,
+    pub chat_avatar_frame: gtk::Box,
     pub chat_title: gtk::Label,
     pub chat_subtitle: gtk::Label,
+    pub sync_spinner: gtk::Spinner,
     pub side_stack: gtk::Stack,
     pub side_spinner: gtk::Spinner,
     pub side_empty: gtk::Label,
@@ -35,8 +50,16 @@ pub struct ShellWidgets {
     pub msg_idle: gtk::Label,
     pub settings_btn: gtk::Button,
     pub friends_btn: gtk::Button,
+    pub album_btn: gtk::Button,
+    pub message_search_btn: gtk::Button,
+    pub shared_media_btn: gtk::Button,
+    pub poll_create_btn: gtk::Button,
     pub side_title: gtk::Label,
     pub search_entry: gtk::SearchEntry,
+    pub chat_filter_bar: gtk::Box,
+    pub chat_filter_btn: gtk::MenuButton,
+    pub chat_filter_label: gtk::Label,
+    pub compact_filter_btn: gtk::MenuButton,
     pub compact_search_btn: gtk::Button,
     pub compact_search_entry: gtk::SearchEntry,
     pub mic_btn: gtk::Button,
@@ -67,6 +90,20 @@ pub fn build_shell_page() -> ShellWidgets {
         .icon_name("line-gtk")
         .pixel_size(22)
         .css_classes(["line-app-brand-icon"])
+        .build();
+    // KDE may put the application icon in the window controls. Keep our
+    // brand icon only when the desktop layout does not already show one.
+    header
+        .settings()
+        .bind_property("gtk-decoration-layout", &brand_icon, "visible")
+        .transform_to(|_, layout: Option<String>| {
+            Some(
+                !layout.is_some_and(|layout| {
+                    layout.split([',', ':']).any(|control| control == "icon")
+                }),
+            )
+        })
+        .sync_create()
         .build();
     let brand_label = gtk::Label::builder()
         .label("LINE GTK")
@@ -126,6 +163,18 @@ pub fn build_shell_page() -> ShellWidgets {
         .build();
     header.pack_end(&settings_btn);
     header.pack_end(&friends_btn);
+
+    let read_pause_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    let read_pause_label = gtk::Label::builder().css_classes(["caption"]).build();
+    let read_pause_box = gtk::Box::builder()
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .css_classes(["line-read-pause"])
+        .build();
+    read_pause_box.append(&gtk::Image::from_icon_name("view-conceal-symbolic"));
+    read_pause_box.append(&read_pause_label);
+    read_pause_box.append(&read_pause_switch);
+    header.pack_end(&read_pause_box);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -199,6 +248,40 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["line-search"])
         .build();
 
+    let chat_filter_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_bottom(8)
+        .build();
+    let filter_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let filter_icon = gtk::Image::from_icon_name("view-filter-symbolic");
+    filter_icon.set_accessible_role(gtk::AccessibleRole::Presentation);
+    filter_content.append(&filter_icon);
+    let chat_filter_label = gtk::Label::builder()
+        .label(crate::i18n::t("chat_filter_all"))
+        .xalign(0.0)
+        .hexpand(true)
+        .wrap(true)
+        .build();
+    filter_content.append(&chat_filter_label);
+    let filter_arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+    filter_arrow.set_accessible_role(gtk::AccessibleRole::Presentation);
+    filter_content.append(&filter_arrow);
+    let chat_filter_btn = gtk::MenuButton::builder()
+        .child(&filter_content)
+        .hexpand(true)
+        .css_classes(["flat", "line-chat-filter"])
+        .build();
+    chat_filter_bar.append(&chat_filter_btn);
+    let compact_filter_btn = gtk::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .css_classes(["flat", "circular"])
+        .halign(gtk::Align::Center)
+        .visible(false)
+        .build();
+
     let side_stack = gtk::Stack::builder()
         .vexpand(true)
         .hexpand(true)
@@ -247,6 +330,8 @@ pub fn build_shell_page() -> ShellWidgets {
     sidebar.append(&side_header);
     sidebar.append(&compact_search_btn);
     sidebar.append(&search_entry);
+    sidebar.append(&chat_filter_bar);
+    sidebar.append(&compact_filter_btn);
     sidebar.append(&side_stack);
 
     // ---- Conversation ----
@@ -269,7 +354,6 @@ pub fn build_shell_page() -> ShellWidgets {
     let title_col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
-        .hexpand(true)
         .build();
     let chat_title = gtk::Label::builder()
         .label(crate::i18n::t("select_chat"))
@@ -282,8 +366,33 @@ pub fn build_shell_page() -> ShellWidgets {
         .xalign(0.0)
         .css_classes(["dim-label", "caption"])
         .build();
+    // Small sign that the chat is refreshing; the conversation stays usable.
+    let sync_spinner = gtk::Spinner::builder()
+        .visible(false)
+        .valign(gtk::Align::Center)
+        .build();
+    sync_spinner.set_size_request(10, 10);
+    let subtitle_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    subtitle_row.append(&chat_subtitle);
+    subtitle_row.append(&sync_spinner);
     title_col.append(&chat_title);
-    title_col.append(&chat_subtitle);
+    title_col.append(&subtitle_row);
+    let chat_avatar_frame = gtk::Box::builder()
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .css_classes(["line-avatar-frame", "line-avatar-xs"])
+        .build();
+    let chat_header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .css_classes(["line-chat-header"])
+        .build();
+    chat_header.append(&chat_avatar_frame);
+    chat_header.append(&title_col);
+    let chat_bar_spacer = gtk::Box::builder().hexpand(true).build();
     let call_btn = gtk::Button::builder()
         .icon_name("call-start-symbolic")
         .tooltip_text("Voice call")
@@ -297,7 +406,61 @@ pub fn build_shell_page() -> ShellWidgets {
         .css_classes(["flat", "circular"])
         .sensitive(false)
         .build();
-    chat_bar.append(&title_col);
+    chat_bar.append(&chat_header);
+    chat_bar.append(&chat_bar_spacer);
+    let read_once_btn = gtk::Button::builder()
+        .label(crate::i18n::t("mark_read_once"))
+        .tooltip_text(crate::i18n::t("mark_read_once_tooltip"))
+        .css_classes(["flat"])
+        .visible(false)
+        .build();
+    chat_bar.append(&read_once_btn);
+    let last_read_btn = gtk::Button::builder()
+        .icon_name("go-jump-symbolic")
+        .tooltip_text(crate::i18n::t("jump_last_read"))
+        .css_classes(["flat", "circular"])
+        .visible(false)
+        .build();
+    chat_bar.append(&last_read_btn);
+    let album_btn = gtk::Button::builder()
+        .icon_name("folder-pictures-symbolic")
+        .label(crate::i18n::t("albums"))
+        .tooltip_text(crate::i18n::t("albums"))
+        .css_classes(["flat"])
+        .build();
+    chat_bar.append(&album_btn);
+    let message_search_btn = gtk::Button::builder()
+        .icon_name("system-search-symbolic")
+        .tooltip_text(crate::i18n::t("message_search"))
+        .css_classes(["flat", "circular"])
+        .build();
+    chat_bar.append(&message_search_btn);
+    let shared_media_btn = gtk::Button::builder()
+        .label(crate::i18n::t("shared_media"))
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let conversation_menu = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text(crate::i18n::t("shared_media"))
+        .css_classes(["flat"])
+        .build();
+    let poll_create_btn = gtk::Button::builder()
+        .label(crate::i18n::t("poll_create"))
+        .sensitive(false)
+        .css_classes(["flat"])
+        .build();
+    let menu_items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_items.append(&shared_media_btn);
+    menu_items.append(&poll_create_btn);
+    let menu = gtk::Popover::new();
+    menu.set_child(Some(&menu_items));
+    conversation_menu.set_popover(Some(&menu));
+    for button in [&shared_media_btn, &poll_create_btn] {
+        let popover = menu.clone();
+        button.connect_clicked(move |_| popover.popdown());
+    }
+    chat_bar.append(&conversation_menu);
     chat_bar.append(&mute_btn);
     chat_bar.append(&call_btn);
 
@@ -383,12 +546,57 @@ pub fn build_shell_page() -> ShellWidgets {
         .valign(gtk::Align::Center)
         .css_classes(["line-composer"])
         .build();
-    let composer = gtk::Entry::builder()
-        .placeholder_text("Type a message…")
+    let composer = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(7)
+        .bottom_margin(7)
+        .hexpand(true)
+        .css_classes(["line-composer-text"])
+        .build();
+    let composer_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(34)
+        .max_content_height(160)
+        .propagate_natural_height(true)
+        .hexpand(true)
+        .child(&composer)
+        .build();
+    let composer_placeholder = gtk::Label::builder()
+        .label(crate::i18n::t("type_message"))
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_top(7)
+        .can_target(false)
+        .css_classes(["dim-label"])
+        .build();
+    let composer_overlay = gtk::Overlay::new();
+    composer_overlay.set_child(Some(&composer_scroll));
+    composer_overlay.add_overlay(&composer_placeholder);
+    let placeholder = composer_placeholder.clone();
+    composer.buffer().connect_changed(move |buffer| {
+        placeholder.set_visible(buffer.char_count() == 0);
+    });
+    let composer_emoji = gtk::Button::builder()
+        .icon_name("face-smile-symbolic")
+        .tooltip_text(crate::i18n::t("insert_emoji"))
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build();
+    let weak = composer.downgrade();
+    composer_emoji.connect_clicked(move |_| {
+        if let Some(composer) = weak.upgrade() {
+            composer.grab_focus();
+            composer.emit_insert_emoji();
+        }
+    });
+    let composer_field = gtk::Box::builder()
         .hexpand(true)
         .valign(gtk::Align::Center)
-        .css_classes(["line-composer-entry"])
+        .css_classes(["entry", "line-composer-entry"])
         .build();
+    composer_field.append(&composer_overlay);
+    composer_field.append(&composer_emoji);
     let attach_btn = gtk::Button::builder()
         .icon_name("mail-attachment-symbolic")
         .tooltip_text("Attach file")
@@ -415,7 +623,7 @@ pub fn build_shell_page() -> ShellWidgets {
     composer_row.append(&attach_btn);
     composer_row.append(&sticker_btn);
     composer_row.append(&mic_btn);
-    composer_row.append(&composer);
+    composer_row.append(&composer_field);
     composer_row.append(&send_btn);
 
     // Recording overlay: cancel | live wave | timer | send (replaces composer; no toast)
@@ -522,6 +730,61 @@ pub fn build_shell_page() -> ShellWidgets {
     conversation.append(&msg_stack);
     conversation.append(&jump_banner);
     conversation.append(&upload_revealer);
+    let reply_title = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(40)
+        .xalign(0.0)
+        .css_classes(["heading", "caption"])
+        .build();
+    let reply_text = gtk::Label::builder()
+        .xalign(0.0)
+        .single_line_mode(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .hexpand(true)
+        .build();
+    let reply_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(3)
+        .hexpand(true)
+        .build();
+    reply_column.append(&reply_title);
+    reply_column.append(&reply_text);
+    let reply_cancel = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular", "line-reply-cancel"])
+        .build();
+    let reply_bar = gtk::Box::builder()
+        .spacing(10)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(4)
+        .margin_bottom(4)
+        .css_classes(["line-reply-preview"])
+        .build();
+    let reply_icon = gtk::Image::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .pixel_size(20)
+        .css_classes(["line-reply-preview-icon"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    reply_bar.append(&reply_icon);
+    reply_bar.append(&reply_column);
+    reply_bar.append(&reply_cancel);
+    let reply_preview = gtk::Revealer::builder()
+        .child(&reply_bar)
+        .reveal_child(false)
+        .build();
+    conversation.append(&reply_preview);
+    let attachment_preview = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(4)
+        .visible(false)
+        .build();
+    conversation.append(&attachment_preview);
     conversation.append(&composer_stack);
 
     let sidebar_paned = gtk::Paned::builder()
@@ -544,11 +807,20 @@ pub fn build_shell_page() -> ShellWidgets {
     page.append(&body);
 
     ShellWidgets {
+        read_once_btn,
+        last_read_btn,
         page,
         chat_list,
         message_list,
         message_scroll,
         composer,
+        composer_placeholder,
+        composer_emoji,
+        attachment_preview,
+        reply_preview,
+        reply_title,
+        reply_text,
+        reply_cancel,
         composer_row,
         composer_stack,
         record_cancel_btn,
@@ -561,12 +833,18 @@ pub fn build_shell_page() -> ShellWidgets {
         conversation,
         send_btn,
         status,
+        read_pause_switch,
+        read_pause_label,
+        read_pause_box,
         profile_label,
         profile_avatar,
         brand_label,
         brand_icon,
+        chat_header,
+        chat_avatar_frame,
         chat_title,
         chat_subtitle,
+        sync_spinner,
         side_stack,
         side_spinner,
         side_empty,
@@ -578,8 +856,16 @@ pub fn build_shell_page() -> ShellWidgets {
         msg_idle,
         settings_btn,
         friends_btn,
+        album_btn,
+        message_search_btn,
+        shared_media_btn,
+        poll_create_btn,
         side_title,
         search_entry,
+        chat_filter_bar,
+        chat_filter_btn,
+        chat_filter_label,
+        compact_filter_btn,
         compact_search_btn,
         compact_search_entry,
         mic_btn,
@@ -601,6 +887,35 @@ pub fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
         r#"
+.line-read-pause { padding: 4px 8px; border-radius: 10px; }
+.line-read-pause.line-read-paused { background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.line-chat-read-paused, .line-chat-pinned, .line-chat-blocked { background: @window_bg_color; color: @accent_color; border-radius: 999px; padding: 2px; }
+.line-reply-quote-button { padding: 0; border-radius: 8px; }
+.line-reply-quote { border-left: 3px solid @accent_bg_color; padding: 8px 10px; background: alpha(@accent_bg_color, 0.10); border-radius: 8px; }
+.line-reply-author, .line-reply-preview-icon { color: @accent_color; }
+.line-reply-excerpt { font-size: 0.9em; }
+.line-reply-preview { border-left: 3px solid @accent_bg_color; padding: 10px 12px; background: alpha(@accent_bg_color, 0.08); border-radius: 10px; }
+.line-reply-cancel { min-width: 32px; min-height: 32px; padding: 0; }
+.line-message-actions { border-radius: 999px; background: alpha(@card_bg_color, 0.65); border: 1px solid alpha(@borders, 0.45); padding: 2px; }
+.line-message-row .line-message-actions { opacity: 0; transition: opacity 120ms ease-in-out; }
+.line-message-row:hover .line-message-actions,
+.line-message-row:focus-within .line-message-actions { opacity: 1; }
+.line-message-action { min-width: 30px; min-height: 30px; padding: 0; color: @window_fg_color; }
+.line-message-action:hover, .line-message-action:focus-visible { color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
+.line-album-photo { border-radius: 12px; padding: 4px; }
+.line-emoji-text, .line-emoji-text text { background: transparent; color: inherit; padding: 0; }
+.line-reaction-strip { margin: 0; }
+.line-reaction-chip { min-height: 24px; padding: 0 4px; border-radius: 6px; background: transparent; border: none; box-shadow: none; font-size: 0.85em; }
+.line-reaction-chip:hover { background: alpha(@accent_bg_color, 0.12); }
+.line-reaction-count { font-weight: 600; }
+.line-reaction-chip.line-reaction-mine { background: alpha(@accent_bg_color, 0.18); }
+.line-reaction-details { min-width: 24px; min-height: 24px; padding: 0; border: none; box-shadow: none; }
+.line-reaction-tab { min-width: 36px; min-height: 36px; padding: 2px; border-radius: 8px; border-bottom: 2px solid transparent; }
+.line-reaction-tab.line-reaction-selected { background: alpha(@accent_bg_color, 0.16); border-bottom-color: @accent_bg_color; }
+.line-reaction-option { min-width: 40px; min-height: 40px; padding: 2px; border-radius: 10px; }
+.line-reaction-option.line-reaction-selected { background: alpha(@accent_bg_color, 0.24); }
+.line-reaction-check { color: @accent_fg_color; background: @accent_bg_color; border-radius: 999px; padding: 1px; }
+
         .line-shell {
             background: @window_bg_color;
         }
@@ -668,6 +983,11 @@ pub fn load_css() {
             background: transparent;
             border-bottom: 1px solid alpha(@borders, 0.35);
         }
+        .line-chat-header-link {
+            border-radius: 12px;
+            padding: 2px 8px 2px 4px;
+        }
+        .line-chat-header-link:hover { background: alpha(@window_fg_color, 0.07); }
         .line-chat-list { background: transparent; }
         .line-chat-list row {
             margin: 2px 8px;
@@ -716,6 +1036,7 @@ pub fn load_css() {
             min-width: 40px;
             min-height: 40px;
         }
+        .line-chat-filter > button { padding: 8px 10px; border-radius: 10px; }
         .line-search {
             border-radius: 12px;
             margin-bottom: 4px;
@@ -745,6 +1066,26 @@ pub fn load_css() {
         }
         .line-call-vol-row {
             margin-top: 4px;
+        }
+        .line-history-card {
+            min-width: 196px;
+            padding: 6px 2px;
+        }
+        .line-history-icon {
+            background: alpha(@accent_bg_color, 0.14);
+            color: @accent_color;
+            border-radius: 999px;
+            padding: 12px;
+        }
+        .line-history-title { font-weight: 700; }
+        .line-history-duration {
+            opacity: 0.8;
+            font-feature-settings: "tnum";
+        }
+        .line-history-missed .line-history-icon,
+        .line-history-missed .line-history-title { color: @error_color; }
+        .line-history-missed .line-history-icon {
+            background: alpha(@error_color, 0.10);
         }
         .line-voice-card {
             min-width: 180px;
@@ -813,7 +1154,49 @@ pub fn load_css() {
         }
         .line-media-viewer-bar {
             background: alpha(@headerbar_bg_color, 0.96);
+            color: @headerbar_fg_color;
+            padding: 8px 12px;
             border-bottom: 1px solid alpha(@borders, 0.45);
+        }
+        .line-media-viewer-bar button {
+            min-width: 30px;
+            min-height: 30px;
+            border-radius: 8px;
+        }
+        .line-media-viewer-bar button.flat {
+            color: inherit;
+        }
+        .line-media-viewer-visual,
+        .line-media-viewer-visual .line-media-viewer-body,
+        .line-media-viewer-visual .line-media-viewer-image,
+        .line-media-viewer-visual .line-media-viewer-video {
+            background: #14171d;
+            color: #f5f7fb;
+        }
+        .line-media-viewer-visual .line-media-viewer-bar {
+            background: #242832;
+            color: #f5f7fb;
+            border-bottom: 1px solid #353b46;
+        }
+        .line-media-viewer-visual button.flat:hover {
+            background: rgba(255, 255, 255, 0.10);
+        }
+        .line-media-viewer-visual button.flat:checked {
+            background: #3b4960;
+        }
+        .line-media-viewer-zoom {
+            background: rgba(0, 0, 0, 0.20);
+            border-radius: 10px;
+            padding: 2px;
+        }
+        .line-media-draw-tools {
+            background: #1d222b;
+            color: #f5f7fb;
+            padding: 10px 16px;
+            border-bottom: 1px solid #353b46;
+        }
+        .line-media-draw-tools button.flat {
+            color: #f5f7fb;
         }
         .line-media-viewer-body {
             background: @window_bg_color;
@@ -828,15 +1211,20 @@ pub fn load_css() {
         .line-draw-swatch {
             min-width: 28px;
             min-height: 28px;
-            font-size: 1.1em;
             padding: 0;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            box-shadow: none;
         }
-        .line-draw-c-red { color: #e53935; }
-        .line-draw-c-green { color: #43a047; }
-        .line-draw-c-blue { color: #1e88e5; }
-        .line-draw-c-yellow { color: #fdd835; }
-        .line-draw-c-white { color: #f5f5f5; }
-        .line-draw-c-black { color: #212121; }
+        .line-draw-swatch:checked {
+            outline: 2px solid #99bdff;
+            outline-offset: 2px;
+        }
+        .line-draw-c-red { background: #e53935; }
+        .line-draw-c-green { background: #43a047; }
+        .line-draw-c-blue { background: #1e88e5; }
+        .line-draw-c-yellow { background: #fdd835; }
+        .line-draw-c-white { background: #f5f5f5; }
+        .line-draw-c-black { background: #212121; }
         .line-media-viewer-video {
             background: @window_bg_color;
         }
@@ -932,7 +1320,13 @@ pub fn load_css() {
         }
         .line-flex-title { font-weight: 700; }
         .line-flex-action { margin-top: 4px; }
-        .line-link-chip { margin-top: 4px; }
+        .line-poll-choice progressbar trough, .line-poll-choice progressbar progress { min-height: 4px; }
+        .line-link-preview { border-radius: 10px; padding: 8px; background: alpha(@card_bg_color, 0.75); border: 1px solid alpha(@borders, 0.5); max-width: 360px; }
+        .line-link-preview-thumbnail { padding: 0; margin: 0; border-radius: 6px; }
+        .line-link-preview-title { font-weight: 700; }
+        .line-link-preview-description { font-size: 0.9em; opacity: 0.8; }
+        .line-link-preview-domain { font-size: 0.8em; opacity: 0.7; }
+        .line-link-preview-actions { margin-top: 4px; }
         .line-unread {
             background: @accent_bg_color;
             color: @accent_fg_color;
@@ -952,7 +1346,7 @@ pub fn load_css() {
             background: transparent;
         }
         .line-msg-list { background: transparent; }
-        .line-msg-list row {
+        .line-msg-list row, .line-message-row {
             background: transparent;
             margin: 2px 4px;
             padding: 0;
@@ -973,13 +1367,26 @@ pub fn load_css() {
         }
         .line-bubble-text { font-size: 0.98em; }
         .line-msg-status {
-            font-size: 0.72em;
+            font-size: 0.78em;
             opacity: 0.65;
             margin-top: 1px;
         }
         .line-msg-status-read {
-            opacity: 0.95;
+            opacity: 1;
+            font-weight: 600;
             color: @accent_color;
+        }
+        .line-message-sender {
+            font-size: 0.82em;
+            font-weight: 600;
+            color: alpha(@window_fg_color, 0.72);
+        }
+        .line-message-sender-link:hover { text-decoration: underline; }
+        .line-avatar-xs,
+        .line-avatar-xs.line-avatar,
+        .line-avatar-frame.line-avatar-xs {
+            min-width: 32px;
+            min-height: 32px;
         }
         .line-msg-time {
             font-size: 0.70em;
@@ -1057,6 +1464,10 @@ pub fn load_css() {
             border-top: 1px solid alpha(@borders, 0.35);
             padding-top: 4px;
         }
+        .line-reply-target {
+            background-color: alpha(@accent_bg_color, 0.18);
+            border-radius: 12px;
+        }
         .line-composer {
             background: alpha(@window_bg_color, 0.94);
             border-top: 1px solid alpha(@borders, 0.4);
@@ -1078,6 +1489,13 @@ pub fn load_css() {
             padding-bottom: 0;
             padding-left: 12px;
             padding-right: 12px;
+        }
+        .line-composer-text, .line-composer-text text {
+            background: transparent;
+        }
+        .line-composer-entry:focus-within {
+            outline: 2px solid @accent_color;
+            outline-offset: -2px;
         }
         .line-send-btn {
             min-height: 34px;
@@ -1121,6 +1539,15 @@ pub fn load_css() {
         .line-sticker-cell {
             padding: 8px;
             border-radius: 12px;
+        }
+        .line-sticker-hover-stage {
+            background: #eef0f3;
+            border-radius: 12px;
+            padding: 8px;
+        }
+        .line-sticker-hover-stage label {
+            color: #33363b;
+            padding: 16px;
         }
         .line-sticker-cell:hover {
             background: alpha(@accent_bg_color, 0.18);

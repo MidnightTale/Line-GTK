@@ -13,16 +13,19 @@ pub struct I18n {
 
 impl I18n {
     pub fn load(repo_root: &Path, code: &str) -> Self {
-        let file = if code == "th" || code == "thai" {
-            "thai.json"
-        } else {
-            "eng.json"
+        let file = match code {
+            "vi" | "vie" | "vietnamese" => "vie.json",
+            "th" | "thai" => "thai.json",
+            "ja" | "ja-JP" | "ja_JP" | "japanese" => "ja.json",
+            _ => "eng.json",
         };
-        let path = lang_path(repo_root, file);
-        let map = read_map(&path).unwrap_or_else(|| {
-            // fallback bundled next to exe / eng
-            read_map(&lang_path(repo_root, "eng.json")).unwrap_or_default()
-        });
+        // 翻訳がない項目は英語で表示し、内部キーの露出を防ぐ。
+        let mut map = read_map(&lang_path(repo_root, "eng.json")).unwrap_or_default();
+        if file != "eng.json"
+            && let Some(translated) = read_map(&lang_path(repo_root, file))
+        {
+            map.extend(translated);
+        }
         Self { map }
     }
 
@@ -82,4 +85,80 @@ pub fn tf(key: &str, pairs: &[(&str, &str)]) -> String {
         return i.tf(key, pairs);
     }
     key.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placeholders(text: &str) -> Vec<&str> {
+        let mut values: Vec<_> = text
+            .split('{')
+            .skip(1)
+            .filter_map(|part| part.split_once('}').map(|(name, _)| name))
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn japanese_catalog_is_complete() {
+        let en: HashMap<String, String> =
+            serde_json::from_str(include_str!("../assets/lang/eng.json")).unwrap();
+        let ja: HashMap<String, String> =
+            serde_json::from_str(include_str!("../assets/lang/ja.json")).unwrap();
+        assert_eq!(en.len(), ja.len());
+        for (key, english) in &en {
+            let japanese = ja.get(key).expect("日本語訳がありません");
+            assert!(!japanese.trim().is_empty(), "空の日本語訳：{key}");
+            assert_eq!(placeholders(english), placeholders(japanese), "{key}");
+        }
+        let language = I18n::load(Path::new(env!("CARGO_MANIFEST_DIR")), "ja");
+        assert_eq!(language.t("send"), "送信");
+        assert_eq!(
+            language.tf("call_calling", &[("name", "しらふか")]),
+            "しらふかに発信中…"
+        );
+    }
+
+    #[test]
+    fn vietnamese_catalog_is_complete_and_default_language_is_preserved() {
+        let en: HashMap<String, String> =
+            serde_json::from_str(include_str!("../assets/lang/eng.json")).unwrap();
+        let vi: HashMap<String, String> =
+            serde_json::from_str(include_str!("../assets/lang/vie.json")).unwrap();
+        assert_eq!(en.len(), vi.len());
+        for (key, english) in &en {
+            let translated = vi.get(key).expect("Missing Vietnamese translation");
+            assert!(
+                !translated.trim().is_empty(),
+                "Empty Vietnamese translation: {key}"
+            );
+            assert_eq!(placeholders(english), placeholders(translated), "{key}");
+        }
+        let config = crate::config::AppConfig::default();
+        assert_eq!(config.language, "vi");
+        let language = I18n::load(Path::new(env!("CARGO_MANIFEST_DIR")), &config.language);
+        assert_eq!(language.t("send"), "Gửi");
+        assert_eq!(language.tf("reply_to", &[("name", "Lan")]), "Trả lời Lan");
+    }
+
+    #[test]
+    fn missing_translations_fall_back_to_english() {
+        let root = std::env::temp_dir().join(format!("line-gtk-i18n-test-{}", std::process::id()));
+        let directory = root.join("assets/lang");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("eng.json"),
+            r#"{"send":"Send","future":"Future"}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("ja.json"), r#"{"send":"送信"}"#).unwrap();
+        let language = I18n::load(&root, "ja");
+        assert_eq!(language.t("send"), "送信");
+        assert_eq!(language.t("future"), "Future");
+        fs::remove_file(directory.join("ja.json")).unwrap();
+        assert_eq!(I18n::load(&root, "ja").t("send"), "Send");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

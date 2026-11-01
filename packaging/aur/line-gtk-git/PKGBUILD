@@ -1,21 +1,25 @@
 # Maintainer: MidnightTale <mntale@pm.me>
 pkgname=line-gtk-git
 pkgver=0.1.0.r0.g0000000
-pkgrel=1
+pkgrel=2
 pkgdesc='Unofficial native LINE client for Linux (GTK4 / Libadwaita), git version'
 arch=('x86_64')
 url='https://github.com/MidnightTale/Line-GTK'
 license=('GPL-3.0-or-later')
 depends=('gtk4' 'libadwaita' 'ffmpeg' 'hicolor-icon-theme')
-makedepends=('cargo' 'deno' 'git')
+makedepends=('cargo' 'deno' 'git' 'python')
 optdepends=(
+  'noto-fonts: Vietnamese and multilingual text rendering'
+  'libsecret: save automatic login credentials in the system keyring'
   'poppler: PDF preview in media viewer'
   'gst-plugins-good: extra video playback codecs'
   'gst-libav: extra video playback codecs'
 )
 provides=('line-gtk')
 conflicts=('line-gtk')
-options=('!lto')
+# Deno appends its JS payload after the ELF sections; strip destroys it.
+# Cargo already strips the Rust UI binary via profile.release.strip.
+options=('!strip' '!debug' '!lto')
 source=("git+https://github.com/MidnightTale/Line-GTK.git")
 sha256sums=('SKIP')
 
@@ -28,6 +32,7 @@ pkgver() {
 
 prepare() {
   cd Line-GTK
+  python3 scripts/vendor-protocol.py --ensure
   export RUSTUP_TOOLCHAIN=stable
   # Prefer lockfile when present; otherwise resolve deps for this snapshot.
   if [[ -f Cargo.lock ]]; then
@@ -73,4 +78,7 @@ package() {
 
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  for doc in docs/*.md; do
+    install -Dm644 "$doc" "$pkgdir/usr/share/doc/$pkgname/docs/${doc##*/}"
+  done
 }

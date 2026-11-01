@@ -5,7 +5,14 @@ use gtk::glib;
 use gtk::prelude::*;
 use qrcode::EcLevel;
 use qrcode::QrCode;
+use std::cell::{Cell, RefCell};
 use std::io::Cursor;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMethod {
+    Qr,
+    Email,
+}
 
 pub struct LoginWidgets {
     /// Full-bleed root (owns the page gradient).
@@ -18,6 +25,17 @@ pub struct LoginWidgets {
     pub subtitle: gtk::Label,
     pub pin_caption: gtk::Label,
     pub note: gtk::Label,
+    pub qr_method_btn: gtk::Button,
+    pub email_method_btn: gtk::Button,
+    pub email_entry: gtk::Entry,
+    pub password_entry: gtk::PasswordEntry,
+    pub email_submit_btn: gtk::Button,
+    pub password_note: gtk::Label,
+    pub remember_login: gtk::CheckButton,
+    pub spinner: gtk::Spinner,
+    pub method: Cell<LoginMethod>,
+    pub busy: Cell<bool>,
+    pub error: RefCell<Option<String>>,
 }
 
 pub fn build_login_page() -> LoginWidgets {
@@ -66,9 +84,59 @@ pub fn build_login_page() -> LoginWidgets {
 
     let stage = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
-        .vhomogeneous(true)
-        .hhomogeneous(true)
+        .vhomogeneous(false)
+        .hhomogeneous(false)
         .build();
+
+    let methods = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .build();
+    let qr_method_btn = gtk::Button::with_label(&crate::i18n::t("login_method_qr"));
+    let email_method_btn = gtk::Button::with_label(&crate::i18n::t("login_method_email"));
+    qr_method_btn.add_css_class("suggested-action");
+    methods.append(&qr_method_btn);
+    methods.append(&email_method_btn);
+
+    let email_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .width_request(300)
+        .build();
+    let email_entry = gtk::Entry::builder()
+        .placeholder_text(crate::i18n::t("login_email_address"))
+        .input_purpose(gtk::InputPurpose::Email)
+        .tooltip_text(crate::i18n::t("login_email_address"))
+        .build();
+    let password_entry = gtk::PasswordEntry::builder()
+        .placeholder_text(crate::i18n::t("login_password"))
+        .tooltip_text(crate::i18n::t("login_password"))
+        .show_peek_icon(true)
+        .build();
+    let email_submit_btn = gtk::Button::builder()
+        .label(crate::i18n::t("login_email_submit"))
+        .css_classes(["suggested-action", "pill"])
+        .build();
+    let password_note = gtk::Label::builder()
+        .label(crate::i18n::t("login_password_note"))
+        .wrap(true)
+        .max_width_chars(32)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    let remember_login = gtk::CheckButton::with_label(&crate::i18n::t("auto_login_remember"));
+    let spinner = gtk::Spinner::builder()
+        .halign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    email_box.append(&email_entry);
+    email_box.append(&password_entry);
+    email_box.append(&remember_login);
+    email_box.append(&email_submit_btn);
+    email_box.append(&spinner);
+    email_box.append(&password_note);
+    stage.add_named(&email_box, Some("email"));
 
     let qr_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -141,6 +209,7 @@ pub fn build_login_page() -> LoginWidgets {
 
     content.append(&title);
     content.append(&subtitle);
+    content.append(&methods);
     content.append(&card);
     content.append(&hint);
     content.append(&retry_btn);
@@ -157,15 +226,113 @@ pub fn build_login_page() -> LoginWidgets {
         subtitle,
         pin_caption,
         note,
+        qr_method_btn,
+        email_method_btn,
+        email_entry,
+        password_entry,
+        email_submit_btn,
+        password_note,
+        remember_login,
+        spinner,
+        method: Cell::new(LoginMethod::Qr),
+        busy: Cell::new(false),
+        error: RefCell::new(None),
     }
 }
 
 pub fn apply_login_language(w: &LoginWidgets) {
     w.subtitle.set_text(&crate::i18n::t("login_subtitle"));
-    w.hint.set_text(&crate::i18n::t("login_qr_hint"));
+    w.hint.set_text(&method_hint(w));
     w.pin_caption.set_text(&crate::i18n::t("login_pin_caption"));
-    w.retry_btn.set_label(&crate::i18n::t("login_retry"));
+    w.retry_btn
+        .set_label(&crate::i18n::t(if w.method.get() == LoginMethod::Email {
+            "login_email_retry"
+        } else {
+            "login_retry"
+        }));
     w.note.set_text(&crate::i18n::t("login_note"));
+    w.qr_method_btn
+        .set_label(&crate::i18n::t("login_method_qr"));
+    w.email_method_btn
+        .set_label(&crate::i18n::t("login_method_email"));
+    w.email_entry
+        .set_placeholder_text(Some(&crate::i18n::t("login_email_address")));
+    w.email_entry
+        .set_tooltip_text(Some(&crate::i18n::t("login_email_address")));
+    w.password_entry
+        .set_placeholder_text(Some(&crate::i18n::t("login_password")));
+    w.password_entry
+        .set_tooltip_text(Some(&crate::i18n::t("login_password")));
+    w.email_submit_btn
+        .set_label(&crate::i18n::t(if w.busy.get() {
+            "login_email_signing_in"
+        } else {
+            "login_email_submit"
+        }));
+    w.password_note
+        .set_text(&crate::i18n::t("login_password_note"));
+    w.remember_login
+        .set_label(Some(&crate::i18n::t("auto_login_remember")));
+}
+
+pub fn method_hint(w: &LoginWidgets) -> String {
+    w.error.borrow().clone().unwrap_or_else(|| {
+        crate::i18n::t(if w.method.get() == LoginMethod::Email {
+            "login_email_hint"
+        } else {
+            "login_qr_hint"
+        })
+    })
+}
+
+pub fn set_method(w: &LoginWidgets, method: LoginMethod) {
+    w.method.set(method);
+    w.password_entry.set_text("");
+    *w.error.borrow_mut() = None;
+    w.qr_method_btn.remove_css_class("suggested-action");
+    w.email_method_btn.remove_css_class("suggested-action");
+    match method {
+        LoginMethod::Qr => w.qr_method_btn.add_css_class("suggested-action"),
+        LoginMethod::Email => w.email_method_btn.add_css_class("suggested-action"),
+    }
+    set_busy(w, false);
+    show_method_stage(w);
+    apply_login_language(w);
+}
+
+pub fn set_busy(w: &LoginWidgets, busy: bool) {
+    w.busy.set(busy);
+    w.email_entry.set_sensitive(!busy);
+    w.remember_login.set_sensitive(!busy);
+    w.password_entry.set_sensitive(!busy);
+    w.email_submit_btn.set_sensitive(!busy);
+    w.email_submit_btn.set_label(&crate::i18n::t(if busy {
+        "login_email_signing_in"
+    } else {
+        "login_email_submit"
+    }));
+    w.spinner.set_visible(busy);
+    w.spinner.set_spinning(busy);
+}
+
+pub fn show_method_stage(w: &LoginWidgets) {
+    match w.method.get() {
+        LoginMethod::Qr => show_qr_stage(w),
+        LoginMethod::Email => {
+            w.stage.set_visible_child_name("email");
+            w.retry_btn.set_visible(false);
+            w.hint.set_text(&method_hint(w));
+        }
+    }
+}
+
+pub fn show_failure(w: &LoginWidgets, message: &str) {
+    *w.error.borrow_mut() = Some(message.into());
+    w.password_entry.set_text("");
+    set_busy(w, false);
+    show_method_stage(w);
+    w.hint.set_text(message);
+    w.retry_btn.set_visible(w.method.get() == LoginMethod::Qr);
 }
 
 pub fn show_qr_stage(w: &LoginWidgets) {
@@ -183,6 +350,12 @@ pub fn show_pin_stage(w: &LoginWidgets, pin: &str) {
     ));
     w.stage.set_visible_child_name("pin");
     w.retry_btn.set_visible(true);
+    w.retry_btn
+        .set_label(&crate::i18n::t(if w.method.get() == LoginMethod::Email {
+            "login_email_retry"
+        } else {
+            "login_retry"
+        }));
     w.hint.set_text(&crate::i18n::t("login_pin_waiting"));
 }
 

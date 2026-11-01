@@ -26,8 +26,9 @@ function temporaryPath(path: string): string {
  */
 export async function atomicWriteTextFile(
   path: string,
-  contents: string,
+  contents: string | Uint8Array,
   mode = 0o600,
+  beforeCommit?: () => void,
 ): Promise<void> {
   await ensurePrivateDir(dirname(path));
   const temporary = temporaryPath(path);
@@ -38,7 +39,13 @@ export async function atomicWriteTextFile(
       mode,
     });
     try {
-      await file.write(new TextEncoder().encode(contents));
+      const bytes = typeof contents === "string"
+        ? new TextEncoder().encode(contents)
+        : contents;
+      let written = 0;
+      while (written < bytes.length) {
+        written += await file.write(bytes.subarray(written));
+      }
       await file.sync();
     } finally {
       file.close();
@@ -46,7 +53,13 @@ export async function atomicWriteTextFile(
     if (Deno.build.os !== "windows") {
       await Deno.chmod(temporary, mode);
     }
-    await Deno.rename(temporary, path);
+    if (beforeCommit) {
+      // Keep the ownership check and final rename in one event-loop turn.
+      beforeCommit();
+      Deno.renameSync(temporary, path);
+    } else {
+      await Deno.rename(temporary, path);
+    }
   } catch (error) {
     try {
       await Deno.remove(temporary);

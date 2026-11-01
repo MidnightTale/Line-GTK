@@ -2,11 +2,14 @@ import type { Client } from "@evex/linejs";
 import { join } from "@std/path";
 import { atomicWriteTextFile } from "./storage.ts";
 import type { CachePolicy } from "./cache_policy.ts";
+import { stickerPackageId } from "./sticker_import.ts";
+import type { createStickerLibrary } from "./sticker_library.ts";
 
 type Json = Record<string, unknown>;
 
 export type StickerRuntime = {
   getClient: () => Client | null;
+  library: ReturnType<typeof createStickerLibrary>;
   dataDir: string;
   stickerDir: string;
   refreshCachePolicy: () => Promise<CachePolicy>;
@@ -128,46 +131,79 @@ export function createStickerService(runtime: StickerRuntime) {
   }
 
   type OwnedPackage = { id: string; version: string; name: string };
-  let ownedPackagesCache: { at: number; packages: OwnedPackage[] } | null =
-    null;
+  let ownedPackagesCache: {
+    client: Client;
+    at: number;
+    packages: OwnedPackage[];
+  } | null = null;
+
+  let ownedUnavailable = false;
 
   async function fetchOwnedPackages(): Promise<OwnedPackage[]> {
+    const check = runtime.library.guard();
     const client = runtime.getClient();
     if (!client) return [];
     await refreshCachePolicy();
+    check();
     if (
-      ownedPackagesCache &&
+      ownedPackagesCache && ownedPackagesCache.client === client &&
       Date.now() - ownedPackagesCache.at < cachePolicy().ownedPack
     ) {
       return ownedPackagesCache.packages;
     }
     try {
-      const { ShopService } = await import(
-        "https://jsr.io/@evex/linejs/3.2.1/base/service/shop/mod.ts"
-      );
+      const { ShopService } = await import("@linegtk/shop");
       const shop = new ShopService(client.base as never);
-      const res = await shop.getOwnedProductSummaries({
-        shopId: "stickershop",
-        offset: 0,
-        limit: 80,
-        locale: { language: "en", country: "TH" },
-      } as never) as Record<string, unknown>;
-      const list = (res.productList ?? res["1"] ?? []) as Record<
-        string,
-        unknown
-      >[];
-      const packages = list
-        .map((p) => ({
-          id: String(p.id ?? p["1"] ?? ""),
-          version: String(p.latestVersion ?? p["21"] ?? "1"),
-          name: String(p.name ?? p["11"] ?? ""),
-        }))
-        .filter((p) => p.id);
-      ownedPackagesCache = { at: Date.now(), packages };
+      const packages: OwnedPackage[] = [];
+      const seen = new Set<string>();
+      let offset = 0;
+      while (true) {
+        const res = await shop.getOwnedProductSummaries({
+          shopId: "stickershop",
+          offset,
+          limit: 80,
+          locale: Deno.env.get("LINE_GTK_LANG") === "ja"
+            ? { language: "ja", country: "JP" }
+            : { language: "en", country: "TH" },
+        } as never) as Record<string, unknown>;
+        if (runtime.getClient() !== client) {
+          throw new Error("sticker_library_session_changed");
+        }
+        check();
+        const list = (res.productList ?? res["1"] ?? []) as Record<
+          string,
+          unknown
+        >[];
+        let added = 0;
+        for (const p of list) {
+          const id = stickerPackageId(String(p.id ?? p["1"] ?? ""));
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          added++;
+          packages.push({
+            id,
+            version: String(p.latestVersion ?? p["21"] ?? "1"),
+            name: String(p.name ?? p["11"] ?? id),
+          });
+        }
+        const total = Number(res.totalSize ?? res["3"]);
+        offset += list.length;
+        if (
+          !list.length || (Number.isFinite(total) && offset >= total) ||
+          (!Number.isFinite(total) && list.length < 80)
+        ) break;
+        if (!added) throw new Error("sticker_owned_pagination_stalled");
+      }
+      ownedUnavailable = false;
+      ownedPackagesCache = { client, at: Date.now(), packages };
       return packages;
     } catch (e) {
+      check();
+      ownedUnavailable = true;
       console.error("[owned stickers]", e);
-      return ownedPackagesCache?.packages ?? [];
+      return ownedPackagesCache?.client === client
+        ? ownedPackagesCache.packages
+        : [];
     }
   }
 
@@ -193,12 +229,15 @@ export function createStickerService(runtime: StickerRuntime) {
       };
       const lang = (Deno.env.get("LINE_GTK_LANG") || "th").toLowerCase();
       const preferEn = lang === "en" || lang === "eng";
+      const preferJa = lang === "ja" || lang === "ja-jp" || lang === "ja_jp";
       let name = pkg.name || pkg.id;
       if (typeof meta.title === "string" && meta.title.trim()) {
         name = meta.title.trim();
       } else if (meta.title && typeof meta.title === "object") {
         name = String(
-          (preferEn
+          (preferJa
+            ? meta.title.ja
+            : preferEn
             ? meta.title.en
             : meta.title.th || meta.title.en || meta.title.ja) ||
             meta.title.en ||
@@ -215,7 +254,7 @@ export function createStickerService(runtime: StickerRuntime) {
           version,
           at: 0,
         }))
-        .filter((s) => s.stickerId);
+        .filter((s) => stickerPackageId(s.stickerId) === s.stickerId);
       return { name, version, stickers };
     } catch (e) {
       console.error("[sticker pack meta]", pkg.id, e);
@@ -293,14 +332,36 @@ export function createStickerService(runtime: StickerRuntime) {
     return await ensureStickerStatic(stickerId);
   }
 
-  async function doListStickers(id: number | string | null) {
+  async function doListStickers(
+    id: number | string | null,
+    importPack?: string,
+  ) {
     const client = runtime.getClient();
     if (!client) {
       fail(id, "not_logged_in");
       return;
     }
-
-    const ownedPkgs = await fetchOwnedPackages();
+    const check = runtime.library.guard();
+    const library = importPack !== undefined
+      ? await runtime.library.importStore(String(id), importPack)
+      : await runtime.library.list();
+    // Most-used packs first: more distinct stickers used in the index wins,
+    // then the most recently used. Unused packs keep LINE's original order
+    // (Array.prototype.sort is stable).
+    const packUse = new Map<string, { count: number; recent: number }>();
+    stickerIndex.forEach((s, position) => {
+      const use = packUse.get(s.packageId) ??
+        { count: 0, recent: position };
+      use.count += 1;
+      use.recent = Math.min(use.recent, position);
+      packUse.set(s.packageId, use);
+    });
+    const ownedPkgs = [...await fetchOwnedPackages()].sort((a, b) => {
+      const ua = packUse.get(a.id);
+      const ub = packUse.get(b.id);
+      if (!ua || !ub) return ua ? -1 : ub ? 1 : 0;
+      return ub.count - ua.count || ua.recent - ub.recent;
+    });
     const ownedPkgIds = new Set(ownedPkgs.map((p) => p.id));
     const versionByPkg = new Map(ownedPkgs.map((p) => [p.id, p.version]));
 
@@ -319,7 +380,7 @@ export function createStickerService(runtime: StickerRuntime) {
       if (recentEntries.length >= 24) break;
     }
 
-    const packs: Json[] = [];
+    const packs: Json[] = [...library.packs];
 
     if (recentEntries.length) {
       const stickers: Json[] = [];
@@ -341,35 +402,27 @@ export function createStickerService(runtime: StickerRuntime) {
       });
     }
 
-    // Owned packs with full grids + pack icons.
-    for (const pkg of ownedPkgs.slice(0, 12)) {
-      const detail = await stickersForOwnedPackage(pkg, 48);
-      if (!detail.stickers.length) continue;
-      const stickers: Json[] = [];
-      for (const s of detail.stickers) {
-        stickers.push({
-          stickerId: s.stickerId,
-          packageId: s.packageId,
-          version: s.version ?? detail.version,
-          imagePath: await ensureStickerStatic(s.stickerId),
-        });
-      }
-      let iconPath = await ensurePackIcon(pkg.id);
-      if (!iconPath) {
-        const first = stickers[0]?.imagePath;
-        iconPath = typeof first === "string" && first ? first : null;
-      }
+    // Enumerate every owned collection; fetch its grid only when selected.
+    const ownedIcons = await Promise.all(
+      ownedPkgs.map((pkg) => ensurePackIcon(pkg.id).catch(() => null)),
+    );
+    ownedPkgs.forEach((pkg, index) => {
       packs.push({
         id: pkg.id,
-        name: detail.name || pkg.name || pkg.id,
-        version: detail.version,
-        iconPath,
-        recent: false,
-        stickers,
+        name: pkg.name || pkg.id,
+        version: pkg.version,
+        iconPath: ownedIcons[index],
+        lazy: true,
+        stickers: [],
       });
+    });
+    if (runtime.getClient() !== client) {
+      throw new Error("sticker_library_session_changed");
     }
 
+    check();
     ok(id, {
+      ...library,
       packs,
       // Keep flat list for older UI paths (unused once chooser migrates).
       stickers: packs.flatMap((p) =>
@@ -379,6 +432,44 @@ export function createStickerService(runtime: StickerRuntime) {
         }))
       ),
       ownedPackages: ownedPkgs.length,
+      ownedUnavailable,
+    });
+  }
+
+  async function ownedPack(id: number | string | null, packageId: string) {
+    const check = runtime.library.guard();
+    const client = runtime.getClient();
+    const pkg = (await fetchOwnedPackages()).find((p) => p.id === packageId);
+    if (!pkg) {
+      fail(id, "sticker_not_owned");
+      return;
+    }
+    const detail = await stickersForOwnedPackage(pkg, 2000);
+    if (!detail.stickers.length) {
+      fail(id, "sticker_import_unavailable");
+      return;
+    }
+    const stickers = [];
+    for (let offset = 0; offset < detail.stickers.length; offset += 3) {
+      stickers.push(
+        ...await Promise.all(
+          detail.stickers.slice(offset, offset + 3).map(async (s) => ({
+            ...s,
+            imagePath: await ensureStickerStatic(s.stickerId),
+          })),
+        ),
+      );
+      if (runtime.getClient() !== client) {
+        throw new Error("sticker_library_session_changed");
+      }
+    }
+    const iconPath = await ensurePackIcon(packageId);
+    check();
+    ok(id, {
+      id: packageId,
+      name: detail.name,
+      stickers,
+      iconPath,
     });
   }
 
@@ -475,6 +566,7 @@ export function createStickerService(runtime: StickerRuntime) {
     ensureImage: ensureStickerImage,
     animationUrl: (stickerId: string) => stickerAnimationUrls(stickerId)[0],
     list: doListStickers,
+    ownedPack,
     send: doSendSticker,
     resetOwnedCache: () => {
       ownedPackagesCache = null;

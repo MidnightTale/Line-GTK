@@ -1,10 +1,14 @@
+mod autostart;
 mod config;
+mod credentials;
 mod desktop_notify;
 mod discord_rpc;
 mod i18n;
 mod protocol;
+mod read_receipts;
 mod sidecar;
 mod sticker_anim;
+mod sticker_image;
 mod tray;
 mod ui;
 
@@ -33,7 +37,8 @@ fn main() -> Result<()> {
 
     let repo_root = discover_repo_root()?;
     tracing::info!(?repo_root, ?data_dir, "starting LINE GTK");
-    ui::run(repo_root, data_dir)
+    let background = env::args().skip(1).any(|a| a == autostart::BACKGROUND_FLAG);
+    ui::run(repo_root, data_dir, background)
 }
 
 fn prefer_gstreamer_hw_decoders() {

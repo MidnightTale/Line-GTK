@@ -119,10 +119,71 @@ fn load_scaled_inner(path: &str, max_px: i32, animate: bool) -> Option<AnimFrame
             return None;
         }
     }
+    if path.to_ascii_lowercase().ends_with(".gif") {
+        return decode_gif(path, max_px, animate);
+    }
     if is_apng_file(path) {
         return decode_apng(path, max_px, animate);
     }
     decode_static(path, max_px)
+}
+
+fn decode_gif(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
+    use image::{AnimationDecoder, ImageDecoder};
+    if std::fs::metadata(path).ok()?.len() > 10 * 1024 * 1024 {
+        return None;
+    }
+    let mut decoder =
+        image::codecs::gif::GifDecoder::new(BufReader::new(File::open(path).ok()?)).ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || width > 2048 || height > 2048 {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    decoder.set_limits(limits).ok()?;
+    let mut frames = Vec::new();
+    let mut pixels = 0usize;
+    for frame in decoder.into_frames() {
+        let frame = frame.ok()?;
+        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        let rgba = frame.into_buffer();
+        pixels =
+            pixels.checked_add((rgba.width() as usize).checked_mul(rgba.height() as usize)?)?;
+        if pixels > 32 * 1024 * 1024 || frames.len() >= 900 {
+            return None;
+        }
+        let scale = if max_px > 0 {
+            (max_px as f64 / width.max(height) as f64).min(1.0)
+        } else {
+            1.0
+        };
+        let w = ((width as f64 * scale).round() as u32).max(1);
+        let h = ((height as f64 * scale).round() as u32).max(1);
+        let rgba = if w != width || h != height {
+            image::imageops::resize(&rgba, w, h, image::imageops::FilterType::Triangle)
+        } else {
+            rgba
+        };
+        frames.push(RawFrame {
+            rgba: rgba.into_raw(),
+            width: w as i32,
+            height: h as i32,
+            delay_ms: (numerator / denominator.max(1)).clamp(20, 5000),
+        });
+        if !animate {
+            break;
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    Some(AnimFrames {
+        frames,
+        plays: if animate { 0 } else { 1 },
+    })
 }
 
 fn decode_static(path: &str, max_px: i32) -> Option<AnimFrames> {
@@ -176,7 +237,8 @@ fn pixbuf_to_rgba(pb: &Pixbuf) -> Option<Vec<u8>> {
 
 fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
     let file = File::open(path).ok()?;
-    let decoder = png::Decoder::new(BufReader::new(file));
+    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let info = reader.info();
     let full_w = info.width as usize;
@@ -241,20 +303,12 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
             _ => None,
         };
 
-        let src = match out.color_type {
-            png::ColorType::Rgba => buf[..out.buffer_size()].to_vec(),
-            png::ColorType::Rgb => {
-                let mut rgba = vec![0u8; fw * fh * 4];
-                for i in 0..fw * fh {
-                    rgba[i * 4] = buf[i * 3];
-                    rgba[i * 4 + 1] = buf[i * 3 + 1];
-                    rgba[i * 4 + 2] = buf[i * 3 + 2];
-                    rgba[i * 4 + 3] = 255;
-                }
-                rgba
-            }
-            _ => continue,
-        };
+        let src = expand_to_rgba(
+            &buf[..out.buffer_size()],
+            out.color_type,
+            out.width,
+            out.height,
+        )?;
 
         match fc.blend_op {
             png::BlendOp::Source => {
@@ -306,6 +360,10 @@ fn decode_apng(path: &str, max_px: i32, animate: bool) -> Option<AnimFrames> {
         } else {
             canvas.clone()
         };
+        if frames.len() >= 240 || (frames.len() + 1) * tw as usize * th as usize > 32 * 1024 * 1024
+        {
+            return None;
+        }
         frames.push(RawFrame {
             rgba,
             width: tw as i32,
@@ -352,7 +410,7 @@ fn expand_to_rgba(
 ) -> Option<Vec<u8>> {
     let n = (width as usize).checked_mul(height as usize)?;
     match color_type {
-        png::ColorType::Rgba => Some(buf[..n * 4].to_vec()),
+        png::ColorType::Rgba => Some(buf.get(..n * 4)?.to_vec()),
         png::ColorType::Rgb => {
             let mut rgba = vec![0u8; n * 4];
             for i in 0..n {
@@ -363,6 +421,65 @@ fn expand_to_rgba(
             }
             Some(rgba)
         }
+        png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => {
+            let channels = if color_type == png::ColorType::GrayscaleAlpha {
+                2
+            } else {
+                1
+            };
+            let source = buf.get(..n * channels)?;
+            let mut rgba = Vec::with_capacity(n * 4);
+            for pixel in source.chunks_exact(channels) {
+                rgba.extend_from_slice(&[
+                    pixel[0],
+                    pixel[0],
+                    pixel[0],
+                    if channels == 2 { pixel[1] } else { 255 },
+                ]);
+            }
+            Some(rgba)
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gif_preview_keeps_animation_timing_alpha_and_a_still_fallback() {
+        let path =
+            std::env::temp_dir().join(format!("linegtk-gif-preview-{}.gif", std::process::id()));
+        let mut encoder = image::codecs::gif::GifEncoder::new(File::create(&path).unwrap());
+        encoder
+            .set_repeat(image::codecs::gif::Repeat::Infinite)
+            .unwrap();
+        for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+            let mut pixels = image::RgbaImage::new(16, 16);
+            for y in 4..12 {
+                for x in 4..12 {
+                    pixels.put_pixel(x, y, image::Rgba(color));
+                }
+            }
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    pixels,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(100, 1),
+                ))
+                .unwrap();
+        }
+        drop(encoder);
+        let frames = load_scaled(path.to_str().unwrap(), 8, true).unwrap();
+        assert_eq!(frames.frames.len(), 2);
+        assert_eq!((frames.frames[0].width, frames.frames[0].height), (8, 8));
+        assert_eq!(frames.frames[0].delay_ms, 100);
+        assert_eq!(frames.frames[0].rgba[3], 0);
+        assert_ne!(frames.frames[0].rgba, frames.frames[1].rgba);
+        let still = load_scaled(path.to_str().unwrap(), 8, false).unwrap();
+        assert_eq!(still.frames.len(), 1);
+        std::fs::remove_file(path).unwrap();
     }
 }
