@@ -46,6 +46,7 @@ pub struct StickerPack {
     pub image_only: bool,
     pub incomplete: bool,
     pub lazy: bool,
+    pub icon_path: Option<String>,
     pub stickers: Vec<StickerItem>,
 }
 

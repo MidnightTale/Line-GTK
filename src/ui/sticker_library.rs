@@ -225,19 +225,36 @@ fn fill_selected(state: &AppState, result: &Value, selected: Option<String>) {
             };
             child = tab.next_sibling();
             tab.set_tooltip_text(Some(&pack.name));
-            if let Some(button) = tab.downcast_ref::<gtk::ToggleButton>()
-                && let Some(label) = button.child().and_downcast::<gtk::Label>()
-            {
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                label.set_width_chars(10);
-                label.set_max_width_chars(16);
+            if let Some(button) = tab.downcast_ref::<gtk::ToggleButton>() {
+                if let Some(path) = &pack.icon_path {
+                    // Show the pack's thumbnail so packs are recognizable
+                    // at a glance; the name stays as tooltip/accessible label.
+                    let icon = gtk::Picture::builder()
+                        .content_fit(gtk::ContentFit::Contain)
+                        .can_shrink(true)
+                        .build();
+                    icon.set_size_request(36, 36);
+                    icon.set_alternative_text(Some(&pack.name));
+                    let path = path.clone();
+                    icon.connect_map(move |picture| {
+                        attach_texture_async_anim(picture.clone(), path.clone(), 72, false);
+                    });
+                    button.set_child(Some(&icon));
+                    button.update_property(&[gtk::accessible::Property::Label(&pack.name)]);
+                } else if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    label.set_width_chars(10);
+                    label.set_max_width_chars(16);
+                }
             }
             if pack.image_only {
                 wire_pack_menu(state, &tab, pack, packs.clone());
             }
         }
         let tab_scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            // No visible bar: it sat over the tabs/stickers and stole clicks.
+            // Wheel and touch scrolling still work.
+            .hscrollbar_policy(gtk::PolicyType::External)
             .vscrollbar_policy(gtk::PolicyType::Never)
             .min_content_width(300)
             .max_content_width(340)
@@ -608,6 +625,8 @@ fn render_page(state: &AppState, gallery: &gtk::Box, pack: Rc<StickerPack>, page
     }
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        // Reserve a gutter so the scrollbar never overlays sticker buttons.
+        .overlay_scrolling(false)
         .min_content_height(230)
         .max_content_height(360)
         .propagate_natural_height(true)

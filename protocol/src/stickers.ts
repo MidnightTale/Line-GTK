@@ -345,7 +345,23 @@ export function createStickerService(runtime: StickerRuntime) {
     const library = importPack !== undefined
       ? await runtime.library.importStore(String(id), importPack)
       : await runtime.library.list();
-    const ownedPkgs = await fetchOwnedPackages();
+    // Most-used packs first: more distinct stickers used in the index wins,
+    // then the most recently used. Unused packs keep LINE's original order
+    // (Array.prototype.sort is stable).
+    const packUse = new Map<string, { count: number; recent: number }>();
+    stickerIndex.forEach((s, position) => {
+      const use = packUse.get(s.packageId) ??
+        { count: 0, recent: position };
+      use.count += 1;
+      use.recent = Math.min(use.recent, position);
+      packUse.set(s.packageId, use);
+    });
+    const ownedPkgs = [...await fetchOwnedPackages()].sort((a, b) => {
+      const ua = packUse.get(a.id);
+      const ub = packUse.get(b.id);
+      if (!ua || !ub) return ua ? -1 : ub ? 1 : 0;
+      return ub.count - ua.count || ua.recent - ub.recent;
+    });
     const ownedPkgIds = new Set(ownedPkgs.map((p) => p.id));
     const versionByPkg = new Map(ownedPkgs.map((p) => [p.id, p.version]));
 
@@ -387,15 +403,19 @@ export function createStickerService(runtime: StickerRuntime) {
     }
 
     // Enumerate every owned collection; fetch its grid only when selected.
-    for (const pkg of ownedPkgs) {
+    const ownedIcons = await Promise.all(
+      ownedPkgs.map((pkg) => ensurePackIcon(pkg.id).catch(() => null)),
+    );
+    ownedPkgs.forEach((pkg, index) => {
       packs.push({
         id: pkg.id,
         name: pkg.name || pkg.id,
         version: pkg.version,
+        iconPath: ownedIcons[index],
         lazy: true,
         stickers: [],
       });
-    }
+    });
     if (runtime.getClient() !== client) {
       throw new Error("sticker_library_session_changed");
     }
