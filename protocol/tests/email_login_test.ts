@@ -108,6 +108,10 @@ Deno.test("入力不足・不正なメールは通信前に拒否し、認証失
       emailLoginError(new Error("timed out")),
       "login_email_timeout",
     );
+    assertEquals(
+      emailLoginError(new Error("login_keys_missing")),
+      "login_keys_missing",
+    );
   } finally {
     await Deno.remove(directory, { recursive: true });
   }

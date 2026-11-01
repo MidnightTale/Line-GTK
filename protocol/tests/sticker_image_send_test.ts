@@ -107,6 +107,7 @@ async function encryptedFixture(
     errors: string[];
     events: Record<string, unknown>[];
     groupReads: number;
+    groupRegistrations: number;
     fallbackUploads: number;
     payload: (message: SendOptions) => Record<string, string>;
     decrypt: (blob: Blob, key: string) => Promise<Buffer>;
@@ -130,8 +131,23 @@ async function encryptedFixture(
     });
     const groupKeys = [Buffer.alloc(32, 2), Buffer.alloc(32, 3)];
     let groupReads = 0;
+    let groupRegistrations = 0;
+    base.talk.getChats = () =>
+      Promise.resolve({
+        chats: [{
+          chatMid: "c-group",
+          extra: { groupExtra: { memberMids: { [mid]: 0 } } },
+        }],
+      } as never);
+    base.talk.getLastE2EEPublicKeys = () =>
+      Promise.resolve({ [mid]: { keyId: 10, keyData: publicKey } } as never);
+    base.e2ee.tryRegisterE2EEGroupKey = () => {
+      groupRegistrations++;
+      return Promise.resolve({} as never);
+    };
     base.e2ee.getE2EELocalPublicKey = () => {
-      const generation = Math.min(groupReads++, 1);
+      groupReads++;
+      const generation = Math.min(groupRegistrations, 1);
       return Promise.resolve({
         keyId: generation + 20,
         privKey: groupKeys[generation].toString("base64"),
@@ -200,6 +216,7 @@ async function encryptedFixture(
       errors,
       events,
       groupReads,
+      groupRegistrations,
       fallbackUploads,
       png,
       payload: (message) => {
@@ -256,6 +273,7 @@ for (const code of ["E2EE_RECREATE_GROUP_KEY", 99]) {
       assertEquals(f.results.length, 1);
       assertEquals(f.sends.length, 2);
       assertEquals(f.groupReads, 2);
+      assertEquals(f.groupRegistrations, 1);
       assertEquals(f.uploads.length, 2);
       assertEquals(f.fallbackUploads, 0);
       assertEquals((f.sends[0].chunks as Buffer[])[4].readInt32BE(), 20);
@@ -275,6 +293,7 @@ Deno.test("repeated group key rejection stops after one refreshed envelope", () 
     assertEquals(f.errors, ["rotate_group_key"]);
     assertEquals(f.sends.length, 2);
     assertEquals(f.groupReads, 2);
+    assertEquals(f.groupRegistrations, 1);
     assertEquals(f.fallbackUploads, 0);
   }));
 

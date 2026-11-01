@@ -283,6 +283,7 @@
   "login_invalid_password": "Hãy kiểm tra định dạng mật khẩu.",
   "login_email_failed": "Không thể đăng nhập. Hãy kiểm tra thông tin tài khoản và quyền cho phép đăng nhập trên điện thoại rồi thử lại.",
   "login_email_timeout": "Đã hết thời gian xác minh. Hãy đăng nhập lại.",
+  "login_keys_missing": "Không thể lấy khóa mã hóa từ điện thoại. Hãy xác nhận đăng nhập trên điện thoại rồi thử lại.",
   "login_in_progress": "Đang có một yêu cầu đăng nhập khác.",
   "login_email_calls_note": "Đăng nhập bằng mã QR để sử dụng cuộc gọi thoại.",
   "login_pin_waiting": "Nhập mã PIN này trong ứng dụng LINE",

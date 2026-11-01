@@ -34,10 +34,12 @@ import {
   guardedDecrypt,
   needsDecryptionRefresh,
   restoreCachedMessages,
+  retryKeyDecryption,
 } from "./e2ee_guard.ts";
 import * as calls from "./calls.ts";
 import { createOutgoingMedia } from "./outgoing_media.ts";
 import { patchMediaDecryption } from "./media_crypto.ts";
+import { patchGroupKeyRecovery } from "./group_key_recovery.ts";
 import { createMediaCache } from "./media_cache.ts";
 import { createStickerLibrary } from "./sticker_library.ts";
 import { createStickerService } from "./stickers.ts";
@@ -956,8 +958,14 @@ async function fromRawTalkSafe(raw: unknown): Promise<TalkMessage> {
   );
 }
 
+const guardedClients = new WeakSet<Client>();
+
 function patchE2eeGuards() {
   if (!client) return;
+  if (guardedClients.has(client)) return;
+  guardedClients.add(client);
+  const current = client;
+  patchGroupKeyRecovery(client.base);
   patchMediaDecryption(client.base.e2ee);
   const e2ee = client.base.e2ee as unknown as {
     decryptE2EEMessage: (
@@ -965,11 +973,17 @@ function patchE2eeGuards() {
     ) => Promise<Record<string, unknown>>;
   };
   const orig = e2ee.decryptE2EEMessage.bind(e2ee);
-  e2ee.decryptE2EEMessage = guardedDecrypt(orig, () => {
-    console.error(
-      "[e2ee] メッセージを復号できません。暗号鍵の再取得が必要です。",
-    );
-  });
+  e2ee.decryptE2EEMessage = guardedDecrypt(
+    retryKeyDecryption(
+      orig,
+      () => client === current && !authDead && Boolean(current.base.authToken),
+    ),
+    () => {
+      console.error(
+        "[e2ee] メッセージを復号できません。暗号鍵の再取得が必要です。",
+      );
+    },
+  );
 }
 
 const e2eeFileNames = new Map<string, string>();
@@ -2448,6 +2462,7 @@ async function handle(req: Json) {
                 "login_invalid_password",
                 "login_email_failed",
                 "login_email_timeout",
+                "login_keys_missing",
               ].includes(code)
               ? code
               : emailLoginError(error),

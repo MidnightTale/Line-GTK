@@ -1,5 +1,6 @@
 import { dirname, join } from "@std/path";
-import { loginWithAuthToken } from "@evex/linejs";
+import type { loginWithAuthToken } from "@evex/linejs";
+import { loginWithTokenKeys } from "./key_login.ts";
 import { FileStorage } from "@evex/linejs/storage";
 import { createLineFetch } from "./connection.ts";
 import {
@@ -29,7 +30,7 @@ export async function restoreSession(
   device: LineDevice,
   storagePath: string,
   androidVersion: string,
-  authenticate: typeof loginWithAuthToken = loginWithAuthToken,
+  authenticate: typeof loginWithAuthToken = loginWithTokenKeys,
   fetcher: ReturnType<typeof createLineFetch> = createLineFetch(),
 ) {
   return await authenticate(token, {

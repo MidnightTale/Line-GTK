@@ -1,8 +1,8 @@
 import { fetchMentionMembers, mentionMetadata } from "./mentions.ts";
-import { type Client, loginWithQR, type TalkMessage } from "@evex/linejs";
-import { FileStorage } from "@evex/linejs/storage";
+import { type Client, type TalkMessage } from "@evex/linejs";
+import { loginWithQrKeys } from "./key_login.ts";
 import { join } from "@std/path";
-import { restoreSession } from "./auth.ts";
+import { createAuthStorage, restoreSession } from "./auth.ts";
 import { authenticateEmail } from "./email_login.ts";
 import type { CachePolicy } from "./cache_policy.ts";
 import { contactKind, friendName, picturePathOf } from "./contacts.ts";
@@ -287,12 +287,12 @@ export function createCommandService(runtime: CommandRuntime) {
 
   async function doLoginQr(id: number | string | null) {
     runtime.setAuthDead(false);
-    const storage = new FileStorage(storagePath);
+    const storage = await createAuthStorage(storagePath);
     // Docs: QR defaults to ANDROIDSECONDARY for call-capable sessions.
     const device = LINE_DEVICE === "DESKTOPWIN"
       ? "ANDROIDSECONDARY"
       : LINE_DEVICE;
-    const client = await loginWithQR(
+    const client = await loginWithQrKeys(
       {
         onReceiveQRUrl: (url) => emitEvent("qr", { url }),
         onPincodeRequest: (pin) => emitEvent("pin", { pin }),

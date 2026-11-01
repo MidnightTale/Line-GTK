@@ -1,7 +1,10 @@
 import type { Client } from "@evex/linejs";
-import { InternalError } from "@evex/linejs/base";
 import { join } from "@std/path";
 import { Buffer } from "node:buffer";
+import {
+  needsGroupKeyRecreation,
+  recreateGroupKey,
+} from "./group_key_recovery.ts";
 
 type Json = Record<string, unknown>;
 
@@ -428,8 +431,8 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
 
     for (let attempt = 0;; attempt++) {
       report(0.78, "Sending…");
-      // linejs fetches the current group key on each encryption. If membership
-      // changed during the send, rebuild the envelope without reuploading media.
+      // Fetch the current group key on each encryption. If membership changed
+      // during the send, recreate the key and rebuild only the envelope.
       const chunks = await e2ee.encryptE2EEMessage(
         opts.to,
         { keyMaterial, fileName: opts.filename || `line.${ext}` },
@@ -447,13 +450,11 @@ export function createOutgoingMedia(runtime: OutgoingMediaRuntime) {
           e2ee: true,
         }) as { id?: unknown; createdTime?: unknown; contentType?: unknown };
       } catch (error) {
-        const code = error instanceof InternalError
-          ? error.data.code
-          : undefined;
         if (
           attempt !== 0 || !opts.to.startsWith("c") ||
-          ![99, "99", "E2EE_RECREATE_GROUP_KEY"].includes(code)
+          !needsGroupKeyRecreation(error)
         ) throw error;
+        await recreateGroupKey(client.base, opts.to);
       }
     }
   }

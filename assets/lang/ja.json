@@ -282,6 +282,7 @@
   "login_invalid_password": "パスワードの形式を確認してください。",
   "login_email_failed": "ログインできませんでした。入力内容とスマホ側のログイン許可を確認して、もう一度お試しください。",
   "login_email_timeout": "認証の待ち時間が過ぎました。もう一度ログインしてください。",
+  "login_keys_missing": "スマートフォンから暗号鍵を取得できませんでした。スマートフォンでログインを確認し、もう一度お試しください。",
   "login_in_progress": "ログイン処理が進行中です。",
   "login_email_calls_note": "音声通話を使うには、QRコードでログインしてください。",
   "login_pin_waiting": "LINEアプリでこの認証番号を入力してください",

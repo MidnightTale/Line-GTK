@@ -283,6 +283,7 @@
   "login_invalid_password": "Check the password format.",
   "login_email_failed": "Could not log in. Check your credentials and login permission on your phone, then try again.",
   "login_email_timeout": "Verification timed out. Please log in again.",
+  "login_keys_missing": "Could not retrieve encryption keys from your phone. Confirm the login on your phone and try again.",
   "login_in_progress": "A login is already in progress.",
   "login_email_calls_note": "Log in with a QR code to use voice calls.",
   "login_pin_waiting": "Enter this PIN in the LINE app",

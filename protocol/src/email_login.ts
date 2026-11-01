@@ -1,4 +1,5 @@
-import { loginWithPassword } from "@evex/linejs";
+import type { loginWithPassword } from "@evex/linejs";
+import { loginWithPasswordKeys } from "./key_login.ts";
 import { createAuthStorage } from "./auth.ts";
 import { createLineFetch } from "./connection.ts";
 
@@ -12,6 +13,7 @@ export function generateLoginPin(): string {
 
 export function emailLoginError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (message === "login_keys_missing") return message;
   if (message.includes("invalid email")) return "login_invalid_email";
   if (message.includes("invalid password")) return "login_invalid_password";
   if (/timeout|timed out/i.test(message)) return "login_email_timeout";
@@ -24,7 +26,7 @@ export async function authenticateEmail(
   password: string,
   storagePath: string,
   onPin: (pin: string) => void,
-  authenticate: PasswordAuthenticator = loginWithPassword,
+  authenticate: PasswordAuthenticator = loginWithPasswordKeys,
 ) {
   email = email.trim();
   if (!email || !password) throw new Error("login_email_missing");
