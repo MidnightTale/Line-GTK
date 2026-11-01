@@ -30,6 +30,25 @@ export function ownedPacks(response: unknown): { id: string; name: string }[] {
   return result;
 }
 
+/**
+ * Latest version of each owned pack. The CDN `meta.json` carries no version,
+ * but the reaction must name it or other clients cannot resolve the image.
+ */
+export function ownedVersions(response: unknown): Map<string, number> {
+  const data = (response ?? {}) as Json;
+  const list = (data.productList ?? data["1"] ?? []) as Json[];
+  const versions = new Map<string, number>();
+  if (!Array.isArray(list)) return versions;
+  for (const item of list) {
+    const id = String(item?.id ?? item?.["1"] ?? "");
+    const raw = item?.latestVersion ?? item?.["21"];
+    if (PRODUCT.test(id) && raw !== undefined) {
+      versions.set(id, emojiVersion(raw));
+    }
+  }
+  return versions;
+}
+
 /** Emoji ids of one pack, in the order LINE shows them. */
 export function packEmojiIds(meta: unknown): string[] {
   const data = (meta ?? {}) as Json;
@@ -55,7 +74,8 @@ type Runtime = {
 export function createReactionEmojiPacks(runtime: Runtime) {
   const get = runtime.fetch ?? fetch;
   let cached: { account: string; at: number; packs: EmojiPack[] } | null = null;
-  const metas = new Map<string, { ids: string[]; version: number }>();
+  const metas = new Map<string, { ids: string[]; version?: number }>();
+  const versions = new Map<string, number>();
 
   async function icon(id: string): Promise<string | null> {
     const path = join(runtime.directory, `emoji-pack-${id}.png`);
@@ -99,7 +119,11 @@ export function createReactionEmojiPacks(runtime: Runtime) {
       cached && cached.account === account && Date.now() - cached.at < PACKS_TTL
     ) return { packs: cached.packs };
     try {
-      const owned = ownedPacks(await runtime.ownedProducts());
+      const summaries = await runtime.ownedProducts();
+      const owned = ownedPacks(summaries);
+      for (const [id, version] of ownedVersions(summaries)) {
+        versions.set(id, version);
+      }
       const result: EmojiPack[] = [];
       for (let i = 0; i < owned.length; i += 6) {
         result.push(
@@ -137,14 +161,20 @@ export function createReactionEmojiPacks(runtime: Runtime) {
         throw new Error("reaction_packs_unavailable");
       }
       const data = await response.json();
-      meta = { ids: packEmojiIds(data), version: emojiVersion(data?.version) };
+      meta = {
+        ids: packEmojiIds(data),
+        version: data?.version === undefined
+          ? undefined
+          : emojiVersion(data.version),
+      };
       if (metas.size >= 100) metas.clear();
       metas.set(id, meta);
     }
+    const version = meta.version ?? versions.get(id) ?? 1;
     const emojis = meta.ids.map((emoji) => ({
       key: `${id}_${emoji}`,
       resourceType: 1,
-      version: meta.version,
+      version,
     }));
     // The message image loader accepts at most 100 emoji per message. Packs
     // can be larger, so submit every image in bounded batches.

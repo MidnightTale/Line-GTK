@@ -557,6 +557,14 @@ export function createReactionService(runtime: Runtime) {
     const matched = ["139", "140", "SEND_REACTION", "NOTIFIED_SEND_REACTION"]
       .includes(type);
     if (!target || !user(account)) return matched;
+    if (target.choice?.kind === "EMOJI") {
+      // Diagnostic: compare the official client's wire shape with paidReactArgs.
+      console.error(
+        `[reactions] received custom emoji op=${type} raw=${
+          String(op.param2).slice(0, 400)
+        } layout=${JSON.stringify(target.layout ?? null)}`,
+      );
+    }
     if (target.layout) layout = target.layout;
     const at = now();
     recording = recording.then(() =>

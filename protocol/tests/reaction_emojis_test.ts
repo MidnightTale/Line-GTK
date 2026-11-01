@@ -185,6 +185,27 @@ Deno.test("emoji pack versions reach the reaction picker", async () => {
   }
 });
 
+Deno.test("pack version falls back to the owned product latestVersion", async () => {
+  const dir = await Deno.makeTempDir();
+  try {
+    const f = fixture(dir);
+    f.owned(() =>
+      Promise.resolve({
+        productList: [{ id: A, name: "ムーン", latestVersion: 3n }],
+      })
+    );
+    await f.service.packs();
+    assertEquals(await f.service.pack(A), {
+      emojis: [
+        { key: `${A}_001`, resourceType: 1, version: 3 },
+        { key: `${A}_002`, resourceType: 1, version: 3 },
+      ],
+    });
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test("取得に失敗すると明示的なエラーにする", async () => {
   const dir = await Deno.makeTempDir();
   try {
